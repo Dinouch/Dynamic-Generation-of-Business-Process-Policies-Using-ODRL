@@ -1,0 +1,22 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPa_perform_checks_for_small_amount_9db441b0",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/rule_perform_checks_for_small_amount",
+      "target": "http://example.com/asset/perform_checks_for_small_amount",
+      "action": "trigger",
+      "constraint": [
+        {
+          "leftOperand": "dateTime",
+          "operator": "gteq",
+          "rightOperand": {
+            "@value": "2024-01-01",
+            "@type": "xsd:date"
+          }
+        }
+      ]
+    }
+  ]
+}

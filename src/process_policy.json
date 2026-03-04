@@ -1,0 +1,19 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:orderFulfillment:201",
+  "@type": "Agreement",
+  "obligation": [{
+    "uid": "http://example.com/rules/warehouseRetrievalRule",
+    "target": "http://example.com/asset/Retrieve product from warehouse",
+    "assigner": "http://example.com/org:OrderManagementSystem",
+    "assignee": "http://example.com/staff:WarehouseOperative",
+    "action": [{
+      "rdf:value": {"@id": "odrl:use"},
+      "refinement": [{
+        "leftOperand": "productAvailability",
+        "operator": "eq",
+        "rightOperand": "in_stock"
+      }]
+    }]
+  }]
+}

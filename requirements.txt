@@ -1,0 +1,12 @@
+matplotlib
+pandas
+python-dotenv
+openai
+numpy
+lxml
+requests
+beautifulsoup4
+networkx
+pytest
+tqdm
+seaborn

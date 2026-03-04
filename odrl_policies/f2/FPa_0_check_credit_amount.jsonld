@@ -1,0 +1,22 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPa_check_credit_amount_d5e9bbf7",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/rule_check_credit_amount",
+      "target": "http://example.com/asset/check_credit_amount",
+      "action": "trigger",
+      "constraint": [
+        {
+          "leftOperand": "dateTime",
+          "operator": "gteq",
+          "rightOperand": {
+            "@value": "2024-01-01",
+            "@type": "xsd:date"
+          }
+        }
+      ]
+    }
+  ]
+}

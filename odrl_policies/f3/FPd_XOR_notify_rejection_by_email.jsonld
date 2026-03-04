@@ -1,0 +1,43 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPd_XOR_65168ce1",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/XOR_ij_notify_rejection_by_email_a8705176",
+      "target": "http://example.com/rules/rule_notify_rejection_by_email",
+      "action": [
+        {
+          "rdf:value": {
+            "@id": "odrl:enable"
+          },
+          "refinement": [
+            {
+              "leftOperand": "product",
+              "operator": "eq",
+              "rightOperand": "rejected"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "uid": "http://example.com/rules/XOR_ik_notify_acceptance_by_email_74310b12",
+      "target": "http://example.com/rules/emailNotifyingRule",
+      "action": [
+        {
+          "rdf:value": {
+            "@id": "odrl:enable"
+          },
+          "refinement": [
+            {
+              "leftOperand": "product",
+              "operator": "eq",
+              "rightOperand": "accepted"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
