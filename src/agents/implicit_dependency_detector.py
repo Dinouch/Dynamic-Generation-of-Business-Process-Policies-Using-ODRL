@@ -26,11 +26,17 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 from openai import OpenAI, AzureOpenAI
 
-from .structural_analyzer import EnrichedGraph, FragmentContext
+from .structural_analyzer import (
+    AgentMessage,
+    EnrichedGraph,
+    FragmentContext,
+    MessageType,
+    ReanalysisLimitError,
+)
 
 
 # ─────────────────────────────────────────────
@@ -125,25 +131,42 @@ class ImplicitDependencyDetector:
         2. Appel OpenAI avec réponse forcée en JSON
         3. Parsing et validation de la réponse
         4. Construction des CandidateDependency
+
+    Couche multi-agent :
+        - receive()  : accepte GRAPH_READY et REFORMULATE
+        - send()     : émet CANDIDATES_READY vers Agent 3
+        - Boucle courte (max MAX_REFORMULATE tours) avec Agent 3
+        - Boucle structurelle (reset du compteur) depuis Agent 1
     """
 
     MODEL = "gpt-4o"
     TEMPERATURE = 0.2
 
+    AGENT_NAME      = "agent2"
+    MAX_REFORMULATE = 3   # max de tours dans la boucle courte Agent2↔Agent3
+
     def __init__(
         self,
-        enriched_graph: EnrichedGraph,
         context_mode: str = "local",
         api_key: Optional[str] = None,
         *,
         azure_endpoint: Optional[str] = None,
         azure_api_version: Optional[str] = None,
         azure_deployment: Optional[str] = None,
+        # Rétrocompatibilité : accepte enriched_graph en paramètre positionnel
+        # pour le mode standalone (sans pipeline).
+        enriched_graph: Optional[EnrichedGraph] = None,
     ):
-        self.enriched_graph = enriched_graph
+        self.enriched_graph = enriched_graph   # peut rester None en mode pipeline
         self.context_mode = context_mode
         self._use_azure = False
         self._deployment: Optional[str] = None
+
+        # ── Couche multi-agent ──────────────────────────────────────
+        self._on_send:           Optional[Callable[[AgentMessage], None]] = None
+        self._reformulate_count: int = 0
+        self._last_graph:        Optional[EnrichedGraph] = None
+        self._last_results:      Optional[dict] = None   # dict[frag_id → ImplicitAnalysisResult]
 
         # Azure OpenAI (prioritaire si endpoint + clé présents)
         key_azure = api_key or os.environ.get("AZURE_OPENAI_KEY") or os.environ.get("AZURE_OPENAI_API_KEY")
@@ -172,24 +195,266 @@ class ImplicitDependencyDetector:
                 )
             self.client = OpenAI(api_key=key)
 
+    # ═════════════════════════════════════════
+    #  COUCHE MULTI-AGENT
+    # ═════════════════════════════════════════
+
+    def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
+        """Enregistre le callback d'envoi (typiquement agent3.receive)."""
+        self._on_send = fn
+
+    def send(self, msg: AgentMessage) -> None:
+        """Émet un message via le callback enregistré."""
+        print(f"[Agent 2] ► SEND {msg}")
+        if self._on_send:
+            self._on_send(msg)
+        else:
+            print(f"[Agent 2][WARN] Aucun callback — message {msg.msg_type.value} non transmis.")
+
+    def receive(self, msg: AgentMessage) -> None:
+        """
+        Point d'entrée des messages entrants.
+
+        Messages acceptés :
+          - GRAPH_READY    : nouveau graphe depuis Agent 1 (première analyse ou graphe enrichi)
+          - REFORMULATE    : demande de reformulation depuis Agent 3 (même graphe, hint)
+
+        Tout autre type est ignoré avec un warning.
+        """
+        print(f"[Agent 2] ◄ RECEIVE {msg}")
+        if msg.msg_type == MessageType.GRAPH_READY:
+            self._handle_graph_ready(msg)
+        elif msg.msg_type == MessageType.REFORMULATE:
+            self._handle_reformulate(msg)
+        else:
+            print(f"[Agent 2][WARN] Message '{msg.msg_type.value}' non géré — ignoré.")
+
     # ─────────────────────────────────────────
-    #  Point d'entrée principal
+    #  Handlers internes
     # ─────────────────────────────────────────
 
-    def analyze(self) -> dict[str, ImplicitAnalysisResult]:
+    def _handle_graph_ready(self, msg: AgentMessage) -> None:
+        """
+        Traite un message GRAPH_READY depuis Agent 1.
+
+        Deux cas distincts :
+          - reanalysis=False : première analyse complète du graphe
+          - reanalysis=True  : graphe enrichi par Agent 1 (arêtes implicites ajoutées)
+            → reset du compteur de reformulation car c'est un nouveau problème,
+              pas une reformulation du même.
+        """
+        enriched_graph = msg.payload["enriched_graph"]
+        self._last_graph = enriched_graph
+
+        if msg.payload.get("reanalysis"):
+            # Graphe enrichi — reset du compteur de reformulation
+            self._reformulate_count = 0
+            affected = msg.payload.get("affected_fragments") or list(
+                enriched_graph.fragment_contexts.keys()
+            )
+            print(f"[Agent 2] Graphe enrichi reçu — re-détection sur {affected}")
+            results = self._detect_on_fragments(enriched_graph, affected)
+        else:
+            # Première analyse — tous les fragments
+            results = self.detect(enriched_graph)
+
+        self._last_results = results
+        self._emit_candidates_ready(results, enriched_graph, loop_turn=msg.loop_turn)
+
+    def _handle_reformulate(self, msg: AgentMessage) -> None:
+        """
+        Traite une demande de reformulation depuis Agent 3.
+
+        REFORMULATE signifie que le graphe est INTACT — Agent 3 a rejeté un
+        candidat parce que le raisonnement d'Agent 2 était mauvais. On relit
+        le même _last_graph et on propose un candidat différent pour le fragment
+        concerné, en intégrant le hint dans le prompt LLM.
+
+        Si MAX_REFORMULATE est atteint, on émet les derniers résultats en l'état
+        plutôt que de bloquer le pipeline (fail-open).
+        """
+        if self._reformulate_count >= self.MAX_REFORMULATE:
+            print(
+                f"[Agent 2][WARN] Limite MAX_REFORMULATE ({self.MAX_REFORMULATE}) atteinte. "
+                "Émission des derniers résultats en l'état."
+            )
+            self._emit_candidates_ready(
+                self._last_results or {},
+                self._last_graph,
+                loop_turn=msg.loop_turn,
+            )
+            return
+
+        fragment_id        = msg.payload["affected_fragment"]
+        hint               = msg.payload.get("hint", "")
+        rejected_candidate = msg.payload.get("rejected_candidate", "")
+
+        print(
+            f"[Agent 2] Reformulation #{self._reformulate_count + 1} "
+            f"pour fragment '{fragment_id}'"
+        )
+
+        # Re-détecter sur ce fragment uniquement avec le hint (appel LLM réel).
+        # Le graphe est LE MÊME — seul le raisonnement change.
+        new_result = self._detect_single_fragment_with_hint(
+            fragment_id        = fragment_id,
+            hint               = hint,
+            rejected_candidate = rejected_candidate,
+        )
+
+        print(
+            f"[Agent 2] Reformulation effectuée — fragment '{fragment_id}' : "
+            f"{len(new_result.candidates)} candidat(s) proposé(s)"
+        )
+
+        # Mettre à jour uniquement ce fragment dans les résultats
+        if self._last_results is None:
+            self._last_results = {}
+        self._last_results[fragment_id] = new_result
+        self._reformulate_count += 1
+
+        self._emit_candidates_ready(
+            self._last_results,
+            self._last_graph,
+            loop_turn=msg.loop_turn + 1,
+        )
+
+    def _emit_candidates_ready(
+        self,
+        results: dict,
+        enriched_graph: Optional[EnrichedGraph],
+        loop_turn: int,
+    ) -> None:
+        """Émet CANDIDATES_READY vers Agent 3."""
+        self.send(AgentMessage(
+            sender    = self.AGENT_NAME,
+            recipient = "agent3",
+            msg_type  = MessageType.CANDIDATES_READY,
+            payload   = {
+                "results":        results,
+                "enriched_graph": enriched_graph,
+            },
+            loop_turn = loop_turn,
+        ))
+
+    # ─────────────────────────────────────────
+    #  Helpers multi-fragment
+    # ─────────────────────────────────────────
+
+    def _detect_on_fragments(
+        self,
+        enriched_graph: EnrichedGraph,
+        fragment_ids: list[str],
+    ) -> dict[str, ImplicitAnalysisResult]:
+        """
+        Re-détecte uniquement sur les fragments listés.
+        Fusionne avec _last_results pour les fragments non affectés,
+        de façon à conserver les résultats déjà calculés.
+        """
+        contexts = (
+            enriched_graph.global_contexts
+            if self.context_mode == "global"
+            else enriched_graph.fragment_contexts
+        )
+
+        merged = dict(self._last_results) if self._last_results else {}
+
+        for fragment_id in fragment_ids:
+            if fragment_id not in contexts:
+                print(f"[Agent 2][WARN] Fragment '{fragment_id}' introuvable dans le graphe — ignoré.")
+                continue
+
+            context = contexts[fragment_id]
+            print(f"[Agent 2] Re-analyse du fragment '{fragment_id}'...")
+            result = self._analyze_fragment(fragment_id, context)
+            merged[fragment_id] = result
+
+            print(
+                f"[Agent 2] Fragment '{fragment_id}' : "
+                f"{len(result.candidates)} candidats détectés "
+                f"({len(result.high_confidence)} haute confiance)"
+            )
+
+        return merged
+
+    def _detect_single_fragment_with_hint(
+        self,
+        fragment_id: str,
+        hint: str,
+        rejected_candidate: str,
+    ) -> ImplicitAnalysisResult:
+        """
+        Re-analyse un unique fragment en injectant un hint de reformulation
+        dans le prompt. Le graphe utilisé est self._last_graph (inchangé).
+
+        Le hint vient d'Agent 3 — il explique pourquoi le candidat précédent
+        a été rejeté et guide le LLM vers une alternative valide.
+        """
+        if self._last_graph is None:
+            raise RuntimeError(
+                "[Agent 2] _last_graph est None — impossible de reformuler sans graphe."
+            )
+
+        contexts = (
+            self._last_graph.global_contexts
+            if self.context_mode == "global"
+            else self._last_graph.fragment_contexts
+        )
+
+        if fragment_id not in contexts:
+            raise ValueError(
+                f"[Agent 2] Fragment '{fragment_id}' introuvable dans _last_graph."
+            )
+
+        context = contexts[fragment_id]
+        prompt  = self._build_prompt_with_hint(fragment_id, context, hint, rejected_candidate)
+        raw_response = self._call_llm(prompt)
+        candidates   = self._parse_response(raw_response, context)
+
+        return ImplicitAnalysisResult(
+            fragment_id      = fragment_id,
+            context_type     = self.context_mode,
+            candidates       = candidates,
+            llm_raw_response = raw_response,
+            prompt_used      = prompt,
+        )
+
+    # ═════════════════════════════════════════
+    #  LOGIQUE MÉTIER (inchangée)
+    # ═════════════════════════════════════════
+
+    # ─────────────────────────────────────────
+    #  Point d'entrée standalone
+    # ─────────────────────────────────────────
+
+    def detect(
+        self,
+        enriched_graph: Optional[EnrichedGraph] = None,
+    ) -> dict[str, ImplicitAnalysisResult]:
         """
         Lance la détection de dépendances implicites pour tous les fragments.
 
+        Peut être appelé en mode standalone (enriched_graph passé en argument
+        ou stocké en self.enriched_graph) ou depuis le pipeline multi-agent
+        via _handle_graph_ready().
+
         Retourne un dict : fragment_id → ImplicitAnalysisResult
         """
+        graph = enriched_graph or self.enriched_graph
+        if graph is None:
+            raise ValueError(
+                "[Agent 2] Aucun enriched_graph fourni. "
+                "Passez-le en argument ou via le constructeur."
+            )
+
         print(f"[Agent 2] Implicit Dependency Detector — mode contexte : {self.context_mode}")
 
         results = {}
 
         contexts = (
-            self.enriched_graph.global_contexts
+            graph.global_contexts
             if self.context_mode == "global"
-            else self.enriched_graph.fragment_contexts
+            else graph.fragment_contexts
         )
 
         for fragment_id, context in contexts.items():
@@ -370,6 +635,44 @@ RULES:
 - Use EXACT activity names as they appear in the lists above
 """
         return prompt
+
+    def _build_prompt_with_hint(
+        self,
+        fragment_id: str,
+        context: FragmentContext,
+        hint: str,
+        rejected_candidate: str,
+    ) -> str:
+        """
+        Variante du prompt de détection pour la boucle de reformulation.
+
+        Injecte en tête du prompt le hint fourni par Agent 3 et le candidat
+        rejeté, de façon à orienter le LLM vers une alternative valide sans
+        répéter l'erreur précédente.
+
+        Le reste du prompt (structure du fragment, connexions, etc.) est
+        identique à _build_prompt() — seul le contexte de reformulation s'ajoute.
+        """
+        base_prompt = self._build_prompt(fragment_id, context)
+
+        reformulation_header = f"""
+═══════════════════════════════════════════
+REFORMULATION HINT FROM VALIDATOR:
+═══════════════════════════════════════════
+
+{hint}
+
+The following candidate was rejected and must NOT be reproduced:
+{rejected_candidate}
+
+Generate a different alternative. Do not propose the same source/target/dep_type combination.
+
+═══════════════════════════════════════════
+
+"""
+        # Insérer le header juste avant la section du fragment
+        insert_marker = f"═══════════════════════════════════════════\nFRAGMENT: {fragment_id}"
+        return base_prompt.replace(insert_marker, reformulation_header + insert_marker, 1)
 
     # ─────────────────────────────────────────
     #  Appel LLM

@@ -10,19 +10,29 @@ Corrections v2 :
       (les connexions relient gateway→activité, pas activité→activité directement)
     - Méthode export() pour sérialiser en JSON-LD propre (sans clés _xxx)
       et écrire un fichier .jsonld par policy
+
+Couche multi-agent :
+    - receive()  : accepte VALIDATION_DONE et SYNTAX_CORRECTION
+    - send()     : émet POLICIES_READY vers Agent 5
+    - Boucle syntaxique (max MAX_SYNTAX_LOOPS, géré par Agent 5) :
+        SYNTAX_CORRECTION reçu → corrections déterministes → POLICIES_READY ré-émis
 """
 
 import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .structural_analyzer import EnrichedGraph, ConnectionInfo
+from .structural_analyzer import (
+    AgentMessage,
+    EnrichedGraph,
+    ConnectionInfo,
+    MessageType,
+)
 from .constraint_validator import ValidationReport
 from .implicit_dependency_detector import CandidateDependency, ImplicitDepType
-
 
 
 # ─────────────────────────────────────────────
@@ -86,10 +96,29 @@ class FragmentPolicySet:
 # ─────────────────────────────────────────────
 
 class PolicyProjectionAgent:
+    """
+    Agent 4 du pipeline multi-agent.
+
+    Mode standalone :
+        Instancier avec enriched_graph + validation_report et appeler generate().
+
+    Mode pipeline :
+        Instancier avec enriched_graph=None, validation_report=None.
+        Les données arrivent via receive(VALIDATION_DONE).
+        Enregistrer le callback vers Agent 5 avant le démarrage.
+
+    Boucle syntaxique :
+        Agent 5 peut renvoyer SYNTAX_CORRECTION.
+        Agent 4 applique des corrections déterministes (pas de LLM)
+        et ré-émet POLICIES_READY avec loop_turn+1.
+        Le compteur MAX_SYNTAX_LOOPS est géré par Agent 5.
+    """
+
+    AGENT_NAME = "agent4"
 
     def __init__(
         self,
-        enriched_graph: EnrichedGraph,
+        enriched_graph:    Optional[EnrichedGraph] = None,
         validation_report: Optional[ValidationReport] = None,
     ):
         self.enriched_graph    = enriched_graph
@@ -97,11 +126,220 @@ class PolicyProjectionAgent:
         self._activity_rule_index:   dict[str, str] = {}
         self._activity_policy_index: dict[str, str] = {}
 
+        # ── Couche multi-agent ──────────────────────────────────────
+        self._on_send:             Optional[Callable[[AgentMessage], None]] = None
+        self._last_fp_results:     Optional[dict] = None
+        self._last_enriched_graph: Optional[EnrichedGraph] = None
+
+    # ═════════════════════════════════════════
+    #  COUCHE MULTI-AGENT
+    # ═════════════════════════════════════════
+
+    def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
+        """Enregistre le callback d'envoi (typiquement agent5.receive)."""
+        self._on_send = fn
+
+    def send(self, msg: AgentMessage) -> None:
+        """Émet un message via le callback enregistré."""
+        print(f"[Agent 4] ► SEND {msg}")
+        if self._on_send:
+            self._on_send(msg)
+        else:
+            print(f"[Agent 4][WARN] Aucun callback — message {msg.msg_type.value} non transmis.")
+
+    def receive(self, msg: AgentMessage) -> None:
+        """
+        Point d'entrée des messages entrants.
+
+        Messages acceptés :
+          - VALIDATION_DONE   : rapport de validation depuis Agent 3
+          - SYNTAX_CORRECTION : corrections JSON-LD à appliquer depuis Agent 5
+
+        Tout autre type est ignoré avec un warning.
+        """
+        print(f"[Agent 4] ◄ RECEIVE {msg}")
+        if msg.msg_type == MessageType.VALIDATION_DONE:
+            validation_report = msg.payload["validation_report"]
+            enriched_graph    = msg.payload["enriched_graph"]
+            self._last_enriched_graph = enriched_graph
+            self._project_and_send(enriched_graph, validation_report, loop_turn=msg.loop_turn)
+
+        elif msg.msg_type == MessageType.SYNTAX_CORRECTION:
+            self._handle_syntax_correction(msg)
+
+        else:
+            print(f"[Agent 4][WARN] Message '{msg.msg_type.value}' non géré — ignoré.")
+
+    # ─────────────────────────────────────────
+    #  Handlers internes
+    # ─────────────────────────────────────────
+
+    def _project_and_send(
+        self,
+        enriched_graph:    EnrichedGraph,
+        validation_report: ValidationReport,
+        loop_turn:         int,
+    ) -> None:
+        """
+        Appelle project() pour générer les Fragment Policies,
+        stocke le résultat et émet POLICIES_READY vers Agent 5.
+        """
+        fp_results = self.project(enriched_graph, validation_report)
+        self._last_fp_results = fp_results
+
+        self.send(AgentMessage(
+            sender    = self.AGENT_NAME,
+            recipient = "agent5",
+            msg_type  = MessageType.POLICIES_READY,
+            payload   = {
+                "fp_results":     fp_results,
+                "enriched_graph": enriched_graph,
+            },
+            loop_turn = loop_turn,
+        ))
+
+    def _handle_syntax_correction(self, msg: AgentMessage) -> None:
+        """
+        Traite une demande de correction syntaxique depuis Agent 5.
+
+        Extrait la liste des policy_uid affectées et les erreurs,
+        applique les corrections déterministes sur self._last_fp_results,
+        puis ré-émet POLICIES_READY avec loop_turn+1.
+        """
+        affected_policies = msg.payload.get("affected_policies", [])
+        errors            = msg.payload.get("errors", [])
+
+        print(
+            f"[Agent 4] SYNTAX_CORRECTION reçu — "
+            f"{len(affected_policies)} policy(ies) affectée(s), "
+            f"{len(errors)} erreur(s) à corriger"
+        )
+
+        self._apply_syntax_corrections(affected_policies, errors)
+
+        # Ré-émettre les policies corrigées vers Agent 5
+        self.send(AgentMessage(
+            sender    = self.AGENT_NAME,
+            recipient = "agent5",
+            msg_type  = MessageType.POLICIES_READY,
+            payload   = {
+                "fp_results":     self._last_fp_results,
+                "enriched_graph": self._last_enriched_graph,
+            },
+            loop_turn = msg.loop_turn + 1,
+        ))
+
+    def _apply_syntax_corrections(
+        self,
+        affected_policies: list[str],
+        errors:            list[dict],
+    ) -> None:
+        """
+        Applique des corrections déterministes JSON-LD sur les policies affectées.
+        Pas de LLM — uniquement des patches structurels sur les champs ODRL.
+
+        Codes d'erreur supportés :
+          MISSING_CONTEXT  → ajouter "@context": "http://www.w3.org/ns/odrl.jsonld"
+          MISSING_TYPE     → ajouter "@type": "Agreement"
+          MALFORMED_URI    → préfixer "uid" avec BASE_URI si absent
+          RULE_MISSING_UID → générer un uid via new_uid() pour la règle concernée
+          MISSING_UID      → générer un uid de policy via new_uid()
+
+        Les corrections ne touchent qu'aux champs structurels JSON-LD —
+        jamais à la logique métier de la policy (règles, actions, contraintes).
+        """
+        if self._last_fp_results is None:
+            print("[Agent 4][WARN] _last_fp_results est None — aucune correction possible.")
+            return
+
+        affected_set = set(affected_policies)
+
+        for fragment_id, fps in self._last_fp_results.items():
+            for policy in fps.all_policies():
+                policy_uid = policy.get("uid", "")
+                if policy_uid not in affected_set:
+                    continue
+
+                for error in errors:
+                    if error.get("policy_uid") != policy_uid:
+                        continue
+
+                    code = error.get("code", "")
+                    path = error.get("path", "")
+
+                    if code == "MISSING_CONTEXT":
+                        if "@context" not in policy:
+                            policy["@context"] = "http://www.w3.org/ns/odrl.jsonld"
+                            print(f"[Agent 4] MISSING_CONTEXT corrigé : {policy_uid}")
+
+                    elif code == "MISSING_TYPE":
+                        if "@type" not in policy:
+                            policy["@type"] = "Agreement"
+                            print(f"[Agent 4] MISSING_TYPE corrigé : {policy_uid}")
+
+                    elif code == "MALFORMED_URI":
+                        uid = policy.get("uid", "")
+                        if uid and not uid.startswith("http"):
+                            policy["uid"] = f"{BASE_URI}/{uid}"
+                            print(f"[Agent 4] MALFORMED_URI corrigé : {uid} → {policy['uid']}")
+
+                    elif code == "MISSING_UID":
+                        if not policy.get("uid"):
+                            policy["uid"] = uri_policy(f"FP_{new_uid()}")
+                            print(f"[Agent 4] MISSING_UID corrigé : {policy['uid']}")
+
+                    elif code == "RULE_MISSING_UID":
+                        # path indique le type de règle ("permission", "obligation", etc.)
+                        rule_type = path or "permission"
+                        rules = policy.get(rule_type, [])
+                        for rule in rules:
+                            if isinstance(rule, dict) and not rule.get("uid"):
+                                rule["uid"] = uri_rule(f"rule_{new_uid()}")
+                                print(
+                                    f"[Agent 4] RULE_MISSING_UID corrigé dans "
+                                    f"'{rule_type}' de {policy_uid}"
+                                )
+
+                    else:
+                        print(
+                            f"[Agent 4][WARN] Code d'erreur inconnu '{code}' "
+                            f"pour {policy_uid} — ignoré."
+                        )
+
+    # ═════════════════════════════════════════
+    #  LOGIQUE MÉTIER (inchangée)
+    # ═════════════════════════════════════════
+
+    def project(
+        self,
+        enriched_graph:    Optional[EnrichedGraph] = None,
+        validation_report: Optional[ValidationReport] = None,
+    ) -> dict[str, "FragmentPolicySet"]:
+        """
+        Point d'entrée unifié : génère les Fragment Policies pour tous les fragments.
+
+        Peut être appelé :
+          - En mode standalone : enriched_graph et validation_report passés en argument
+            ou stockés dans self depuis le constructeur.
+          - Depuis _project_and_send() : arguments explicites fournis par le message.
+        """
+        graph  = enriched_graph    or self.enriched_graph
+        report = validation_report or self.validation_report
+
+        if graph is None:
+            raise ValueError("[Agent 4] Aucun enriched_graph disponible pour la projection.")
+
+        # Mettre à jour les références internes pour les méthodes métier
+        self.enriched_graph    = graph
+        self.validation_report = report
+
+        return self.generate()
+
     # ─────────────────────────────────────────
     #  Point d'entrée — génération (séquentielle)
     # ─────────────────────────────────────────
 
-    def generate(self) -> dict[str, FragmentPolicySet]:
+    def generate(self) -> dict[str, "FragmentPolicySet"]:
         """Génération séquentielle (comportement historique)."""
         print("[Agent 4] Policy Projection Agent — démarrage de la génération")
 
@@ -118,7 +356,7 @@ class PolicyProjectionAgent:
     #  Point d'entrée — génération (parallèle)
     # ─────────────────────────────────────────
 
-    def generate_parallel(self, max_workers: Optional[int] = None) -> dict[str, FragmentPolicySet]:
+    def generate_parallel(self, max_workers: Optional[int] = None) -> dict[str, "FragmentPolicySet"]:
         """
         Génère les policies "par fragment" en parallèle (ThreadPool).
 
@@ -140,8 +378,6 @@ class PolicyProjectionAgent:
                 fps = fut.result()
                 results[frag_id] = fps
 
-        # Conserver un ordre stable (même si dict est ordonné en Py3.7+, ici
-        # on renvoie un dict reconstruit dans l'ordre des fragments initiaux)
         return {fid: results[fid] for fid in frag_ids if fid in results}
 
     # ─────────────────────────────────────────
@@ -196,7 +432,6 @@ class PolicyProjectionAgent:
 
         return fps
 
-
     # ─────────────────────────────────────────
     #  Export JSON-LD ODRL
     # ─────────────────────────────────────────
@@ -220,7 +455,6 @@ class PolicyProjectionAgent:
             exported[fragment_id] = []
 
             for i, policy in enumerate(fps.all_policies()):
-                # Nettoyer les clés internes _xxx → ODRL pur
                 odrl = {k: v for k, v in policy.items() if not k.startswith("_")}
 
                 ptype    = policy.get("_type", "FP")
@@ -231,7 +465,6 @@ class PolicyProjectionAgent:
                 filename = f"{ptype}_{subtype}_{activity.replace('-','_')}.jsonld"
                 filepath = os.path.join(frag_dir, filename)
 
-                # Gérer les doublons de nom
                 counter = 1
                 base_path = filepath
                 while os.path.exists(filepath):
@@ -259,7 +492,7 @@ class PolicyProjectionAgent:
         for mapping in self.enriched_graph.b2p_mappings.values():
             act = mapping.activity_name
             if act in self._activity_rule_index:
-                continue  # déjà indexé
+                continue
 
             b2p = None
             if mapping.b2p_policy_ids:
@@ -290,7 +523,6 @@ class PolicyProjectionAgent:
         )
         policy_uid = uri_policy(f"FPa_{activity_name.replace('-','_')}_{new_uid()}")
 
-        # Cas 1 : B2P existante → projection directe
         if mapping and mapping.b2p_policy_ids:
             b2p = next(
                 (p for p in self.enriched_graph.raw_b2p
@@ -311,7 +543,6 @@ class PolicyProjectionAgent:
                         fpa[rule_type] = b2p[rule_type]
                 return fpa
 
-        # Cas 2 : policy minimale
         rule_uid = uri_rule(f"rule_{activity_name.replace('-','_')}")
         return {
             "@context":     "http://www.w3.org/ns/odrl.jsonld",
@@ -342,18 +573,11 @@ class PolicyProjectionAgent:
 
     # ─────────────────────────────────────────
     #  FIX XOR : FPd depuis les patterns du graphe
-    #  (et non depuis les connexions)
     # ─────────────────────────────────────────
 
     def _fpd_from_pattern(self, pattern, fragment_id: str) -> list[dict]:
         """
         Génère les FPd XOR/AND/OR depuis les patterns détectés par l'Agent 1.
-
-        Pourquoi les patterns et pas les connexions ?
-        Les connexions portent des arêtes gateway→activité.
-        Pour générer enable(ruleij ⊕ ruleik), il faut les DEUX activités cibles
-        d'un même gateway — ce que les patterns exposent directement via
-        graph.out_edges(gateway_id).
         """
         graph   = self.enriched_graph.graph
         gw_node = graph.get_node(pattern.gateway_id)
@@ -364,7 +588,6 @@ class PolicyProjectionAgent:
         if len(out_edges) < 2:
             return []
 
-        # Résoudre les branches : (activity_name, condition)
         branches = []
         for edge in out_edges:
             target = graph.get_node(edge.target)
@@ -374,7 +597,7 @@ class PolicyProjectionAgent:
                     "condition": edge.condition or f"condition_{target.name}",
                 })
 
-        gw_type  = pattern.pattern_type  # fork_xor / fork_and / fork_or
+        gw_type  = pattern.pattern_type
         policies = []
 
         for i in range(len(branches)):
@@ -391,7 +614,6 @@ class PolicyProjectionAgent:
 
     # ─────────────────────────────────────────
     #  gateway:XOR → Listing 7/8
-    #  enable(ruleij ⊕ ruleik)
     # ─────────────────────────────────────────
 
     def _fpd_xor_pair(self, b_i: dict, b_j: dict, gw_name: str, fragment_id: str) -> dict:
@@ -410,7 +632,6 @@ class PolicyProjectionAgent:
             "_gateway_name": gw_name,
             "_activities":   [act_i, act_j],
             "_conditions":   [b_i["condition"], b_j["condition"]],
-            # Listing 7/8 — 2 permissions avec refinement conditionnel
             "permission": [
                 {
                     "uid":    uri_rule(f"XOR_ij_{act_i}_{new_uid()}"),
@@ -437,7 +658,6 @@ class PolicyProjectionAgent:
 
     # ─────────────────────────────────────────
     #  gateway:AND → Listing 5
-    #  enable(ruleij ∧ ruleik)
     # ─────────────────────────────────────────
 
     def _fpd_and_pair(self, b_i: dict, b_j: dict, gw_name: str, fragment_id: str) -> dict:
@@ -456,7 +676,6 @@ class PolicyProjectionAgent:
             "_gateway":      "AND",
             "_gateway_name": gw_name,
             "_activities":   [act_i, act_j],
-            # Listing 5
             "obligation": [{
                 "uid":    uri_rule(f"AND_{act_i}_{act_j}_{new_uid()}"),
                 "target": {"@type": "AssetCollection", "uid": coll},
@@ -472,7 +691,6 @@ class PolicyProjectionAgent:
 
     # ─────────────────────────────────────────
     #  gateway:OR → Listing 6
-    #  enable(ruleij ∨ ruleik)
     # ─────────────────────────────────────────
 
     def _fpd_or_pair(self, b_i: dict, b_j: dict, gw_name: str, fragment_id: str) -> dict:
@@ -490,7 +708,6 @@ class PolicyProjectionAgent:
             "_gateway":      "OR",
             "_gateway_name": gw_name,
             "_activities":   [act_i, act_j],
-            # Listing 6
             "obligation": [
                 {
                     "uid":    uri_rule(f"OR_ij_{act_i}_{new_uid()}"),
@@ -509,7 +726,6 @@ class PolicyProjectionAgent:
 
     # ─────────────────────────────────────────
     #  flow:sequence → Listing 9
-    #  enable(ruleij ≺ ruleik)
     # ─────────────────────────────────────────
 
     def _fpd_flow_sequence(self, conn: ConnectionInfo, fragment_id: str) -> dict:
@@ -526,7 +742,6 @@ class PolicyProjectionAgent:
             "_type":        "FPd",
             "_flow":        "sequence",
             "_activities":  [conn.from_activity, conn.to_activity],
-            # Listing 9
             "permission": [{
                 "uid":    uri_rule(f"SEQ_{conn.from_activity}_{conn.to_activity}_{new_uid()}"),
                 "target": ruleij,
@@ -542,7 +757,6 @@ class PolicyProjectionAgent:
 
     # ─────────────────────────────────────────
     #  flow:message → Listing 10
-    #  ruleix →msg→ enable(rulejy)
     # ─────────────────────────────────────────
 
     def _generate_fpd_message(self, conn, fragment_id: str) -> dict:
@@ -563,7 +777,6 @@ class PolicyProjectionAgent:
             "_from_fragment": from_frag,
             "_to_fragment":   to_frag,
             "_activities":    [conn.from_activity, conn.to_activity],
-            # Listing 10
             "permission": [{
                 "uid":      uri_rule(f"MSG_{conn.from_activity}_{conn.to_activity}_{new_uid()}"),
                 "target":   uri_message(from_frag, to_frag),

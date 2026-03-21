@@ -1,0 +1,30 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPa_perform_checks_for_small_amount_21f3e09f",
+  "@type": "Agreement",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/smallAmountRule",
+      "target": "http://example.com/asset/perform-checks-for-small-amount",
+      "assigner": "http://example.com/FinancialBank:org:FB",
+      "assignee": "http://example.com/staff/FinancialBank:org:FB",
+      "action": [
+        {
+          "rdf:value": {
+            "@id": "odrl:trigger"
+          },
+          "refinement": [
+            {
+              "leftOperand": "count",
+              "operator": "lteq",
+              "rightOperand": {
+                "@value": "10",
+                "@type": "xsd:integer"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

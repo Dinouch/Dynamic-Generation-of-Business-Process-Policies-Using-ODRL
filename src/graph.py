@@ -205,8 +205,10 @@ class BPMNGraph:
     def get_node(self, node_id: str) -> Optional[Node]:
         return self._nodes.get(node_id)
 
+
     def get_edge(self, edge_id: str) -> Optional[Edge]:
         return self._edges.get(edge_id)
+
 
     def successors(self, node_id: str) -> list[Node]:
         """Retourne les nœuds successeurs directs."""

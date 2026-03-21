@@ -1,0 +1,27 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPd_SEQ_41af058e",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/SEQ_ask_for_more_information_check_for_completeness_35a5b6c6",
+      "target": "http://example.com/rules/lateInfoRequestRule",
+      "action": "enable",
+      "duty": [
+        {
+          "action": "nextPolicy",
+          "uid": "http://example.com/policy:201"
+        }
+      ],
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "gt",
+          "rightOperand": {
+            "@id": "odrl:policyUsage"
+          }
+        }
+      ]
+    }
+  ]
+}

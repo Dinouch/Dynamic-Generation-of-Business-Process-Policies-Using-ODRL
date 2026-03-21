@@ -13,10 +13,44 @@ Sortie : EnrichedGraph contenant
     - Le mapping B2P → activités
     - Les connexions typées entre activités
     - Le contexte global CG et local CL pour chaque fragment
+
+─────────────────────────────────────────────────────────────────
+  COUCHE MULTI-AGENT
+─────────────────────────────────────────────────────────────────
+  Cet agent expose également l'infrastructure de messagerie
+  partagée par tous les agents du pipeline :
+
+      MessageType, AgentMessage, ReanalysisLimitError
+
+  Ces classes sont importées par tous les autres agents :
+      from .structural_analyzer import AgentMessage, MessageType, ReanalysisLimitError
+
+  Méthodes multi-agent de StructuralAnalyzer :
+      register_send_callback(fn)  — connecte Agent 1 → Agent 2
+      send(msg)                   — émet un AgentMessage
+      receive(msg)                — accepte STRUCTURAL_UPDATE de Agent 3
+      analyze_and_send()          — analyze() + émet GRAPH_READY
+
+  Boucle structurelle (Agent 3 → Agent 1 → Agent 2) :
+      Quand Agent 3 détecte un STRUCTURAL_ERROR (graphe incomplet),
+      il envoie STRUCTURAL_UPDATE avec des arêtes implicites à ajouter.
+      Agent 1 les injecte chirurgicalement dans _last_enriched_graph
+      via _add_implicit_connections() — SANS re-exécuter analyze().
+
+      Pourquoi pas de re-analyse complète :
+          Tout le pipeline repose sur les noms d'activités comme
+          identifiants stables (_name_to_id, _fragment_of, ConnectionInfo).
+          Re-exécuter analyze() depuis le BPMN brut redonnerait exactement
+          le même graphe sans les nouvelles arêtes. Et modifier les fragments
+          avant désynchroniserait les mappings déjà en mémoire dans les autres
+          agents. La seule opération sûre est d'ajouter des ConnectionInfo
+          implicites au graphe existant.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+import datetime
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Optional
 
 # Import fragmenter à la demande dans analyze() pour éviter dépendance circulaire
 # et garder l'agent utilisable sans fragmenter si fragments est fourni.
@@ -32,6 +66,84 @@ from graph import (
     EdgeType,
     DependencyType,
 )
+
+
+# ─────────────────────────────────────────────
+#  Infrastructure de messagerie multi-agent
+#  (importée par tous les agents du pipeline)
+# ─────────────────────────────────────────────
+
+class MessageType(Enum):
+    """
+    Types de messages échangés entre agents.
+
+    Flux complet du pipeline :
+        Agent 1 ──GRAPH_READY──────────► Agent 2
+        Agent 2 ──CANDIDATES_READY─────► Agent 3
+        Agent 3 ──REFORMULATE──────────► Agent 2   (boucle courte)
+        Agent 3 ──STRUCTURAL_UPDATE────► Agent 1   (boucle structurelle)
+        Agent 3 ──VALIDATION_DONE──────► Agent 4
+        Agent 4 ──POLICIES_READY───────► Agent 5
+        Agent 5 ──SYNTAX_CORRECTION────► Agent 4   (boucle syntaxique)
+        Agent 5 ──ODRL_VALID───────────► pipeline
+        Agent 5 ──ODRL_SYNTAX_ERROR────► pipeline
+    """
+    # Agent 1 → Agent 2
+    GRAPH_READY        = "graph_ready"
+    # Agent 3 → Agent 1  (boucle structurelle)
+    STRUCTURAL_UPDATE  = "structural_update"
+    # Agent 2 → Agent 3
+    CANDIDATES_READY   = "candidates_ready"
+    # Agent 3 → Agent 2  (boucle courte)
+    REFORMULATE        = "reformulate"
+    # Agent 3 → Agent 4
+    VALIDATION_DONE    = "validation_done"
+    # Agent 4 → Agent 5
+    POLICIES_READY     = "policies_ready"
+    # Agent 5 → Agent 4  (boucle syntaxique)
+    SYNTAX_CORRECTION  = "syntax_correction"
+    # Agent 5 → pipeline (signal final)
+    ODRL_VALID         = "odrl_valid"
+    ODRL_SYNTAX_ERROR  = "odrl_syntax_error"
+
+
+@dataclass
+class AgentMessage:
+    """
+    Message échangé entre deux agents du pipeline.
+
+    Champs :
+        sender    — AGENT_NAME de l'émetteur  (ex: "agent1")
+        recipient — AGENT_NAME du destinataire (ex: "agent2")
+        msg_type  — type de message (MessageType)
+        payload   — données spécifiques au message
+        timestamp — ISO généré automatiquement à la création
+        loop_turn — tour de boucle courant :
+                      · 0 pour le premier message d'un cycle
+                      · incrémenté par l'agent qui répond dans une boucle
+                      · Exception : Agent 1 conserve le loop_turn reçu
+                        lors d'un STRUCTURAL_UPDATE (Agent 3 avait déjà incrémenté)
+    """
+    sender:    str
+    recipient: str
+    msg_type:  MessageType
+    payload:   dict
+    timestamp: str = field(
+        default_factory=lambda: datetime.datetime.now().isoformat()
+    )
+    loop_turn: int = 0
+
+    def __repr__(self) -> str:
+        return (
+            f"AgentMessage({self.msg_type.value} | "
+            f"{self.sender} → {self.recipient} | "
+            f"turn={self.loop_turn} | {self.timestamp})"
+        )
+
+
+class ReanalysisLimitError(Exception):
+    """Levée quand Agent 1 dépasse MAX_REANALYSIS."""
+    pass
 
 
 # ─────────────────────────────────────────────
@@ -154,7 +266,18 @@ class StructuralAnalyzer:
 
     Cet agent est DÉTERMINISTE — pas de LLM, pas d'aléatoire.
     Chaque opération est traceable et justifiable.
+
+    ── Couche multi-agent ──────────────────────────────────────────────
+    En mode connecté (pipeline complet) :
+        analyzer.register_send_callback(agent2.receive)
+        analyzer.analyze_and_send()   # démarre le pipeline
+
+    En mode standalone (tests unitaires) :
+        enriched_graph = analyzer.analyze()   # aucun callback nécessaire
     """
+
+    AGENT_NAME     = "agent1"
+    MAX_REANALYSIS = 1   # sécurité : max 1 enrichissement structurel par session
 
     def __init__(
         self,
@@ -172,6 +295,228 @@ class StructuralAnalyzer:
         # Index interne : nom → id (pour la résolution des flows)
         self._name_to_id: dict[str, str] = {}
         self._fragment_of: dict[str, str] = {}  # node_name → fragment_id
+
+        # ── Attributs multi-agent ──────────────────────────────────
+        self._on_send:            Optional[Callable[[AgentMessage], None]] = None
+        self._reanalysis_count:   int = 0
+        self._last_enriched_graph: Optional[EnrichedGraph] = None
+
+    # ─────────────────────────────────────────
+    #  Couche multi-agent
+    # ─────────────────────────────────────────
+
+    def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
+        """
+        Enregistre le callback vers Agent 2.
+        En mode pipeline : analyzer.register_send_callback(agent2.receive)
+        """
+        self._on_send = fn
+        print(f"[Agent 1] Callback send enregistré → {fn}")
+
+    def send(self, msg: AgentMessage) -> None:
+        """Émet un AgentMessage vers le destinataire enregistré."""
+        print(f"[Agent 1] ► SEND {msg}")
+        if self._on_send:
+            self._on_send(msg)
+        else:
+            print(f"[Agent 1][WARN] Aucun callback — message '{msg.msg_type.value}' non transmis.")
+
+    def receive(self, msg: AgentMessage) -> None:
+        """
+        Point d'entrée pour les messages entrants.
+        Accepte uniquement STRUCTURAL_UPDATE (de Agent 3).
+        Ignore tout autre type avec warning — jamais d'exception.
+        """
+        print(f"[Agent 1] ◄ RECEIVE {msg}")
+        if msg.msg_type == MessageType.STRUCTURAL_UPDATE:
+            self._handle_structural_update(msg)
+        else:
+            print(f"[Agent 1][WARN] Message '{msg.msg_type.value}' non géré — ignoré.")
+
+    def analyze_and_send(self) -> None:
+        """
+        Version connectée de analyze() pour le mode pipeline.
+        Lance l'analyse complète puis émet GRAPH_READY vers Agent 2.
+
+        En mode standalone (tests), utiliser analyze() directement.
+        """
+        enriched_graph = self.analyze()
+        self._last_enriched_graph = enriched_graph
+        self.send(AgentMessage(
+            sender    = self.AGENT_NAME,
+            recipient = "agent2",
+            msg_type  = MessageType.GRAPH_READY,
+            payload   = {
+                "enriched_graph":     enriched_graph,
+                "fragment_ids":       list(enriched_graph.fragment_contexts.keys()),
+                "reanalysis":         False,
+                "affected_fragments": None,
+            },
+        ))
+
+    def _handle_structural_update(self, msg: AgentMessage) -> None:
+        """
+        Traite un STRUCTURAL_UPDATE d'Agent 3.
+
+        Enrichissement CHIRURGICAL — sans re-exécuter analyze().
+        Injecte les arêtes implicites dans _last_enriched_graph via
+        _add_implicit_connections(), puis réémet GRAPH_READY.
+
+        Lève ReanalysisLimitError si MAX_REANALYSIS est dépassé.
+        """
+        if self._reanalysis_count >= self.MAX_REANALYSIS:
+            raise ReanalysisLimitError(
+                f"[Agent 1] MAX_REANALYSIS ({self.MAX_REANALYSIS}) atteint. "
+                "Arrêt de la boucle structurelle."
+            )
+        if self._last_enriched_graph is None:
+            raise RuntimeError(
+                "[Agent 1] Aucun graphe en mémoire — "
+                "analyze_and_send() doit être appelé avant receive()."
+            )
+
+        edges_to_add   = msg.payload.get("implicit_edges_to_add", [])
+        affected_frags = msg.payload.get("affected_fragments", [])
+
+        print(
+            f"[Agent 1] Enrichissement structurel demandé par Agent 3 "
+            f"({len(edges_to_add)} arête(s) à ajouter, "
+            f"fragments affectés : {affected_frags})"
+        )
+        if msg.payload.get("reason"):
+            print(f"[Agent 1]   Raison : {msg.payload['reason']}")
+
+        new_connections = self._add_implicit_connections(edges_to_add)
+        self._reanalysis_count += 1
+
+        print(
+            f"[Agent 1] Enrichissement #{self._reanalysis_count} / {self.MAX_REANALYSIS} max — "
+            f"{len(new_connections)} connexion(s) ajoutée(s)"
+        )
+
+        # Conserver le loop_turn reçu — Agent 3 avait déjà incrémenté
+        self.send(AgentMessage(
+            sender    = self.AGENT_NAME,
+            recipient = "agent2",
+            msg_type  = MessageType.GRAPH_READY,
+            payload   = {
+                "enriched_graph":     self._last_enriched_graph,
+                "fragment_ids":       list(self._last_enriched_graph.fragment_contexts.keys()),
+                "reanalysis":         True,
+                "affected_fragments": affected_frags,
+                "new_connections":    new_connections,
+            },
+            loop_turn = msg.loop_turn,  # pas d'incrémentation ici
+        ))
+
+    def _add_implicit_connections(self, edges: list[dict]) -> list[ConnectionInfo]:
+        """
+        Injecte des ConnectionInfo implicites dans le graphe existant.
+
+        Opération chirurgicale — ne touche pas aux nœuds, patterns,
+        ni à la structure des fragments. Utilise _name_to_id (déjà
+        construit lors de analyze(), stable en mémoire) pour résoudre
+        les noms sans risque de désynchronisation.
+
+        Chaque edge dict attendu :
+        {
+            "source_activity": str,      # nom exact de l'activité source
+            "target_activity": str,      # nom exact de l'activité cible
+            "from_fragment":   str,      # fragment_id de la source
+            "to_fragment":     str,      # fragment_id de la cible
+            "dep_type":        str,      # "temporal"|"data"|"role"|"compliance"|"conflict"
+            "is_inter":        bool,     # True si inter-fragment
+            "condition":       str|None, # condition optionnelle
+        }
+
+        Met à jour upstream_deps / downstream_deps des FragmentContext
+        concernés dans _last_enriched_graph.
+
+        Retourne la liste des ConnectionInfo effectivement ajoutées.
+        """
+        new_connections: list[ConnectionInfo] = []
+
+        for edge in edges:
+            src_name  = edge.get("source_activity", "")
+            tgt_name  = edge.get("target_activity", "")
+            from_frag = edge.get("from_fragment", "")
+            to_frag   = edge.get("to_fragment", "")
+            is_inter  = edge.get("is_inter", from_frag != to_frag)
+
+            # Vérifier que les activités existent dans le graphe via _name_to_id
+            if src_name not in self._name_to_id:
+                print(
+                    f"[Agent 1][WARN] Activité source '{src_name}' "
+                    "inconnue dans _name_to_id — arête ignorée."
+                )
+                continue
+            if tgt_name not in self._name_to_id:
+                print(
+                    f"[Agent 1][WARN] Activité cible '{tgt_name}' "
+                    "inconnue dans _name_to_id — arête ignorée."
+                )
+                continue
+
+            # Vérifier les fragments
+            if from_frag and from_frag not in self._last_enriched_graph.fragment_contexts:
+                print(
+                    f"[Agent 1][WARN] Fragment source '{from_frag}' "
+                    "inconnu — arête ajoutée sans mise à jour du contexte."
+                )
+            if to_frag and to_frag not in self._last_enriched_graph.fragment_contexts:
+                print(
+                    f"[Agent 1][WARN] Fragment cible '{to_frag}' "
+                    "inconnu — arête ajoutée sans mise à jour du contexte."
+                )
+
+            conn = ConnectionInfo(
+                from_activity   = src_name,
+                to_activity     = tgt_name,
+                connection_type = edge.get("dep_type", "implicit"),
+                gateway_name    = None,   # implicite — pas de gateway BPMN
+                condition       = edge.get("condition"),
+                is_inter        = is_inter,
+                from_fragment   = from_frag,
+                to_fragment     = to_frag,
+            )
+
+            # Injecter dans la liste globale des connexions
+            self._last_enriched_graph.connections.append(conn)
+            new_connections.append(conn)
+
+            # Mettre à jour les contextes de fragments (upstream/downstream)
+            if from_frag in self._last_enriched_graph.fragment_contexts:
+                ctx = self._last_enriched_graph.fragment_contexts[from_frag]
+                if is_inter and conn not in ctx.downstream_deps:
+                    ctx.downstream_deps.append(conn)
+                # Mettre à jour aussi le contexte global si présent
+                if from_frag in self._last_enriched_graph.global_contexts:
+                    gctx = self._last_enriched_graph.global_contexts[from_frag]
+                    if is_inter and conn not in gctx.downstream_deps:
+                        gctx.downstream_deps.append(conn)
+                    if gctx.all_inter_edges is not None and conn not in gctx.all_inter_edges:
+                        gctx.all_inter_edges.append(conn)
+
+            if to_frag in self._last_enriched_graph.fragment_contexts:
+                ctx = self._last_enriched_graph.fragment_contexts[to_frag]
+                if is_inter and conn not in ctx.upstream_deps:
+                    ctx.upstream_deps.append(conn)
+                # Mettre à jour aussi le contexte global si présent
+                if to_frag in self._last_enriched_graph.global_contexts:
+                    gctx = self._last_enriched_graph.global_contexts[to_frag]
+                    if is_inter and conn not in gctx.upstream_deps:
+                        gctx.upstream_deps.append(conn)
+                    if gctx.all_inter_edges is not None and conn not in gctx.all_inter_edges:
+                        gctx.all_inter_edges.append(conn)
+
+            print(
+                f"[Agent 1] ✓ Arête implicite ajoutée : "
+                f"'{src_name}' → '{tgt_name}' "
+                f"({'inter' if is_inter else 'intra'}, "
+                f"type={edge.get('dep_type', 'implicit')})"
+            )
+
+        return new_connections
 
     # ─────────────────────────────────────────
     #  Point d'entrée principal
@@ -739,4 +1084,3 @@ class StructuralAnalyzer:
             )
 
         return global_contexts
-
