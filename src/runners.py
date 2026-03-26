@@ -78,8 +78,34 @@ def run_sequential_agents(
     print("  AGENT 1 — Structural Analyzer")
     print("=" * 60)
 
-    analyzer = StructuralAnalyzer(bp_model=bp_model, fragments=fragments, b2p_policies=b2p_policies)
+    api_key = os.environ.get("OPENAI_API_KEY")
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    azure_version = os.environ.get("AZURE_OPENAI_API_VERSION")
+    azure_deploy = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+
+    analyzer = StructuralAnalyzer(
+        bp_model=bp_model,
+        fragments=fragments,
+        b2p_policies=b2p_policies,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint or None,
+        azure_api_version=azure_version or None,
+        azure_deployment=azure_deploy or None,
+    )
     enriched_graph = analyzer.analyze()
+
+    rep1 = getattr(enriched_graph, "structural_llm_report", None)
+    if rep1 and rep1.get("llm_used"):
+        print("\nAGENT 1 — Synthèse LLM (ambiguïtés B2P / graphe)")
+        print("-" * 40)
+        for n in rep1.get("notes_globales_fr") or []:
+            if isinstance(n, str) and n.strip():
+                print(f"  • {n.strip()}")
+        g = rep1.get("graphe") or {}
+        if g.get("conseil_fr"):
+            print(f"  Conseil (graphe) : {g['conseil_fr']}")
+    elif rep1 and not rep1.get("llm_used"):
+        print(f"\n[Agent 1] LLM structurel : {rep1.get('reason', 'non utilisé')}")
 
     print("\nFORMAL GRAPH")
     print("-" * 40)
@@ -115,82 +141,30 @@ def run_sequential_agents(
 
     # Agent 2 & 3 require an LLM
     has_llm = bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_KEY"))
-    agent2_results = None
     validation_report = None
 
     if not has_llm:
         print("\n[INFO] No LLM key detected — skipping Agents 2 and 3.")
     else:
         print("\n" + "=" * 60)
-        print("  AGENT 2 — Implicit Dependency Detector")
+        print("  AGENT 2 & 3 — Unhandled formulation / validation (standalone stub)")
         print("=" * 60)
         try:
-            from agents.implicit_dependency_detector import ImplicitDependencyDetector
+            from agents.constraint_validator import ConstraintValidator
 
-            detector = ImplicitDependencyDetector(
-                enriched_graph=enriched_graph,
-                context_mode=context_mode,
+            validator = ConstraintValidator(enriched_graph=enriched_graph)
+            validation_report = validator.validate(enriched_graph, proposals=[])
+            print(
+                f"\n  ValidationReport: accepted_unhandled="
+                f"{len(validation_report.accepted_unhandled_proposals)} "
+                f"(use full pipeline for Agent 2 LLM formulation)"
             )
-            agent2_results = detector.detect(enriched_graph)
-
-            print("\nCandidates by fragment:")
-            print("-" * 40)
-            for frag_id, analysis in agent2_results.items():
-                print(f"\n  Fragment {frag_id} : {len(analysis.candidates)} candidate(s)")
-                for c in analysis.candidates:
-                    conf = "high" if c.is_high_confidence else "low"
-                    print(f"    - {c}  [confidence={conf}]")
-                    j = c.justification[:80] + ("..." if len(c.justification) > 80 else "")
-                    print(f"      {j}")
-                if not analysis.candidates:
-                    print("    (none)")
         except Exception as e:
-            print(f"[ERROR Agent 2] {e}")
+            print(f"[ERROR Agent 3] {e}")
             import traceback
 
             traceback.print_exc()
-            agent2_results = None
-
-        if agent2_results:
-            print("\n" + "=" * 60)
-            print("  AGENT 3 — Constraint Validator")
-            print("=" * 60)
-            try:
-                from agents.constraint_validator import ConstraintValidator
-
-                validator = ConstraintValidator(
-                    enriched_graph=enriched_graph,
-                    analysis_results=agent2_results,
-                )
-                validation_report = validator.validate(enriched_graph, agent2_results)
-
-                print("\nDecisions:")
-                print("-" * 40)
-                icons = {
-                    "accepted": "[OK]",
-                    "rejected": "[KO]",
-                    "reformulate": "[~~]",
-                    "structural_error": "[!!]",
-                }
-                for r in validation_report.results:
-                    d = r.decision.value
-                    inter = " [INTER]" if r.candidate.is_inter else ""
-                    print(f"\n  {icons.get(d, '?')} [{d.upper():16s}] {r.candidate.source_activity} → {r.candidate.target_activity}{inter}")
-                    if r.reason:
-                        print(f"     Reason      : {r.reason.value}")
-                    print(f"     Explanation : {r.explanation[:80]}...")
-
-                print(
-                    f"\n  Accepted={len(validation_report.accepted)}  "
-                    f"Rejected={len(validation_report.rejected)}  "
-                    f"Reformulate={len(validation_report.reformulate)}"
-                )
-            except Exception as e:
-                print(f"[ERROR Agent 3] {e}")
-                import traceback
-
-                traceback.print_exc()
-                validation_report = None
+            validation_report = None
 
     print("\n" + "=" * 60)
     print("  AGENT 4 — Policy Projection Agent")
@@ -203,6 +177,10 @@ def run_sequential_agents(
         projector = PolicyProjectionAgent(
             enriched_graph=enriched_graph,
             validation_report=validation_report,
+            api_key=api_key,
+            azure_endpoint=azure_endpoint or None,
+            azure_api_version=azure_version or None,
+            azure_deployment=azure_deploy or None,
         )
         fp_results = projector.project(enriched_graph, validation_report)
 

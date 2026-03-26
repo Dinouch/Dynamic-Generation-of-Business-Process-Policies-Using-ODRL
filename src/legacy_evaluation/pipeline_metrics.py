@@ -9,8 +9,8 @@ Chaque métrique est documentée par un commentaire justifiant son choix
 
 USAGE
 ────
-    from pipeline_metrics import PipelineMetricsCollector
-    from metrics_visualization import print_metrics_report, export_metrics_json
+    from legacy_evaluation.pipeline_metrics import PipelineMetricsCollector
+    from legacy_evaluation.metrics_visualization import print_metrics_report, export_metrics_json
 
     collector = PipelineMetricsCollector(...)
     metrics = collector.compute_all()

@@ -1,0 +1,70 @@
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix odrl:  <http://www.w3.org/ns/odrl/2/> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+# ODRL 2.2 — shapes Agent 5 (syntaxe). Ne pas contraindre odrl:uid en RDF : le contexte
+# W3C mappe ``uid`` → @id ; il n'y a pas de triple séparé odrl:uid. On valide l'IRI du
+# nœud cible via sh:nodeKind sh:IRI sur la NodeShape (pas de sh:path odrl:uid).
+
+_:OdrlPolicySet a sh:NodeShape ;
+    sh:targetClass odrl:Set ;
+    sh:nodeKind sh:IRI .
+
+_:OdrlPolicyAgreement a sh:NodeShape ;
+    sh:targetClass odrl:Agreement ;
+    sh:nodeKind sh:IRI .
+
+_:OdrlPolicyOffer a sh:NodeShape ;
+    sh:targetClass odrl:Offer ;
+    sh:nodeKind sh:IRI .
+
+_:PermissionRuleShape a sh:NodeShape ;
+    sh:targetObjectsOf odrl:permission ;
+    sh:nodeKind sh:IRI ;
+    sh:property [
+        sh:path odrl:target ;
+        sh:minCount 1 ;
+    ] ;
+    sh:property [
+        sh:path odrl:action ;
+        sh:minCount 1 ;
+    ] .
+
+_:ProhibitionRuleShape a sh:NodeShape ;
+    sh:targetObjectsOf odrl:prohibition ;
+    sh:nodeKind sh:IRI ;
+    sh:property [
+        sh:path odrl:target ;
+        sh:minCount 1 ;
+    ] ;
+    sh:property [
+        sh:path odrl:action ;
+        sh:minCount 1 ;
+    ] .
+
+_:ObligationRuleShape a sh:NodeShape ;
+    sh:targetObjectsOf odrl:obligation ;
+    sh:nodeKind sh:IRI ;
+    sh:property [
+        sh:path odrl:target ;
+        sh:minCount 1 ;
+    ] ;
+    sh:property [
+        sh:path odrl:action ;
+        sh:minCount 1 ;
+    ] .
+
+_:ConstraintShape a sh:NodeShape ;
+    sh:targetObjectsOf odrl:constraint ;
+    sh:property [
+        sh:path odrl:leftOperand ;
+        sh:minCount 1 ;
+    ] ;
+    sh:property [
+        sh:path odrl:operator ;
+        sh:minCount 1 ;
+    ] ;
+    sh:property [
+        sh:path odrl:rightOperand ;
+        sh:minCount 1 ;
+    ] .

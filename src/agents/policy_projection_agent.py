@@ -18,12 +18,17 @@ Couche multi-agent :
         SYNTAX_CORRECTION reçu → corrections déterministes → POLICIES_READY ré-émis
 """
 
+import copy
 import json
 import os
+import re
+import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from openai import AzureOpenAI, OpenAI
 
 from .structural_analyzer import (
     AgentMessage,
@@ -32,7 +37,20 @@ from .structural_analyzer import (
     MessageType,
 )
 from .constraint_validator import ValidationReport
-from .implicit_dependency_detector import CandidateDependency, ImplicitDepType
+from .unhandled_case_formulator import UnhandledCaseProposal
+
+
+# ─────────────────────────────────────────────
+#  Template keys for hint-based ODRL patching (extend without changing core logic)
+# ─────────────────────────────────────────────
+
+TEMPLATE_KEY_MAP: dict[str, str] = {
+    "constraint_operator": "operator",
+    "constraint_left_operand": "leftOperand",
+    "constraint_right_operand": "rightOperand",
+    "action_id": "action",
+    "rule_type": "rule_type",
+}
 
 
 # ─────────────────────────────────────────────
@@ -50,6 +68,7 @@ def uri_rule(name: str) -> str:
 def uri_asset(name: str) -> str:
     return f"{BASE_URI}/asset/{name.replace(' ','_').replace('-','_')}"
 
+
 def uri_collection(name: str) -> str:
     return f"{BASE_URI}/assets/{name.replace(' ','_').replace('-','_')}"
 
@@ -58,6 +77,35 @@ def uri_message(fi: str, fj: str) -> str:
 
 def new_uid() -> str:
     return str(uuid.uuid4())[:8]
+
+
+# Chaîne "enable" seule ne matérialise pas odrl:action sur le nœud règle après expand→RDF (pyld).
+ODRL_ACTION_ENABLE: dict[str, str] = {"@id": "odrl:enable"}
+
+
+def _coerce_odrl_action_from_hint(action: object) -> object:
+    """
+    Normalise le hint ``action`` d'Agent 2 vers une valeur compatible pyld/SHACL.
+
+    Les sorties LLM du type ``odrl:trigger (re-trigger...)`` ne sont pas des IRIs ;
+    on retombe sur ``odrl:enable``.
+    """
+    if action is None:
+        return ODRL_ACTION_ENABLE
+    if isinstance(action, dict):
+        return action if action.get("@id") else ODRL_ACTION_ENABLE
+    if isinstance(action, str):
+        s = action.strip()
+        if not s or s.lower() == "enable":
+            return ODRL_ACTION_ENABLE
+        if " " in s or "(" in s or "\n" in s or len(s) > 72:
+            return ODRL_ACTION_ENABLE
+        if s.startswith("odrl:"):
+            return {"@id": s}
+        if s.startswith("http://") or s.startswith("https://"):
+            return {"@id": s}
+        return ODRL_ACTION_ENABLE
+    return ODRL_ACTION_ENABLE
 
 
 # ─────────────────────────────────────────────
@@ -115,16 +163,59 @@ class PolicyProjectionAgent:
     """
 
     AGENT_NAME = "agent4"
+    MODEL = "gpt-4o"
+    TEMPERATURE = 0.2
+
+    _UNHANDLED_SYSTEM = (
+        "You are an ODRL 2.2 expert. You output only valid JSON (no markdown fences). "
+        "The JSON must include keys problem_interpretation, business_intent, odrl_policy."
+    )
 
     def __init__(
         self,
         enriched_graph:    Optional[EnrichedGraph] = None,
         validation_report: Optional[ValidationReport] = None,
+        api_key: Optional[str] = None,
+        *,
+        azure_endpoint: Optional[str] = None,
+        azure_api_version: Optional[str] = None,
+        azure_deployment: Optional[str] = None,
     ):
         self.enriched_graph    = enriched_graph
         self.validation_report = validation_report
         self._activity_rule_index:   dict[str, str] = {}
         self._activity_policy_index: dict[str, str] = {}
+
+        self._unhandled_fpd_llm_cache: dict[str, dict] = {}
+        self._unhandled_cache_lock = threading.Lock()
+        self._use_azure = False
+        self._deployment: Optional[str] = None
+        self.client: Optional[Any] = None
+
+        key_azure = api_key or os.environ.get("AZURE_OPENAI_KEY") or os.environ.get(
+            "AZURE_OPENAI_API_KEY"
+        )
+        endpoint = (azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "")).rstrip("/")
+        if key_azure and endpoint:
+            self._use_azure = True
+            self._deployment = (
+                azure_deployment
+                or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+                or os.environ.get("AZURE_OPENAI_MODEL")
+                or "gpt-4o"
+            )
+            api_ver = azure_api_version or os.environ.get(
+                "AZURE_OPENAI_API_VERSION", "2024-12-01-preview"
+            )
+            self.client = AzureOpenAI(
+                api_key=key_azure,
+                api_version=api_ver,
+                azure_endpoint=endpoint,
+            )
+        else:
+            key = api_key or os.environ.get("OPENAI_API_KEY")
+            if key:
+                self.client = OpenAI(api_key=key)
 
         # ── Couche multi-agent ──────────────────────────────────────
         self._on_send:             Optional[Callable[[AgentMessage], None]] = None
@@ -152,8 +243,10 @@ class PolicyProjectionAgent:
         Point d'entrée des messages entrants.
 
         Messages acceptés :
-          - VALIDATION_DONE   : rapport de validation depuis Agent 3
-          - SYNTAX_CORRECTION : corrections JSON-LD à appliquer depuis Agent 5
+          - VALIDATION_DONE     : rapport depuis Agent 3 → génère policies → POLICIES_READY vers Agent 3
+          - SEMANTIC_CORRECTION : correctifs sémantiques depuis Agent 3
+          - SEMANTIC_VALIDATED  : policies validées sémantiquement → POLICIES_READY vers Agent 5
+          - SYNTAX_CORRECTION   : corrections depuis Agent 5 (syntaxe)
 
         Tout autre type est ignoré avec un warning.
         """
@@ -163,6 +256,12 @@ class PolicyProjectionAgent:
             enriched_graph    = msg.payload["enriched_graph"]
             self._last_enriched_graph = enriched_graph
             self._project_and_send(enriched_graph, validation_report, loop_turn=msg.loop_turn)
+
+        elif msg.msg_type == MessageType.SEMANTIC_CORRECTION:
+            self._handle_semantic_correction(msg)
+
+        elif msg.msg_type == MessageType.SEMANTIC_VALIDATED:
+            self._handle_semantic_validated(msg)
 
         elif msg.msg_type == MessageType.SYNTAX_CORRECTION:
             self._handle_syntax_correction(msg)
@@ -182,14 +281,14 @@ class PolicyProjectionAgent:
     ) -> None:
         """
         Appelle project() pour générer les Fragment Policies,
-        stocke le résultat et émet POLICIES_READY vers Agent 5.
+        stocke le résultat et émet POLICIES_READY vers Agent 3 (validation sémantique).
         """
         fp_results = self.project(enriched_graph, validation_report)
         self._last_fp_results = fp_results
 
         self.send(AgentMessage(
             sender    = self.AGENT_NAME,
-            recipient = "agent5",
+            recipient = "agent3",
             msg_type  = MessageType.POLICIES_READY,
             payload   = {
                 "fp_results":     fp_results,
@@ -241,7 +340,8 @@ class PolicyProjectionAgent:
         Codes d'erreur supportés :
           MISSING_CONTEXT  → ajouter "@context": "http://www.w3.org/ns/odrl.jsonld"
           MISSING_TYPE     → ajouter "@type": "Agreement"
-          MALFORMED_URI    → préfixer "uid" avec BASE_URI si absent
+          MALFORMED_URI    → extraire une IRI http(s) depuis ``suggestion`` (regex) ;
+                             sinon préfixer ``uid`` avec BASE_URI si relatif
           RULE_MISSING_UID → générer un uid via new_uid() pour la règle concernée
           MISSING_UID      → générer un uid de policy via new_uid()
 
@@ -278,10 +378,22 @@ class PolicyProjectionAgent:
                             print(f"[Agent 4] MISSING_TYPE corrigé : {policy_uid}")
 
                     elif code == "MALFORMED_URI":
-                        uid = policy.get("uid", "")
-                        if uid and not uid.startswith("http"):
-                            policy["uid"] = f"{BASE_URI}/{uid}"
-                            print(f"[Agent 4] MALFORMED_URI corrigé : {uid} → {policy['uid']}")
+                        import re
+
+                        suggestion = error.get("suggestion") or ""
+                        match = re.search(r'https?://[^\s"\'\.>]+', suggestion)
+                        if match:
+                            policy["uid"] = match.group(0)
+                            print(
+                                f"[Agent 4] MALFORMED_URI corrigé : {suggestion[:60]} → {policy['uid']}"
+                            )
+                        else:
+                            uid = policy.get("uid", "")
+                            if uid and not uid.startswith("http"):
+                                policy["uid"] = f"{BASE_URI}/{uid}"
+                                print(
+                                    f"[Agent 4] MALFORMED_URI corrigé (fallback) : {uid} → {policy['uid']}"
+                                )
 
                     elif code == "MISSING_UID":
                         if not policy.get("uid"):
@@ -294,7 +406,8 @@ class PolicyProjectionAgent:
                         rules = policy.get(rule_type, [])
                         for rule in rules:
                             if isinstance(rule, dict) and not rule.get("uid"):
-                                rule["uid"] = uri_rule(f"rule_{new_uid()}")
+                                ru = uri_rule(f"rule_{new_uid()}")
+                                rule["uid"] = ru
                                 print(
                                     f"[Agent 4] RULE_MISSING_UID corrigé dans "
                                     f"'{rule_type}' de {policy_uid}"
@@ -305,6 +418,333 @@ class PolicyProjectionAgent:
                             f"[Agent 4][WARN] Code d'erreur inconnu '{code}' "
                             f"pour {policy_uid} — ignoré."
                         )
+
+    def _handle_semantic_correction(self, msg: AgentMessage) -> None:
+        """
+        Apply semantic hints from Agent 3 to policies in ``_last_fp_results``,
+        then re-emit ``POLICIES_READY`` to Agent 3.
+
+        Parameters
+        ----------
+        msg
+            Payload includes ``semantic_hints`` (list of dicts) and ``fp_results``.
+        """
+        hints = msg.payload.get("semantic_hints") or []
+        fp_results = msg.payload.get("fp_results") or self._last_fp_results
+        if fp_results is not None:
+            self._last_fp_results = fp_results
+        eg = msg.payload.get("enriched_graph")
+        if eg is not None:
+            self._last_enriched_graph = eg
+
+        print(f"[Agent 4] SEMANTIC_CORRECTION — {len(hints)} hint(s)")
+
+        for h in hints:
+            uid = h.get("policy_uid")
+            if not uid or not self._last_fp_results:
+                continue
+            policy = self._find_policy_by_uid(uid)
+            if policy is None:
+                print(f"[Agent 4][WARN] Policy uid {uid} not found for semantic patch.")
+                continue
+            path = h.get("field_path", "")
+            if not path:
+                print(f"[Agent 4][WARN] Empty field_path for policy {uid}.")
+                continue
+            self._set_field_path(policy, path, h.get("suggested_fix", ""))
+
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent3",
+                msg_type=MessageType.POLICIES_READY,
+                payload={
+                    "fp_results": self._last_fp_results,
+                    "enriched_graph": self._last_enriched_graph,
+                },
+                loop_turn=msg.loop_turn + 1,
+            )
+        )
+
+    def _handle_semantic_validated(self, msg: AgentMessage) -> None:
+        """
+        Forward semantically validated policies to Agent 5.
+
+        Parameters
+        ----------
+        msg
+            Payload includes ``fp_results`` and ``enriched_graph``.
+        """
+        fp_results = msg.payload.get("fp_results")
+        if fp_results is not None:
+            self._last_fp_results = fp_results
+        eg = msg.payload.get("enriched_graph")
+        if eg is not None:
+            self._last_enriched_graph = eg
+
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent5",
+                msg_type=MessageType.POLICIES_READY,
+                payload={
+                    "fp_results": self._last_fp_results,
+                    "enriched_graph": self._last_enriched_graph,
+                },
+                loop_turn=msg.loop_turn,
+            )
+        )
+
+    def _find_policy_by_uid(self, policy_uid: str) -> Optional[dict]:
+        """Locate a policy dict by its ``uid`` across all fragment results."""
+        if not self._last_fp_results:
+            return None
+        for fps in self._last_fp_results.values():
+            for pol in fps.all_policies():
+                if pol.get("uid") == policy_uid:
+                    return pol
+        return None
+
+    def _set_field_path(self, policy: dict, path: str, fix: str) -> None:
+        """
+        Navigate ``path`` (e.g. permission[0].constraint[0].operator) and assign
+        a value derived from ``suggested_fix`` text (best-effort).
+        """
+        parts = path.split(".")
+        cur: Any = policy
+        for seg in parts[:-1]:
+            if "[" in seg:
+                name, rest = seg.split("[", 1)
+                idx = int(rest.split("]")[0])
+                cur = cur[name][idx]
+            else:
+                cur = cur[seg]
+        last = parts[-1]
+        last_name = last.split("[", 1)[0] if "[" in last else last
+        val = self._coerce_semantic_fix(fix, field_name=last_name)
+        if "[" in last:
+            name, rest = last.split("[", 1)
+            idx = int(rest.split("]")[0])
+            cur[name][idx] = val
+        else:
+            cur[last] = val
+
+    def _coerce_semantic_fix(self, fix: str, field_name: str = "") -> str:
+        """
+        Map common English fix phrases to ODRL operator tokens.
+        For ``uid`` / targets, extract an http(s) IRI from LLM prose (\"set uid to ...\").
+        """
+        fix = fix.strip().strip('"')
+        if field_name == "uid" or (field_name and "uid" in field_name.lower()):
+            m = re.search(r"https?://[^\s\"'<>\\\]]+", fix)
+            if m:
+                return m.group(0).rstrip(".,;)")
+        m = re.search(r"https?://[^\s\"'<>\\\]]+", fix)
+        if m and field_name in ("uid", "target", "assignee", "assigner"):
+            return m.group(0).rstrip(".,;)")
+        low = fix.lower()
+        for token in ("gteq", "lteq", "neq", "eq", "gt", "lt"):
+            if token in low:
+                return token
+        return fix
+
+
+    def _parse_llm_json_object(self, raw: str) -> dict:
+        """Extrait un objet JSON depuis une réponse LLM (éventuellement entourée de fences)."""
+        text = raw.strip()
+        if "```" in text:
+            for chunk in text.split("```"):
+                chunk = chunk.strip()
+                if chunk.lower().startswith("json"):
+                    chunk = chunk[4:].strip()
+                if chunk.startswith("{") and chunk.endswith("}"):
+                    try:
+                        return json.loads(chunk)
+                    except json.JSONDecodeError:
+                        continue
+        return json.loads(text)
+
+    def _unhandled_structural_context(self, proposal: UnhandledCaseProposal) -> Optional[dict]:
+        """Contexte Agent 1 (UnhandledPattern) pour enrichir le prompt — même flux pour tous les types."""
+        eg = self.enriched_graph
+        if not eg:
+            return None
+        patterns = getattr(eg, "unhandled_patterns", None) or []
+        for up in patterns:
+            if up.pattern_type != proposal.pattern_type:
+                continue
+            if proposal.fragment_id and up.fragment_id != proposal.fragment_id:
+                continue
+            if proposal.gateway_name and up.gateway_name != proposal.gateway_name:
+                continue
+            return {
+                "structural_description": up.description,
+                "bpmn_semantic": up.bpmn_semantic,
+                "involved_fragment_ids": list(up.involved_fragment_ids or []),
+                "involved_activity_names": list(up.involved_activity_names or []),
+            }
+        return None
+
+    def _call_llm(self, system: str, user: str) -> str:
+        if not self.client:
+            raise RuntimeError("LLM client not configured for Agent 4")
+        model = self._deployment if self._use_azure else self.MODEL
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "temperature": self.TEMPERATURE,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if not self._use_azure:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = self.client.chat.completions.create(**kwargs)
+        content = response.choices[0].message.content
+        if not content:
+            raise RuntimeError("Empty LLM response (Agent 4 unhandled)")
+        return content
+
+    def _normalize_odrl_actions_in_policy(self, policy: dict) -> None:
+        """Assure des actions ODRL expansibles (pyld/SHACL) sur permission/prohibition/obligation."""
+        for key in ("permission", "prohibition", "obligation"):
+            rules = policy.get(key)
+            if not isinstance(rules, list):
+                continue
+            for rule in rules:
+                if isinstance(rule, dict) and "action" in rule:
+                    rule["action"] = _coerce_odrl_action_from_hint(rule.get("action"))
+
+    def _llm_synthesize_unhandled_policy(self, proposal: UnhandledCaseProposal) -> Optional[dict]:
+        """
+        Interprète le cas, déduit l'intention métier et produit un document ODRL JSON-LD
+        (même chemin pour tous les pattern_type, sans branche spéciale).
+        """
+        structural = self._unhandled_structural_context(proposal)
+        payload = {
+            "proposal": proposal.to_dict(),
+            "bpmn_structural_context": structural,
+            "base_uri": BASE_URI,
+            "requested_rule_type": proposal.odrl_rule_type,
+        }
+        user_prompt = f"""You assist in BPMN-to-ODRL translation for a validated unhandled pattern.
+
+Work through these steps internally, then output JSON only:
+1) INTERPRET the structural problem (cycles, gateways, activities, fragments, hints from Agent 2).
+2) DEDUCE a clear business intent (one or two sentences) that a sensible ODRL policy should express.
+3) GENERATE one ODRL 2.2 JSON-LD policy object in field "odrl_policy".
+
+Input (JSON):
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+Requirements for "odrl_policy":
+- "@context": "http://www.w3.org/ns/odrl.jsonld"
+- "@type": "Set" or "Agreement"
+- "uid": a full IRI under {BASE_URI}/policy:...
+- Include exactly one of permission, prohibition, obligation matching requested_rule_type "{proposal.odrl_rule_type}"
+- Each rule: "uid" (IRI), "target" (IRI asset), "action" as {{"@id": "odrl:enable"}} or another valid odrl action IRI
+- Prefer concrete assets derived from activity/gateway names; avoid nonsense policies — if the pattern is incoherent, still emit a minimal prohibition or obligation that documents "no valid operation" rather than fake permissions.
+
+Respond with JSON only:
+{{
+  "problem_interpretation": "string",
+  "business_intent": "string",
+  "odrl_policy": {{ ... }}
+}}
+"""
+        raw = self._call_llm(self._UNHANDLED_SYSTEM, user_prompt)
+        data = self._parse_llm_json_object(raw)
+        interp = data.get("problem_interpretation", "")
+        intent = data.get("business_intent", "")
+        if interp or intent:
+            print(
+                f"[Agent 4] Unhandled LLM — interprétation: {interp[:160]}{'…' if len(interp) > 160 else ''}"
+            )
+            print(
+                f"[Agent 4] Unhandled LLM — intention métier: {intent[:160]}{'…' if len(intent) > 160 else ''}"
+            )
+        odrl = data.get("odrl_policy")
+        if not isinstance(odrl, dict):
+            print("[Agent 4][WARN] LLM response missing odrl_policy object")
+            return None
+        if not odrl.get("uid"):
+            odrl["uid"] = uri_policy(f"FPd_UNH_{proposal.pattern_type}_{new_uid()}")
+        if "@context" not in odrl:
+            odrl["@context"] = "http://www.w3.org/ns/odrl.jsonld"
+        self._normalize_odrl_actions_in_policy(odrl)
+        return odrl
+
+    def _fallback_minimal_unhandled_fpd(
+        self,
+        proposal: UnhandledCaseProposal,
+        target_fragment_id: Optional[str],
+    ) -> dict:
+        """Repli sans LLM : policy minimale cohérente, sans logique spécifique à un pattern."""
+        frag = target_fragment_id or proposal.fragment_id or "fragment"
+        uid = uri_policy(f"FPd_UNH_{proposal.pattern_type}_{frag.replace('-', '_')}_{new_uid()}")
+        rule_uid = uri_rule(f"rule_unh_{new_uid()}")
+        rt = proposal.odrl_rule_type if proposal.odrl_rule_type in (
+            "permission",
+            "prohibition",
+            "obligation",
+        ) else "permission"
+        tgt = uri_asset(proposal.gateway_name or frag or "asset")
+        rule_body: dict = {
+            "uid": rule_uid,
+            "target": tgt,
+            "action": ODRL_ACTION_ENABLE,
+        }
+        out: dict = {
+            "@context": "http://www.w3.org/ns/odrl.jsonld",
+            "uid": uid,
+            "@type": "Set",
+            "_fragment_id": frag,
+            "_type": "FPd",
+            "_unhandled_pattern": proposal.pattern_type,
+            "_gateway_name": proposal.gateway_name,
+            "_hint_text": proposal.hint_text,
+        }
+        if proposal.hint_text:
+            out["dct:description"] = proposal.hint_text
+        out[rt] = [rule_body]
+        return out
+
+    def _generate_fpd_from_unhandled_proposal(
+        self,
+        proposal: UnhandledCaseProposal,
+        target_fragment_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        FPd depuis une proposition unhandled validée : synthèse LLM (interprétation → intention → ODRL),
+        avec cache par proposition pour les fragments multiples.
+        """
+        cache_key = json.dumps(proposal.to_dict(), sort_keys=True)
+        with self._unhandled_cache_lock:
+            if cache_key not in self._unhandled_fpd_llm_cache:
+                body: Optional[dict] = None
+                if self.client:
+                    try:
+                        body = self._llm_synthesize_unhandled_policy(proposal)
+                    except Exception as e:
+                        print(f"[Agent 4][WARN] LLM unhandled synthesis failed: {e}")
+                if body is None:
+                    print(
+                        "[Agent 4] Repli déterministe minimal pour unhandled "
+                        f"({proposal.pattern_type}, fragment cible "
+                        f"{target_fragment_id or proposal.fragment_id})"
+                    )
+                    body = self._fallback_minimal_unhandled_fpd(proposal, target_fragment_id)
+                self._unhandled_fpd_llm_cache[cache_key] = body
+
+            base = self._unhandled_fpd_llm_cache[cache_key]
+        out = copy.deepcopy(base)
+        frag = target_fragment_id or proposal.fragment_id or "fragment"
+        out["_fragment_id"] = frag
+        out["_type"] = "FPd"
+        out["_unhandled_pattern"] = proposal.pattern_type
+        out["_gateway_name"] = proposal.gateway_name
+        out["_hint_text"] = proposal.hint_text
+        return out
 
     # ═════════════════════════════════════════
     #  LOGIQUE MÉTIER (inchangée)
@@ -343,6 +783,8 @@ class PolicyProjectionAgent:
         """Génération séquentielle (comportement historique)."""
         print("[Agent 4] Policy Projection Agent — démarrage de la génération")
 
+        self._unhandled_fpd_llm_cache = {}
+
         # Pré-indexer TOUTES les activités avant de générer les FPd inter-fragments
         self._preindex_all_activities()
 
@@ -366,6 +808,7 @@ class PolicyProjectionAgent:
         - Ensuite chaque fragment est généré indépendamment.
         """
         print("[Agent 4] Policy Projection Agent — génération parallèle")
+        self._unhandled_fpd_llm_cache = {}
         self._preindex_all_activities()
 
         frag_ids = list(self.enriched_graph.fragment_contexts.keys())
@@ -417,14 +860,23 @@ class PolicyProjectionAgent:
             if fpd:
                 fps.fpd_policies.append(fpd)
 
-        # Étape 3 — FPd depuis dépendances implicites validées (Agent 3)
+        # Étape 3 — FPd depuis propositions « unhandled » validées (Agent 3)
         if self.validation_report:
-            for vr in self.validation_report.accepted:
-                c = vr.candidate
-                if c.source_fragment == fragment_id:
-                    fpd = self._generate_fpd_from_implicit(c)
-                    if fpd:
-                        fps.fpd_policies.append(fpd)
+            for prop in getattr(
+                self.validation_report, "accepted_unhandled_proposals", []
+            ) or []:
+                if isinstance(prop, dict):
+                    prop = UnhandledCaseProposal.from_dict(prop)
+                targets = list(prop.involved_fragment_ids or [])
+                if not targets:
+                    targets = [prop.fragment_id] if prop.fragment_id else []
+                if fragment_id not in targets:
+                    continue
+                fpd = self._generate_fpd_from_unhandled_proposal(
+                    prop, target_fragment_id=fragment_id
+                )
+                if fpd:
+                    fps.fpd_policies.append(fpd)
 
         s = fps.summary()
         print(f"[Agent 4] '{fragment_id}' : "
@@ -459,9 +911,11 @@ class PolicyProjectionAgent:
 
                 ptype    = policy.get("_type", "FP")
                 subtype  = (policy.get("_gateway") or policy.get("_flow") or
-                            policy.get("_dep_type") or str(i))
+                            policy.get("_dep_type") or policy.get("_unhandled_pattern") or
+                            str(i))
                 activity = (policy.get("_activity") or
-                            "_".join(policy.get("_activities", [])[:1]))
+                            "_".join(policy.get("_activities", [])[:1]) or
+                            policy.get("_gateway_name", "policy"))
                 filename = f"{ptype}_{subtype}_{activity.replace('-','_')}.jsonld"
                 filepath = os.path.join(frag_dir, filename)
 
@@ -622,9 +1076,12 @@ class PolicyProjectionAgent:
         ruleij = self._activity_rule_index.get(act_i, uri_rule(f"rule_{act_i.replace('-','_')}"))
         ruleik = self._activity_rule_index.get(act_j, uri_rule(f"rule_{act_j.replace('-','_')}"))
 
+        policy_uid = uri_policy(f"FPd_XOR_{new_uid()}")
+        r_ij = uri_rule(f"XOR_ij_{act_i}_{new_uid()}")
+        r_ik = uri_rule(f"XOR_ik_{act_j}_{new_uid()}")
         return {
             "@context":      "http://www.w3.org/ns/odrl.jsonld",
-            "uid":           uri_policy(f"FPd_XOR_{new_uid()}"),
+            "uid":           policy_uid,
             "@type":         "Set",
             "_fragment_id":  fragment_id,
             "_type":         "FPd",
@@ -634,7 +1091,7 @@ class PolicyProjectionAgent:
             "_conditions":   [b_i["condition"], b_j["condition"]],
             "permission": [
                 {
-                    "uid":    uri_rule(f"XOR_ij_{act_i}_{new_uid()}"),
+                    "uid":    r_ij,
                     "target": ruleij,
                     "action": [{
                         "rdf:value":  {"@id": "odrl:enable"},
@@ -644,7 +1101,7 @@ class PolicyProjectionAgent:
                     }]
                 },
                 {
-                    "uid":    uri_rule(f"XOR_ik_{act_j}_{new_uid()}"),
+                    "uid":    r_ik,
                     "target": ruleik,
                     "action": [{
                         "rdf:value":  {"@id": "odrl:enable"},
@@ -667,9 +1124,11 @@ class PolicyProjectionAgent:
         ruleik = self._activity_rule_index.get(act_j, uri_rule(f"rule_{act_j.replace('-','_')}"))
         coll   = uri_collection(f"{act_i}_{act_j}_AND")
 
+        policy_uid = uri_policy(f"FPd_AND_{new_uid()}")
+        rule_uid = uri_rule(f"AND_{act_i}_{act_j}_{new_uid()}")
         return {
             "@context":      "http://www.w3.org/ns/odrl.jsonld",
-            "uid":           uri_policy(f"FPd_AND_{new_uid()}"),
+            "uid":           policy_uid,
             "@type":         "Set",
             "_fragment_id":  fragment_id,
             "_type":         "FPd",
@@ -677,9 +1136,9 @@ class PolicyProjectionAgent:
             "_gateway_name": gw_name,
             "_activities":   [act_i, act_j],
             "obligation": [{
-                "uid":    uri_rule(f"AND_{act_i}_{act_j}_{new_uid()}"),
+                "uid":    rule_uid,
                 "target": {"@type": "AssetCollection", "uid": coll},
-                "action": "enable"
+                "action": ODRL_ACTION_ENABLE,
             }],
             "_asset_collection": [
                 {"@type": "dc:Document", "@id": ruleij,
@@ -699,9 +1158,12 @@ class PolicyProjectionAgent:
         ruleij = self._activity_rule_index.get(act_i, uri_rule(f"rule_{act_i.replace('-','_')}"))
         ruleik = self._activity_rule_index.get(act_j, uri_rule(f"rule_{act_j.replace('-','_')}"))
 
+        policy_uid = uri_policy(f"FPd_OR_{new_uid()}")
+        r_ij = uri_rule(f"OR_ij_{act_i}_{new_uid()}")
+        r_ik = uri_rule(f"OR_ik_{act_j}_{new_uid()}")
         return {
             "@context":      "http://www.w3.org/ns/odrl.jsonld",
-            "uid":           uri_policy(f"FPd_OR_{new_uid()}"),
+            "uid":           policy_uid,
             "@type":         "Set",
             "_fragment_id":  fragment_id,
             "_type":         "FPd",
@@ -710,16 +1172,16 @@ class PolicyProjectionAgent:
             "_activities":   [act_i, act_j],
             "obligation": [
                 {
-                    "uid":    uri_rule(f"OR_ij_{act_i}_{new_uid()}"),
+                    "uid":    r_ij,
                     "target": ruleij,
-                    "action": "enable",
-                    "consequence": [{"target": ruleik, "action": "enable"}]
+                    "action": ODRL_ACTION_ENABLE,
+                    "consequence": [{"target": ruleik, "action": ODRL_ACTION_ENABLE}],
                 },
                 {
-                    "uid":    uri_rule(f"OR_ik_{act_j}_{new_uid()}"),
+                    "uid":    r_ik,
                     "target": ruleik,
-                    "action": "enable",
-                    "consequence": [{"target": ruleij, "action": "enable"}]
+                    "action": ODRL_ACTION_ENABLE,
+                    "consequence": [{"target": ruleij, "action": ODRL_ACTION_ENABLE}],
                 }
             ]
         }
@@ -734,18 +1196,20 @@ class PolicyProjectionAgent:
         policy_ik = self._activity_policy_index.get(
             conn.to_activity, uri_policy(f"FPa_{conn.to_activity.replace('-','_')}"))
 
+        policy_uid = uri_policy(f"FPd_SEQ_{new_uid()}")
+        rule_uid = uri_rule(f"SEQ_{conn.from_activity}_{conn.to_activity}_{new_uid()}")
         return {
             "@context":     "http://www.w3.org/ns/odrl.jsonld",
-            "uid":          uri_policy(f"FPd_SEQ_{new_uid()}"),
+            "uid":          policy_uid,
             "@type":        "Set",
             "_fragment_id": fragment_id,
             "_type":        "FPd",
             "_flow":        "sequence",
             "_activities":  [conn.from_activity, conn.to_activity],
             "permission": [{
-                "uid":    uri_rule(f"SEQ_{conn.from_activity}_{conn.to_activity}_{new_uid()}"),
+                "uid":    rule_uid,
                 "target": ruleij,
-                "action": "enable",
+                "action": ODRL_ACTION_ENABLE,
                 "duty":   [{"action": "nextPolicy", "uid": policy_ik}],
                 "constraint": [{
                     "leftOperand":  "event",
@@ -767,9 +1231,11 @@ class PolicyProjectionAgent:
         from_frag = getattr(conn, "from_fragment", fragment_id)
         to_frag   = getattr(conn, "to_fragment",   "unknown")
 
+        policy_uid = uri_policy(f"FPd_MSG_{new_uid()}")
+        rule_uid = uri_rule(f"MSG_{conn.from_activity}_{conn.to_activity}_{new_uid()}")
         return {
             "@context":       "http://www.w3.org/ns/odrl.jsonld",
-            "uid":            uri_policy(f"FPd_MSG_{new_uid()}"),
+            "uid":            policy_uid,
             "@type":          "Set",
             "_fragment_id":   fragment_id,
             "_type":          "FPd",
@@ -778,7 +1244,7 @@ class PolicyProjectionAgent:
             "_to_fragment":   to_frag,
             "_activities":    [conn.from_activity, conn.to_activity],
             "permission": [{
-                "uid":      uri_rule(f"MSG_{conn.from_activity}_{conn.to_activity}_{new_uid()}"),
+                "uid":      rule_uid,
                 "target":   uri_message(from_frag, to_frag),
                 "assignee": ruleix,
                 "action": [{
@@ -791,7 +1257,7 @@ class PolicyProjectionAgent:
                 }],
                 "duty": [{
                     "target": rulejy,
-                    "action": "enable",
+                    "action": ODRL_ACTION_ENABLE,
                     "constraint": [{
                         "leftOperand":  "event",
                         "operator":     "gt",
@@ -800,67 +1266,3 @@ class PolicyProjectionAgent:
                 }]
             }]
         }
-
-    # ─────────────────────────────────────────
-    #  FPd implicite — depuis Agent 3
-    # ─────────────────────────────────────────
-
-    def _generate_fpd_from_implicit(self, candidate: CandidateDependency) -> dict:
-        src_rule  = self._activity_rule_index.get(
-            candidate.source_activity,
-            uri_rule(f"rule_{candidate.source_activity.replace('-','_')}"))
-        tgt_rule  = self._activity_rule_index.get(
-            candidate.target_activity,
-            uri_rule(f"rule_{candidate.target_activity.replace('-','_')}"))
-
-        rule_type  = candidate.suggested_odrl_rule or "obligation"
-        constraint = self._build_implicit_constraint(candidate)
-
-        rule_body = {
-            "uid":    uri_rule(f"IMP_{candidate.dep_type.value}_{new_uid()}"),
-            "target": tgt_rule,
-            "action": "enable",
-        }
-        if constraint:
-            rule_body["constraint"] = [constraint]
-
-        if rule_type == "prohibition":
-            rule_body["target"]     = src_rule
-            rule_body["constraint"] = [{
-                "leftOperand":  "event",
-                "operator":     "eq",
-                "rightOperand": f"{candidate.target_activity}:active"
-            }]
-
-        return {
-            "@context":       "http://www.w3.org/ns/odrl.jsonld",
-            "uid":            uri_policy(f"FPd_IMP_{candidate.dep_type.value}_{new_uid()}"),
-            "@type":          "Set",
-            "_fragment_id":   candidate.source_fragment,
-            "_type":          "FPd",
-            "_implicit":      True,
-            "_dep_type":      candidate.dep_type.value,
-            "_confidence":    candidate.confidence,
-            "_justification": candidate.justification,
-            "_inter":         candidate.is_inter,
-            rule_type:        [rule_body],
-        }
-
-    def _build_implicit_constraint(self, candidate: CandidateDependency) -> Optional[dict]:
-        dep = candidate.dep_type
-        if dep == ImplicitDepType.TEMPORAL:
-            return {"leftOperand": "event", "operator": "gt",
-                    "rightOperand": {"@id": "odrl:policyUsage"}}
-        if dep == ImplicitDepType.ROLE:
-            return {"leftOperand": "spatial", "operator": "eq",
-                    "rightOperand": f"role:{candidate.source_activity}"}
-        if dep == ImplicitDepType.COMPLIANCE:
-            return {"leftOperand": "event", "operator": "eq",
-                    "rightOperand": f"compliance:{candidate.source_activity}:completed"}
-        if dep == ImplicitDepType.DATA:
-            return {"leftOperand": "event", "operator": "eq",
-                    "rightOperand": f"data:{candidate.source_activity}:produced"}
-        if dep == ImplicitDepType.CONFLICT:
-            return {"leftOperand": "event", "operator": "neq",
-                    "rightOperand": f"{candidate.source_activity}:active"}
-        return None

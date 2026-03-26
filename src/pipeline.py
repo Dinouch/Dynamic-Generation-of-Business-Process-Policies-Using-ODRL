@@ -3,44 +3,35 @@ pipeline.py — Orchestration du pipeline multi-agent ODRL
 
 Câble les 5 agents et expose run_pipeline() comme point d'entrée unique.
 
-Flux nominal :
-    Agent 1 ──GRAPH_READY──► Agent 2 ──CANDIDATES_READY──► Agent 3
-                                 ▲                              │
-                                 │         REFORMULATE ◄────────┤ (boucle courte)
-                                 │                              │
-               Agent 1 ◄──STRUCTURAL_UPDATE──────────────────┘  (boucle structurelle)
-                                                               │
-                                                    VALIDATION_DONE
-                                                               │
-    Agent 5 ◄──POLICIES_READY──── Agent 4 ◄───────────────────┘
-        │                             ▲
-        └──SYNTAX_CORRECTION──────────┘  (boucle syntaxique)
-        │
-        └──ODRL_VALID / ODRL_SYNTAX_ERROR──► ResultCollector
+Flux nominal (refactor) :
+    Agent 1 ──GRAPH_READY──► Agent 3
+    Agent 3 ──GRAPH_READY──► Agent 2  (si patterns non couverts)
+    Agent 2 ──UNHANDLED_PROPOSALS──► Agent 3
+    Agent 3 ──VALIDATION_DONE──► Agent 4
+    Agent 4 ──POLICIES_READY──► Agent 3  (validation sémantique)
+    Agent 3 ──SEMANTIC_CORRECTION / SEMANTIC_VALIDATED──► Agent 4
+    Agent 4 ──POLICIES_READY──► Agent 5
+    Agent 5 ──SYNTAX_CORRECTION──► Agent 4
+    Agent 5 ──ODRL_VALID / ODRL_SYNTAX_ERROR──► ResultCollector
 
 Le pipeline est entièrement synchrone : chaque receive() appelle le suivant
-en cascade. Quand agent1.analyze_and_send() retourne, tout est terminé.
+en cascade.
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
-# Imports absolus depuis le package agents, car pipeline.py
-# est chargé comme module top-level (pas comme package).
 from agents.structural_analyzer import (
     StructuralAnalyzer,
     AgentMessage,
     MessageType,
 )
-from agents.implicit_dependency_detector import ImplicitDependencyDetector
+from agents.pipeline_registry import COVERED_PATTERNS
+from agents.unhandled_case_formulator import UnhandledCaseFormulator
 from agents.constraint_validator import ConstraintValidator
 from agents.policy_projection_agent import PolicyProjectionAgent
 from agents.policy_auditor import PolicyAuditor, AuditReport
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  Résultat du pipeline
-# ══════════════════════════════════════════════════════════════════════
 
 @dataclass
 class PipelineResult:
@@ -55,24 +46,20 @@ class PipelineResult:
     syntax_score: score syntaxique [0.0 – 1.0].
     msg_type    : MessageType.ODRL_VALID ou MessageType.ODRL_SYNTAX_ERROR.
     loop_turns  : nombre de tours de boucle syntaxique utilisés (Agent 5).
+    semantic_loop_turns : tours de boucle sémantique Agent 3 ↔ Agent 4 (informatif).
     """
-    is_valid:    bool
-    report:      AuditReport
-    summary:     dict
+
+    is_valid: bool
+    report: AuditReport
+    summary: dict
     syntax_score: float
-    msg_type:    MessageType   # ODRL_VALID ou ODRL_SYNTAX_ERROR
-    loop_turns:  int = 0
+    msg_type: MessageType
+    loop_turns: int = 0
+    semantic_loop_turns: int = 0
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  Collecteur de résultat
-# ══════════════════════════════════════════════════════════════════════
 
 class ResultCollector:
-    """
-    Endpoint final du pipeline.
-    Agent 5 lui envoie ODRL_VALID ou ODRL_SYNTAX_ERROR via son callback.
-    """
+    """Endpoint final du pipeline (signaux Agent 5)."""
 
     def __init__(self):
         self._result: Optional[PipelineResult] = None
@@ -81,138 +68,131 @@ class ResultCollector:
         """Reçoit le signal final d'Agent 5 et stocke le résultat."""
         print(f"[Collector] ◄ RECEIVE {msg}")
         self._result = PipelineResult(
-            is_valid     = msg.payload["is_valid"],
-            report       = msg.payload["report"],
-            summary      = msg.payload["summary"],
-            syntax_score = msg.payload.get("syntax_score", 1.0),
-            msg_type     = msg.msg_type,
-            loop_turns   = msg.payload.get("loop_turns_used", 0),
+            is_valid=msg.payload["is_valid"],
+            report=msg.payload["report"],
+            summary=msg.payload["summary"],
+            syntax_score=msg.payload.get("syntax_score", 1.0),
+            msg_type=msg.msg_type,
+            loop_turns=msg.payload.get("loop_turns_used", 0),
+            semantic_loop_turns=msg.payload.get("semantic_loop_turns", 0),
         )
 
     def get_result(self) -> PipelineResult:
         if self._result is None:
             raise RuntimeError(
-                "Pipeline non terminé — aucun résultat reçu d'Agent 5. "
-                "Vérifier que tous les callbacks sont correctement câblés."
+                "Pipeline non terminé — aucun résultat reçu d'Agent 5."
             )
         return self._result
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  Point d'entrée principal
-# ══════════════════════════════════════════════════════════════════════
-
 def run_pipeline(
-    bp_model:     dict,
-    fragments:    dict,
+    bp_model: dict,
+    fragments: dict,
     b2p_policies: list[dict],
-    context_mode: str = "global",
+    context_mode: str = "local",
     *,
-    api_key:           Optional[str] = None,
-    azure_endpoint:    Optional[str] = None,
+    api_key: Optional[str] = None,
+    azure_endpoint: Optional[str] = None,
     azure_api_version: Optional[str] = None,
-    azure_deployment:  Optional[str] = None,
+    azure_deployment: Optional[str] = None,
 ) -> PipelineResult:
     """
     Câble les 5 agents et lance le pipeline ODRL.
 
-    Retourne un PipelineResult quand Agent 5 émet son signal final
-    (ODRL_VALID ou ODRL_SYNTAX_ERROR).
-
-    Paramètres
+    Parameters
     ----------
-    bp_model          : modèle BPMN brut (dict parsé)
-    fragments         : découpage en fragments du BPMN
-    b2p_policies      : liste des policies B2P d'origine
-    context_mode      : "global" ou "local" — mode de contexte pour Agent 2
-    api_key           : clé OpenAI (optionnel si Azure)
-    azure_endpoint    : endpoint Azure OpenAI (optionnel)
-    azure_api_version : version API Azure (optionnel)
-    azure_deployment  : nom du déploiement Azure (optionnel)
+    context_mode
+        Conservé pour compatibilité ; l'Agent 2 n'utilise plus de mode local/global explicite.
     """
-
+    _ = context_mode
     print("[Pipeline] Initialisation du pipeline multi-agent ODRL")
 
-    # ── Instanciation des agents ─────────────────────────────────────
+    agent1 = StructuralAnalyzer(
+        bp_model,
+        fragments,
+        b2p_policies,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+        azure_api_version=azure_api_version,
+        azure_deployment=azure_deployment,
+    )
 
-    agent1 = StructuralAnalyzer(bp_model, fragments, b2p_policies)
-
-    agent2 = ImplicitDependencyDetector(
-        context_mode      = context_mode,
-        api_key           = api_key,
-        azure_endpoint    = azure_endpoint,
-        azure_api_version = azure_api_version,
-        azure_deployment  = azure_deployment,
+    agent2 = UnhandledCaseFormulator(
+        covered_patterns=COVERED_PATTERNS,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+        azure_api_version=azure_api_version,
+        azure_deployment=azure_deployment,
     )
 
     agent3 = ConstraintValidator(
-        api_key           = api_key,
-        azure_endpoint    = azure_endpoint,
-        azure_api_version = azure_api_version,
-        azure_deployment  = azure_deployment,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+        azure_api_version=azure_api_version,
+        azure_deployment=azure_deployment,
     )
 
-    # Agent 4 et 5 reçoivent leurs données via les messages —
-    # on les instancie avec des valeurs vides, elles seront remplacées.
     agent4 = PolicyProjectionAgent(
-        enriched_graph    = None,
-        validation_report = None,
+        enriched_graph=None,
+        validation_report=None,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+        azure_api_version=azure_api_version,
+        azure_deployment=azure_deployment,
     )
 
     agent5 = PolicyAuditor(
-        fp_results     = {},
-        enriched_graph = None,
-        raw_b2p        = b2p_policies,
+        fp_results={},
+        enriched_graph=None,
+        raw_b2p=b2p_policies,
     )
 
     collector = ResultCollector()
 
-    # ── Câblage des callbacks ────────────────────────────────────────
+    def agent4_router(msg: AgentMessage) -> None:
+        """Dispatch messages targeting Agent 4, or Agent 4's outbound routing."""
+        if msg.recipient == "agent4":
+            agent4.receive(msg)
+        elif msg.recipient == "agent3":
+            agent3.receive(msg)
+        elif msg.recipient == "agent5":
+            agent5.receive(msg)
+        else:
+            print(f"[Pipeline][WARN] Routage inconnu : {msg.recipient}")
 
-    # Chemin nominal : 1 → 2 → 3 → 4 → 5 → collecteur
-    agent1.register_send_callback(agent2.receive)           # 1 → 2
+    agent1.register_send_callback(agent3.receive)
+    # Agent 2 → Agent 3 (UNHANDLED_PROPOSALS, etc.)
+    agent2.register_send_callback(agent3.receive)
+    agent3.register_send_callback_agent2(agent2.receive)
+    agent3.register_send_callback_agent1(agent1.receive)
+    agent3.register_send_callback_agent4(agent4_router)
+    agent4.register_send_callback(agent4_router)
 
-    agent2.register_send_callback(agent3.receive)           # 2 → 3
-
-    agent3.register_send_callback_agent2(agent2.receive)    # 3 → 2  (boucle courte)
-    agent3.register_send_callback_agent1(agent1.receive)    # 3 → 1  (boucle structurelle)
-    agent3.register_send_callback_agent4(agent4.receive)    # 3 → 4  (sortie normale)
-
-    agent4.register_send_callback(agent5.receive)           # 4 → 5
-
-    # Agent 5 envoie soit vers Agent 4 (SYNTAX_CORRECTION), soit vers le collecteur (signal final)
     def agent5_router(msg: AgentMessage) -> None:
         if msg.recipient == "agent4":
             agent4.receive(msg)
         else:
             collector.receive(msg)
+
     agent5.register_send_callback(agent5_router)
 
     print("[Pipeline] Câblage des 5 agents terminé — démarrage de l'analyse")
 
-    # ── Démarrage ────────────────────────────────────────────────────
-    # Le pipeline est synchrone : analyze_and_send() déclenche la cascade
-    # complète de receive() en profondeur d'abord.
-    # Quand cette ligne retourne, le collecteur a reçu son résultat.
     agent1.analyze_and_send()
 
     result = collector.get_result()
 
-    # ── Export JSON-LD des policies finales du pipeline ───────────────
-    # On utilise les fp_results actuellement en mémoire dans Agent 5,
-    # qui incluent les éventuelles corrections appliquées via la boucle
-    # syntaxique Agent 5 ↔ Agent 4.
     try:
         final_fp_results = getattr(agent5, "fp_results", None)
         if final_fp_results:
-            # Export dédié au mode pipeline pour ne pas écraser l'export standalone
             import os
-            root_dir   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+            root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             output_dir = os.path.join(root_dir, "odrl_policies_pipeline")
 
             exporter = PolicyProjectionAgent(
-                enriched_graph    = agent5.enriched_graph,
-                validation_report = None,
+                enriched_graph=agent5.enriched_graph,
+                validation_report=None,
             )
             exported = exporter.export(final_fp_results, output_dir=output_dir)
             total_files = sum(len(v) for v in exported.values())
@@ -228,6 +208,7 @@ def run_pipeline(
         f"[Pipeline] Terminé — {status} | "
         f"syntax_score={result.syntax_score:.2f} | "
         f"syntax_loops={result.loop_turns} | "
+        f"semantic_loops={result.semantic_loop_turns} | "
         f"signal={result.msg_type.value}"
     )
 

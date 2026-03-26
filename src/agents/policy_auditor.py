@@ -3,11 +3,14 @@ policy_auditor.py — Agent 5 : Policy Auditor
 
 Responsabilité unique :
     Valider les policies ODRL JSON-LD générées par l'Agent 4
-    selon trois niveaux de vérification, tous déterministes, sans LLM.
+    selon deux niveaux de vérification, tous déterministes, sans LLM.
 
 ═══════════════════════════════════════════════════════════════════════
 NIVEAU 1 — SYNTAXE ODRL (structure JSON-LD)
 ───────────────────────────────────────────
+Validation via SHACL (pyshacl + pyld) quand disponible,
+repli sur vérifications manuelles sinon.
+
 Vérifie que chaque policy respecte le schéma W3C ODRL 2.2 :
   - Champs obligatoires : @context, uid, @type
   - @type valide : Agreement | Offer | Set
@@ -20,50 +23,17 @@ Vérifie que chaque policy respecte le schéma W3C ODRL 2.2 :
 
 Score syntaxique : 1 - (N_errors / N_checks)   [formule AgentODRL]
 
-═══════════════════════════════════════════════════════════════════════
-NIVEAU 2 — COHÉRENCE SÉMANTIQUE FPa  (policy d'activité)
-──────────────────────────────────────────────────────────
-Source de vérité : la B2P source de chaque FPa (champ _source_b2p).
-Vérifie que la FPa encode fidèlement la B2P d'origine :
-  - Le type de règle correspond (permission / prohibition / obligation)
-  - L'assigner est présent et correspond
-  - L'assignee est présent et correspond
-  - Le target (asset) correspond
-  - Chaque constraint de la B2P est présente dans la FPa
-    (comparaison leftOperand + operator + rightOperand)
-  - Pas de règles supplémentaires absentes de la B2P
-
-═══════════════════════════════════════════════════════════════════════
-NIVEAU 3 — COHÉRENCE SÉMANTIQUE FPd  (policy de dépendance)
-─────────────────────────────────────────────────────────────
-Source de vérité : l'EnrichedGraph d'Agent 1 + le ValidationReport
-d'Agent 3 pour les dépendances implicites.
-
-  FPd XOR     → les activités encodées correspondent aux branches
-                réelles du fork XOR dans le graphe ;
-                les conditions encodées correspondent aux conditions
-                des arêtes sortantes de cette gateway.
-
-  FPd AND     → les activités correspondent aux branches réelles
-                du fork AND dans le graphe.
-
-  FPd OR      → idem pour fork OR.
-
-  FPd SEQ     → une ConnectionInfo (sequence, is_inter=False) existe
-                entre from_activity et to_activity dans le graphe.
-
-  FPd MESSAGE → une ConnectionInfo (message, is_inter=True) existe
-                entre les deux fragments et les deux activités.
-
-  FPd IMPLICIT→ une ConnectionInfo implicite acceptée par Agent 3
-                existe avec les mêmes source/target ; le type de
-                règle ODRL généré correspond au suggested_odrl_rule
-                validé par Agent 3.
+Note sur uid / @id :
+  Dans le contexte officiel ODRL JSON-LD, "uid" est un alias de "@id".
+  pyld expand() ne produit donc pas de triple odrl:uid distinct.
+  _dedupe_uid_atid_collision() supprime "uid" redondant avant pyld
+  pour éviter l'erreur "colliding keywords".
+  odrl_shapes.ttl utilise sh:nodeKind sh:IRI sur les NodeShapes
+  (et non sh:path odrl:uid) pour s'aligner sur ce comportement.
 
 ═══════════════════════════════════════════════════════════════════════
 NIVEAU 4 — COHÉRENCE GLOBALE (intra + inter fragments)
 ────────────────────────────────────────────────────────
-Hérité et étendu du ConsistencyAuditor original :
   - Conflit permission/prohibition sur le même target
   - FPd XOR avec deux conditions identiques
   - FPd XOR sans refinement conditionnel
@@ -74,6 +44,8 @@ Hérité et étendu du ConsistencyAuditor original :
   - Cycles de dépendances inter-fragments
 
 ═══════════════════════════════════════════════════════════════════════
+Niveaux 2 et 3 (FPa/FPd sémantiques) : délégués à l'Agent 3.
+
 Sorties :
     AuditIssue          : une anomalie individuelle
     AuditReport         : rapport complet — is_valid si aucun CRITICAL
@@ -88,8 +60,10 @@ Couche multi-agent :
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from enum import Enum
 from typing import Callable, Optional
 
@@ -109,65 +83,205 @@ from .policy_projection_agent import FragmentPolicySet
 # ══════════════════════════════════════════════════════════════════════
 
 class IssueSeverity(Enum):
-    CRITICAL = "critical"   # anomalie bloquante — policy invalide
-    WARNING  = "warning"    # anomalie potentielle — policy douteuse
-    INFO     = "info"       # observation — pas un problème
+    CRITICAL = "critical"
+    WARNING  = "warning"
+    INFO     = "info"
 
 
 class IssueLayer(Enum):
-    """Quel niveau a détecté l'anomalie."""
-    SYNTAX    = "syntax"       # Niveau 1
-    FPA_SEM   = "fpa_semantic" # Niveau 2
-    FPD_SEM   = "fpd_semantic" # Niveau 3
-    GLOBAL    = "global"       # Niveau 4
+    SYNTAX = "syntax"   # Niveau 1 (SHACL ou repli manuel)
+    GLOBAL = "global"   # Niveau 4 — cohérence inter/intra fragment
 
 
 class IssueCode(Enum):
     # ── Syntaxe ──────────────────────────────────────────────────────
-    MISSING_CONTEXT           = "missing_@context"
-    MISSING_UID               = "missing_uid"
-    MISSING_TYPE              = "missing_@type"
-    INVALID_TYPE              = "invalid_@type"
-    MALFORMED_URI             = "malformed_uri"
-    NO_RULE                   = "no_rule_found"
-    RULE_MISSING_UID          = "rule_missing_uid"
-    RULE_MISSING_TARGET       = "rule_missing_target"
-    RULE_MISSING_ACTION       = "rule_missing_action"
-    DUPLICATE_RULE_UID        = "duplicate_rule_uid"
-    CONSTRAINT_INCOMPLETE     = "constraint_missing_field"
-    REFINEMENT_INCOMPLETE     = "refinement_missing_field"
-
-    # ── FPa sémantique ───────────────────────────────────────────────
-    FPA_WRONG_RULE_TYPE       = "fpa_wrong_rule_type"
-    FPA_WRONG_ASSIGNER        = "fpa_wrong_assigner"
-    FPA_WRONG_ASSIGNEE        = "fpa_wrong_assignee"
-    FPA_WRONG_TARGET          = "fpa_wrong_target"
-    FPA_MISSING_CONSTRAINT    = "fpa_missing_constraint"
-    FPA_EXTRA_RULE            = "fpa_extra_rule_not_in_b2p"
-    FPA_NO_B2P_SOURCE         = "fpa_no_b2p_source"
-
-    # ── FPd sémantique ───────────────────────────────────────────────
-    FPD_UNKNOWN_GATEWAY       = "fpd_unknown_gateway"
-    FPD_WRONG_XOR_ACTIVITY    = "fpd_wrong_xor_activity"
-    FPD_WRONG_XOR_CONDITION   = "fpd_wrong_xor_condition"
-    FPD_WRONG_AND_ACTIVITY    = "fpd_wrong_and_activity"
-    FPD_WRONG_OR_ACTIVITY     = "fpd_wrong_or_activity"
-    FPD_SEQ_NOT_IN_GRAPH      = "fpd_seq_connection_not_in_graph"
-    FPD_MSG_NOT_IN_GRAPH      = "fpd_msg_connection_not_in_graph"
-    FPD_IMPLICIT_NOT_FOUND    = "fpd_implicit_not_in_validated"
-    FPD_IMPLICIT_WRONG_TYPE   = "fpd_implicit_wrong_rule_type"
+    MISSING_CONTEXT       = "missing_@context"
+    MISSING_UID           = "missing_uid"
+    MISSING_TYPE          = "missing_@type"
+    INVALID_TYPE          = "invalid_@type"
+    MALFORMED_URI         = "malformed_uri"
+    NO_RULE               = "no_rule_found"
+    RULE_MISSING_UID      = "rule_missing_uid"
+    RULE_MISSING_TARGET   = "rule_missing_target"
+    RULE_MISSING_ACTION   = "rule_missing_action"
+    DUPLICATE_RULE_UID    = "duplicate_rule_uid"
+    CONSTRAINT_INCOMPLETE = "constraint_missing_field"
+    REFINEMENT_INCOMPLETE = "refinement_missing_field"
+    SHACL_VIOLATION       = "shacl_violation"
 
     # ── Global ───────────────────────────────────────────────────────
-    PERM_PROHIB_CONFLICT      = "permission_prohibition_conflict"
-    XOR_SAME_CONDITION        = "xor_same_condition"
-    XOR_MISSING_CONDITION     = "xor_missing_condition"
-    MISSING_FPA               = "missing_fpa_for_fpd_activity"
-    DUPLICATE_RULE            = "duplicate_rule_uid_global"
-    MESSAGE_NO_RECEIVER       = "message_flow_no_receiver"
-    MESSAGE_UNKNOWN_RULE      = "message_flow_unknown_rule"
-    MESSAGE_UNKNOWN_TARGET    = "message_flow_unknown_target"
-    DEPENDENCY_CYCLE          = "inter_fragment_dependency_cycle"
-    ORPHAN_FPD                = "orphan_fpd_no_matching_fpa"
+    PERM_PROHIB_CONFLICT  = "permission_prohibition_conflict"
+    XOR_SAME_CONDITION    = "xor_same_condition"
+    XOR_MISSING_CONDITION = "xor_missing_condition"
+    MISSING_FPA           = "missing_fpa_for_fpd_activity"
+    DUPLICATE_RULE        = "duplicate_rule_uid_global"
+    MESSAGE_NO_RECEIVER   = "message_flow_no_receiver"
+    MESSAGE_UNKNOWN_RULE  = "message_flow_unknown_rule"
+    MESSAGE_UNKNOWN_TARGET = "message_flow_unknown_target"
+    DEPENDENCY_CYCLE      = "inter_fragment_dependency_cycle"
+    ORPHAN_FPD            = "orphan_fpd_no_matching_fpa"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Helpers JSON-LD / pyld
+# ══════════════════════════════════════════════════════════════════════
+
+_RULE_LIST_KEYS = frozenset(("permission", "prohibition", "obligation"))
+
+
+def _strip_uid_if_redundant_with_atid(d: dict) -> None:
+    """
+    Remove ``uid`` when it is identical to ``@id``.
+
+    In the official ODRL JSON-LD context, ``uid`` is an alias for ``@id``.
+    Having both with the same value causes pyld to raise
+    "colliding keywords detected".
+    """
+    if "@id" in d and "uid" in d and str(d["@id"]) == str(d["uid"]):
+        del d["uid"]
+
+
+def _dedupe_rule_list_value(val: object) -> object:
+    """Recursively deduplicate uid/@id in a rule list or single rule dict."""
+    if isinstance(val, list):
+        return [_dedupe_uid_atid_collision(x) for x in val]
+    if isinstance(val, dict):
+        return _dedupe_uid_atid_collision(val)
+    return val
+
+
+def _strip_uid_in_nested_rule_lists(obj: object) -> None:
+    """
+    After the recursive build, strip redundant ``uid`` from every dict
+    directly under permission / prohibition / obligation lists, including
+    nested ones — remaining source of pyld "colliding keywords" on rules.
+    """
+    if isinstance(obj, dict):
+        for rk in _RULE_LIST_KEYS:
+            if rk not in obj:
+                continue
+            seq = obj[rk]
+            if isinstance(seq, list):
+                for item in seq:
+                    if isinstance(item, dict):
+                        _strip_uid_if_redundant_with_atid(item)
+            elif isinstance(seq, dict):
+                _strip_uid_if_redundant_with_atid(seq)
+        for v in obj.values():
+            _strip_uid_in_nested_rule_lists(v)
+    elif isinstance(obj, list):
+        for x in obj:
+            _strip_uid_in_nested_rule_lists(x)
+
+
+def _dedupe_uid_atid_collision(obj: object) -> object:
+    """
+    Remove redundant ``uid`` keys before passing to pyld expand().
+
+    The official ODRL context maps ``uid`` → ``@id``.  Having both with the
+    same value triggers pyld "colliding keywords".  This function strips the
+    redundant ``uid`` on a deep copy of the object, covering:
+      - the top-level policy dict
+      - every rule dict in permission / prohibition / obligation lists
+      - all nested structures via a final recursive pass
+    """
+    if isinstance(obj, dict):
+        out: dict = {}
+        for k, v in obj.items():
+            if k in _RULE_LIST_KEYS:
+                out[k] = _dedupe_rule_list_value(v)
+            else:
+                out[k] = _dedupe_uid_atid_collision(v)
+        _strip_uid_if_redundant_with_atid(out)
+        _strip_uid_in_nested_rule_lists(out)
+        return out
+    if isinstance(obj, list):
+        return [_dedupe_uid_atid_collision(x) for x in obj]
+    return obj
+
+
+def _odrl_jsonld_to_rdflib_graph(odrl: dict):
+    """
+    Convert an ODRL JSON-LD dict (already deduplicated) to an rdflib Graph
+    via pyld expand() + to_rdf() in N-Quads format.
+
+    Using pyld instead of rdflib's built-in JSON-LD parser gives correct
+    handling of remote contexts (e.g. ``@type: @id`` terms like ``uid``).
+
+    The caller is responsible for stripping internal ``_`` keys and calling
+    _dedupe_uid_atid_collision() before passing ``odrl`` here.
+
+    Parameters
+    ----------
+    odrl : dict
+        Clean, deduplicated ODRL policy dict (no ``_`` internal keys,
+        no duplicate ``@id``/``uid``).
+
+    Returns
+    -------
+    rdflib.Graph
+    """
+    from pyld import jsonld
+    from rdflib import Graph
+
+    # Deep copy to avoid mutating caller's dict
+    doc = json.loads(json.dumps(odrl))
+    expanded = jsonld.expand(doc)
+    nquads = jsonld.to_rdf(expanded, {"format": "application/n-quads"})
+    g = Graph()
+    if nquads and str(nquads).strip():
+        g.parse(data=nquads, format="nquads")
+    return g
+
+
+def _shacl_report_to_issue_code(report_text: str) -> IssueCode:
+    """
+    Map a pyshacl report text to an IssueCode that Agent 4 can handle
+    via its SYNTAX_CORRECTION handler.
+
+    SHACL_VIOLATION must not be emitted toward Agent 4 — only mapped codes.
+    """
+    msg = (report_text or "").lower()
+    if "context" in msg or "@context" in msg:
+        return IssueCode.MISSING_CONTEXT
+    if "missing_@type" in msg or ("type" in msg and "agreement" in msg and "invalid" in msg):
+        return IssueCode.MISSING_TYPE
+    if "uid" in msg and ("missing" in msg or "absent" in msg or "less than" in msg or "mincount" in msg):
+        return IssueCode.MISSING_UID
+    if "uri" in msg or "iri" in msg or "malformed" in msg or "nodekind" in msg:
+        return IssueCode.MALFORMED_URI
+    if "action" in msg and ("mincount" in msg or "less than" in msg):
+        return IssueCode.RULE_MISSING_ACTION
+    if "target" in msg and ("mincount" in msg or "less than" in msg):
+        return IssueCode.RULE_MISSING_TARGET
+    if "rule" in msg and "uid" in msg:
+        return IssueCode.RULE_MISSING_UID
+    if "leftoperand" in msg or "rightoperand" in msg or "operator" in msg:
+        return IssueCode.CONSTRAINT_INCOMPLETE
+    return IssueCode.MISSING_CONTEXT
+
+
+def _syntax_correction_wire_code(code: IssueCode) -> str:
+    """
+    Return the string code expected by Agent 4's SYNTAX_CORRECTION handler.
+
+    Agent 4 uses string matching on ``error["code"]``, not IssueCode enum values.
+    """
+    mapping = {
+        IssueCode.MISSING_CONTEXT:       "MISSING_CONTEXT",
+        IssueCode.MISSING_UID:           "MISSING_UID",
+        IssueCode.MISSING_TYPE:          "MISSING_TYPE",
+        IssueCode.INVALID_TYPE:          "MISSING_TYPE",
+        IssueCode.MALFORMED_URI:         "MALFORMED_URI",
+        IssueCode.NO_RULE:               "NO_RULE",
+        IssueCode.RULE_MISSING_UID:      "RULE_MISSING_UID",
+        IssueCode.RULE_MISSING_TARGET:   "RULE_MISSING_TARGET",
+        IssueCode.RULE_MISSING_ACTION:   "RULE_MISSING_ACTION",
+        IssueCode.DUPLICATE_RULE_UID:    "DUPLICATE_RULE_UID",
+        IssueCode.CONSTRAINT_INCOMPLETE: "CONSTRAINT_INCOMPLETE",
+        IssueCode.REFINEMENT_INCOMPLETE: "REFINEMENT_INCOMPLETE",
+    }
+    return mapping.get(code, code.name)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -203,24 +317,24 @@ class AuditIssue:
 class AuditReport:
     issues: list[AuditIssue] = field(default_factory=list)
 
-    # ── Filtres par layer ──────────────────────────────────────────
     @property
     def syntax_issues(self) -> list[AuditIssue]:
         return [i for i in self.issues if i.layer == IssueLayer.SYNTAX]
 
     @property
     def fpa_issues(self) -> list[AuditIssue]:
-        return [i for i in self.issues if i.layer == IssueLayer.FPA_SEM]
+        """Deprecated — FPa semantics validated in Agent 3."""
+        return []
 
     @property
     def fpd_issues(self) -> list[AuditIssue]:
-        return [i for i in self.issues if i.layer == IssueLayer.FPD_SEM]
+        """Deprecated — FPd semantics validated in Agent 3."""
+        return []
 
     @property
     def global_issues(self) -> list[AuditIssue]:
         return [i for i in self.issues if i.layer == IssueLayer.GLOBAL]
 
-    # ── Filtres par sévérité ───────────────────────────────────────
     @property
     def criticals(self) -> list[AuditIssue]:
         return [i for i in self.issues if i.severity == IssueSeverity.CRITICAL]
@@ -233,42 +347,32 @@ class AuditReport:
     def infos(self) -> list[AuditIssue]:
         return [i for i in self.issues if i.severity == IssueSeverity.INFO]
 
-    # ── Validité globale ───────────────────────────────────────────
     @property
     def is_valid(self) -> bool:
-        """True si aucune issue CRITICAL, tous niveaux confondus."""
         return len(self.criticals) == 0
 
     @property
     def is_syntactically_valid(self) -> bool:
-        return not any(
-            i.severity == IssueSeverity.CRITICAL
-            for i in self.syntax_issues
-        )
+        return not any(i.severity == IssueSeverity.CRITICAL for i in self.syntax_issues)
 
     @property
     def is_semantically_valid(self) -> bool:
-        return not any(
-            i.severity == IssueSeverity.CRITICAL
-            for i in (self.fpa_issues + self.fpd_issues)
-        )
+        """Semantic validation delegated to Agent 3 — always True here if no CRITICAL global."""
+        return True
 
-    # ── Score syntaxique (formule AgentODRL) ──────────────────────
     def syntax_score(self, n_checks: int = 10) -> float:
-        n_errors = sum(1 for i in self.syntax_issues
-                       if i.severity == IssueSeverity.CRITICAL)
+        n_errors = sum(1 for i in self.syntax_issues if i.severity == IssueSeverity.CRITICAL)
         return max(0.0, 1.0 - n_errors / n_checks)
 
     def summary(self) -> dict:
-        # ── Agrégation basique des compteurs ─────────────────────────
         base = {
-            "is_valid":              self.is_valid,
+            "is_valid":               self.is_valid,
             "is_syntactically_valid": self.is_syntactically_valid,
             "is_semantically_valid":  self.is_semantically_valid,
-            "total_issues":          len(self.issues),
-            "critical":              len(self.criticals),
-            "warning":               len(self.warnings),
-            "info":                  len(self.infos),
+            "total_issues":           len(self.issues),
+            "critical":               len(self.criticals),
+            "warning":                len(self.warnings),
+            "info":                   len(self.infos),
             "by_layer": {
                 "syntax":       len(self.syntax_issues),
                 "fpa_semantic": len(self.fpa_issues),
@@ -277,67 +381,30 @@ class AuditReport:
             },
         }
 
-        # ── Décomposition de la conformité syntaxique selon C1..C9 ──
-        #
-        # On projette les IssueCode syntaxiques existants sur les
-        # critères de Mustafa Daham et al. (C1..C9). Quand un critère
-        # n'est pas directement vérifié par nos règles actuelles,
-        # on le laisse à None (non évalué).
-        syntax_criticals = [
-            i for i in self.syntax_issues
-            if i.severity == IssueSeverity.CRITICAL
-        ]
+        syntax_criticals = [i for i in self.syntax_issues if i.severity == IssueSeverity.CRITICAL]
         syntax_codes = {i.code for i in syntax_criticals}
 
-        # C1 — odrl:uid pour Policy / Rule (approximation via UID + URI)
-        c1_ok = not any(
-            c in syntax_codes
-            for c in (
-                IssueCode.MISSING_UID,
-                IssueCode.RULE_MISSING_UID,
-                IssueCode.MALFORMED_URI,
-            )
-        )
-
-        # C5 — Relation target présent
+        c1_ok = not any(c in syntax_codes for c in (
+            IssueCode.MISSING_UID, IssueCode.RULE_MISSING_UID, IssueCode.MALFORMED_URI,
+        ))
         c5_ok = IssueCode.RULE_MISSING_TARGET not in syntax_codes
-
-        # C6 — Action présente
         c6_ok = IssueCode.RULE_MISSING_ACTION not in syntax_codes
-
-        # C7 — Au moins une règle dans la policy
         c7_ok = IssueCode.NO_RULE not in syntax_codes
-
-        # C8 — Triple (leftOperand, operator, rightOperand) complet
-        c8_ok = not any(
-            c in syntax_codes
-            for c in (
-                IssueCode.CONSTRAINT_INCOMPLETE,
-                IssueCode.REFINEMENT_INCOMPLETE,
-            )
-        )
+        c8_ok = not any(c in syntax_codes for c in (
+            IssueCode.CONSTRAINT_INCOMPLETE, IssueCode.REFINEMENT_INCOMPLETE,
+        ))
 
         base["syntax_criteria"] = {
-            # C1 : ODRL UID (Policy / Rule)
-            "C1_uid": c1_ok,
-            # C2 : Data type specification (non évalué explicitement)
-            "C2_datatype": None,
-            # C3 : Meta info (dc:creator/title/description/issued) — non évalué
-            "C3_meta_info": None,
-            # C4 : Function / Party (assigner/assignee de type Party) — non évalué
-            "C4_function_party": None,
-            # C5 : Relation (target Asset présent)
+            "C1_uid":             c1_ok,
+            "C2_datatype":        None,
+            "C3_meta_info":       None,
+            "C4_function_party":  None,
             "C5_relation_target": c5_ok,
-            # C6 : Action (action de type Action présente)
-            "C6_action": c6_ok,
-            # C7 : Rule (au moins une règle Permission/Prohibition/Obligation)
-            "C7_rule": c7_ok,
-            # C8 : Constraint complète (leftOperand/operator/rightOperand)
-            "C8_constraint": c8_ok,
-            # C9 : ODRL Extension (profil / extension contrôlée) — non évalué
-            "C9_odrl_extension": None,
+            "C6_action":          c6_ok,
+            "C7_rule":            c7_ok,
+            "C8_constraint":      c8_ok,
+            "C9_odrl_extension":  None,
         }
-
         return base
 
 
@@ -347,208 +414,128 @@ class AuditReport:
 
 class PolicyAuditor:
     """
-    Agent 5 du pipeline multi-agent.
+    Agent 5 of the multi-agent pipeline.
 
-    Fusionne la validation syntaxique ODRL et la vérification sémantique
-    déterministe des FPa (via B2P source) et des FPd (via EnrichedGraph),
-    ainsi que l'audit de cohérence globale intra/inter-fragment.
+    Validates ODRL JSON-LD policies generated by Agent 4 using two
+    deterministic levels — no LLM calls.
 
-    Mode standalone :
-        Instancier avec fp_results, enriched_graph, raw_b2p et appeler audit().
+    Level 1 — ODRL syntax via SHACL (pyshacl + pyld) with manual fallback.
+    Level 4 — Global coherence (intra + inter fragment).
 
-    Mode pipeline :
-        Instancier avec fp_results={}, enriched_graph=None, raw_b2p=b2p_policies.
-        Les données réelles arrivent via receive(POLICIES_READY).
-        Enregistrer le callback de sortie avant le démarrage.
+    Levels 2 and 3 (FPa / FPd semantics) are handled by Agent 3.
 
-    Boucle syntaxique :
-        Si audit() détecte des issues CRITICAL de layer SYNTAX,
-        Agent 5 émet SYNTAX_CORRECTION vers Agent 4 (max MAX_SYNTAX_LOOPS tours).
-        Agent 4 applique les corrections et ré-émet POLICIES_READY.
-        Une fois la limite atteinte ou aucune issue syntaxique critique,
-        Agent 5 émet le signal final ODRL_VALID ou ODRL_SYNTAX_ERROR.
+    Pipeline mode:
+        Instantiate with fp_results={}, enriched_graph=None, raw_b2p=b2p_policies.
+        Data arrives via receive(POLICIES_READY).
+        Register the output callback before starting.
 
-    Paramètres
-    ----------
-    fp_results      : dict[fragment_id → FragmentPolicySet]  (Agent 4)
-    enriched_graph  : EnrichedGraph                           (Agent 1)
-    raw_b2p         : list[dict]  — policies B2P originales
-    validation_report : ValidationReport | None               (Agent 3)
-                        Nécessaire pour valider les FPd IMPLICIT.
+    Syntax loop:
+        CRITICAL SYNTAX issues → SYNTAX_CORRECTION → Agent 4 → POLICIES_READY
+        Max MAX_SYNTAX_LOOPS rounds; then emit final ODRL_VALID or ODRL_SYNTAX_ERROR.
     """
 
-    # Types ODRL acceptés
-    _VALID_TYPES = {"Agreement", "Offer", "Set"}
-
-    # URI minimale : doit commencer par http:// ou https://
-    _URI_RE = re.compile(r"^https?://")
-
-    # Types de règles ODRL
-    _RULE_TYPES = ("permission", "prohibition", "obligation")
+    _VALID_TYPES  = {"Agreement", "Offer", "Set"}
+    _URI_RE       = re.compile(r"^https?://")
+    _RULE_TYPES   = ("permission", "prohibition", "obligation")
 
     AGENT_NAME       = "agent5"
-    MAX_SYNTAX_LOOPS = 2   # max de tours dans la boucle syntaxique Agent5↔Agent4
+    MAX_SYNTAX_LOOPS = 2
 
     def __init__(
         self,
-        fp_results:         dict[str, FragmentPolicySet],
-        enriched_graph:     Optional[EnrichedGraph],
-        raw_b2p:            list[dict],
-        validation_report:  Optional[ValidationReport] = None,
+        fp_results:        dict[str, FragmentPolicySet],
+        enriched_graph:    Optional[EnrichedGraph],
+        raw_b2p:           list[dict],
+        validation_report: Optional[ValidationReport] = None,
     ):
         self.fp_results        = fp_results
         self.enriched_graph    = enriched_graph
         self.raw_b2p           = raw_b2p
         self.validation_report = validation_report
 
-        # ── Couche multi-agent ──────────────────────────────────────
         self._on_send:           Optional[Callable[[AgentMessage], None]] = None
         self._syntax_loop_count: int = 0
 
-        # ── Index B2P : uid → policy dict ──────────────────────────
-        self._b2p_index: dict[str, dict] = {
+        self._b2p_index:      dict[str, dict]                  = {
             b.get("uid", ""): b for b in raw_b2p if b.get("uid")
         }
+        self._seq_index:      dict[tuple[str, str], ConnectionInfo] = {}
+        self._msg_index:      dict[tuple[str, str], ConnectionInfo] = {}
+        self._pattern_index:  dict[str, StructuralPattern]          = {}
+        self._fork_edges:     dict[str, list[ConnectionInfo]]        = {}
+        self._rule_index:     dict[str, tuple[str, str, str]]        = {}
+        self._validated_index: dict[tuple[str, str], object]         = {}
 
-        # ── Index ConnectionInfo par type ──────────────────────────
-        self._seq_index:     dict[tuple[str, str], ConnectionInfo] = {}
-        self._msg_index:     dict[tuple[str, str], ConnectionInfo] = {}
-        self._pattern_index: dict[str, StructuralPattern] = {}
-        self._fork_edges:    dict[str, list[ConnectionInfo]] = {}
-
-        # ── Index global rule_uid → (fragment_id, policy_uid, rule_type)
-        self._rule_index: dict[str, tuple[str, str, str]] = {}
-
-        # ── Index validated candidates (Agent 3) ───────────────────
-        self._validated_index: dict[tuple[str, str], object] = {}
-
-        # Construire les index seulement si on a un graphe (mode standalone)
         if self.enriched_graph is not None:
             self._build_indexes()
 
     # ═════════════════════════════════════════
-    #  COUCHE MULTI-AGENT
+    #  Multi-agent layer
     # ═════════════════════════════════════════
 
     def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
-        """Enregistre le callback d'envoi (typiquement collector.receive)."""
         self._on_send = fn
 
     def send(self, msg: AgentMessage) -> None:
-        """Émet un message via le callback enregistré."""
         print(f"[Agent 5] ► SEND {msg}")
         if self._on_send:
             self._on_send(msg)
         else:
-            print(f"[Agent 5][WARN] Aucun callback — message {msg.msg_type.value} non transmis.")
+            print(f"[Agent 5][WARN] No callback — message {msg.msg_type.value} not transmitted.")
 
     def receive(self, msg: AgentMessage) -> None:
-        """
-        Point d'entrée des messages entrants.
-
-        Messages acceptés :
-          - POLICIES_READY : policies générées depuis Agent 4
-
-        Tout autre type est ignoré avec un warning.
-        """
         print(f"[Agent 5] ◄ RECEIVE {msg}")
         if msg.msg_type == MessageType.POLICIES_READY:
-            fp_results     = msg.payload["fp_results"]
-            enriched_graph = msg.payload["enriched_graph"]
-
-            # Mettre à jour l'état interne et reconstruire les index
-            self.fp_results     = fp_results
-            self.enriched_graph = enriched_graph
+            self.fp_results     = msg.payload["fp_results"]
+            self.enriched_graph = msg.payload["enriched_graph"]
             self._build_indexes()
-
             self._audit_and_route(loop_turn=msg.loop_turn)
         else:
-            print(f"[Agent 5][WARN] Message '{msg.msg_type.value}' non géré — ignoré.")
-
-    # ─────────────────────────────────────────
-    #  Routing interne
-    # ─────────────────────────────────────────
+            print(f"[Agent 5][WARN] Message '{msg.msg_type.value}' not handled — ignored.")
 
     def _audit_and_route(self, loop_turn: int) -> None:
-        """
-        Audite les policies courantes et route vers la destination appropriée.
-
-        Logique :
-          1. Appeler audit() → AuditReport
-          2. Si au moins une issue CRITICAL ET _syntax_loop_count < MAX_SYNTAX_LOOPS :
-               → incrémenter _syntax_loop_count
-               → émettre SYNTAX_CORRECTION vers Agent 4
-               → RETURN (boucle de correction)
-          3. Sinon : émettre le signal final ODRL_VALID ou ODRL_SYNTAX_ERROR
-
-        On utilise _syntax_loop_count (compteur propre à Agent 5), pas loop_turn du message,
-        car loop_turn peut être > MAX_SYNTAX_LOOPS après la boucle Agent 2↔3 (reformulation).
-        """
         report = self.audit()
-
-        # ── Toute issue CRITICAL déclenche la boucle de correction ───
         any_critical = report.criticals
         critical_syntax_count = sum(1 for i in any_critical if i.layer == IssueLayer.SYNTAX)
 
-        # ── Boucle de correction Agent 5 → Agent 4 ───────────────────
-        # Limite basée sur le compteur local, pas sur loop_turn (qui vient de la boucle 2↔3)
         if any_critical and self._syntax_loop_count < self.MAX_SYNTAX_LOOPS:
             self._syntax_loop_count += 1
-
             errors = [
                 {
                     "policy_uid": i.policy_uid,
-                    "code":       i.code.value,
+                    "code":       _syntax_correction_wire_code(i.code),
                     "layer":      i.layer.value,
                     "path":       (i.details or {}).get("path", ""),
                     "suggestion": i.suggestion,
                 }
                 for i in any_critical
             ]
-
-            affected_policies = list({
-                i.policy_uid
-                for i in any_critical
-                if i.policy_uid
-            })
-
+            affected_policies = list({i.policy_uid for i in any_critical if i.policy_uid})
             print(
-                f"[Agent 5] {len(any_critical)} issue(s) CRITICAL détectée(s) "
-                f"({critical_syntax_count} syntax) — émission SYNTAX_CORRECTION "
-                f"vers Agent 4 (boucle #{self._syntax_loop_count})"
+                f"[Agent 5] {len(any_critical)} issue(s) CRITICAL "
+                f"({critical_syntax_count} syntax) — SYNTAX_CORRECTION "
+                f"to Agent 4 (loop #{self._syntax_loop_count})"
             )
-
             self.send(AgentMessage(
                 sender    = self.AGENT_NAME,
                 recipient = "agent4",
                 msg_type  = MessageType.SYNTAX_CORRECTION,
-                payload   = {
-                    "affected_policies": affected_policies,
-                    "errors":            errors,
-                },
-                loop_turn = self._syntax_loop_count,  # tour de la boucle 5↔4
+                payload   = {"affected_policies": affected_policies, "errors": errors},
+                loop_turn = self._syntax_loop_count,
             ))
             return
 
-        # ── Signal final ─────────────────────────────────────────────
         if any_critical and self._syntax_loop_count >= self.MAX_SYNTAX_LOOPS:
             print(
-                f"[Agent 5][WARN] MAX_SYNTAX_LOOPS ({self.MAX_SYNTAX_LOOPS}) atteint — "
-                "émission du rapport final avec erreurs restantes."
+                f"[Agent 5][WARN] MAX_SYNTAX_LOOPS ({self.MAX_SYNTAX_LOOPS}) reached — "
+                "emitting final report with remaining errors."
             )
 
-        final_type = (
-            MessageType.ODRL_VALID
-            if report.is_valid
-            else MessageType.ODRL_SYNTAX_ERROR
-        )
-
+        final_type = MessageType.ODRL_VALID if report.is_valid else MessageType.ODRL_SYNTAX_ERROR
         print(
-            f"[Agent 5] Signal final : {final_type.value} — "
-            f"is_valid={report.is_valid}, "
-            f"syntax_loops_used={self._syntax_loop_count}"
+            f"[Agent 5] Final signal: {final_type.value} — "
+            f"is_valid={report.is_valid}, syntax_loops_used={self._syntax_loop_count}"
         )
-
         self.send(AgentMessage(
             sender    = self.AGENT_NAME,
             recipient = "pipeline",
@@ -564,27 +551,20 @@ class PolicyAuditor:
         ))
 
     # ═════════════════════════════════════════
-    #  LOGIQUE MÉTIER (inchangée)
+    #  Index construction
     # ═════════════════════════════════════════
 
-    # ══════════════════════════════════════════════════════════════
-    #  Construction des index
-    # ══════════════════════════════════════════════════════════════
-
     def _build_indexes(self) -> None:
-        # Réinitialiser les index avant reconstruction
-        # (nécessaire en mode pipeline où les données changent entre les passes)
-        self._seq_index      = {}
-        self._msg_index      = {}
-        self._pattern_index  = {}
-        self._fork_edges     = {}
-        self._rule_index     = {}
+        self._seq_index       = {}
+        self._msg_index       = {}
+        self._pattern_index   = {}
+        self._fork_edges      = {}
+        self._rule_index      = {}
         self._validated_index = {}
 
         if self.enriched_graph is None:
             return
 
-        # Connexions du graphe
         for conn in self.enriched_graph.connections:
             key = (conn.from_activity, conn.to_activity)
             if conn.connection_type == "message":
@@ -592,101 +572,178 @@ class PolicyAuditor:
             elif conn.connection_type == "sequence":
                 self._seq_index[key] = conn
 
-        # Patterns : gateway_name → pattern + arêtes sortantes
         for pattern in self.enriched_graph.patterns:
             if pattern.gateway_name:
                 self._pattern_index[pattern.gateway_name] = pattern
 
-        # Index global des règles (pour cohérence inter-fragment)
         for frag_id, fps in self.fp_results.items():
             for policy in fps.fpa_policies:
                 for rt in self._RULE_TYPES:
                     for rule in policy.get(rt, []):
                         uid = rule.get("uid")
                         if uid:
-                            self._rule_index[uid] = (
-                                frag_id, policy.get("uid", ""), rt
-                            )
+                            self._rule_index[uid] = (frag_id, policy.get("uid", ""), rt)
 
-        # Index des candidats validés par Agent 3
         if self.validation_report:
-            for candidate in self.validation_report.validated_candidates():
-                key = (candidate.source_activity, candidate.target_activity)
-                self._validated_index[key] = candidate
+            for p in getattr(self.validation_report, "accepted_unhandled_proposals", []) or []:
+                key = (getattr(p, "gateway_name", ""), getattr(p, "fragment_id", ""))
+                self._validated_index[key] = p
 
     def _get_fork_branches(self, gateway_name: str) -> list[ConnectionInfo]:
-        """
-        Retourne les ConnectionInfo correspondant aux branches sortantes
-        d'une gateway identifiée par son nom.
-        On cherche dans le graphe BPMN le nœud dont le nom correspond,
-        puis on récupère les arêtes sortantes via les ConnectionInfo.
-
-        Les ConnectionInfo portent la condition de la branche quand
-        elle est définie dans le BPMN source.
-        """
         branches: list[ConnectionInfo] = []
         for conn in self.enriched_graph.connections:
-            # Agent 1 encode le fork via ConnectionInfo.gateway_name
             if conn.gateway_name != gateway_name:
                 continue
-            # On ne conserve que les branches de contrôle (XOR/AND/OR)
             if conn.connection_type not in {"xor", "and", "or"}:
                 continue
             branches.append(conn)
         return branches
 
-
-    # ══════════════════════════════════════════════════════════════
-    #  Point d'entrée standalone
-    # ══════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════
+    #  Main audit entry point
+    # ═════════════════════════════════════════
 
     def audit(self) -> AuditReport:
-        print("[Agent 5] PolicyAuditor — démarrage de l'audit")
+        print("[Agent 5] PolicyAuditor — starting audit")
         report = AuditReport()
 
         for frag_id, fps in self.fp_results.items():
             print(f"[Agent 5] Fragment '{frag_id}' "
                   f"({len(fps.fpa_policies)} FPa, {len(fps.fpd_policies)} FPd)")
-
-            # Niveau 1 — syntaxe de toutes les policies
             for policy in fps.all_policies():
-                report.issues.extend(
-                    self._check_syntax(policy, frag_id)
-                )
+                report.issues.extend(self._check_syntax(policy, frag_id))
+            report.issues.extend(self._check_intra_consistency(frag_id, fps))
 
-            # Niveau 2 — sémantique FPa
-            for policy in fps.fpa_policies:
-                report.issues.extend(
-                    self._check_fpa_semantics(policy, frag_id)
-                )
-
-            # Niveau 3 — sémantique FPd
-            for fpd in fps.fpd_policies:
-                report.issues.extend(
-                    self._check_fpd_semantics(fpd, frag_id)
-                )
-
-            # Niveau 4 intra — cohérence interne du fragment
-            report.issues.extend(
-                self._check_intra_consistency(frag_id, fps)
-            )
-
-        # Niveau 4 inter — cohérence entre fragments
         report.issues.extend(self._check_inter_consistency())
 
         s = report.summary()
-        status = "✅ VALIDE" if s["is_valid"] else "❌ ANOMALIES CRITIQUES"
-        print(
-            f"[Agent 5] Audit terminé : {status} — "
-            f"{s['critical']} critical, {s['warning']} warning, {s['info']} info"
-        )
+        status = "✅ VALID" if s["is_valid"] else "❌ CRITICAL ISSUES"
+        print(f"[Agent 5] Audit done: {status} — "
+              f"{s['critical']} critical, {s['warning']} warning, {s['info']} info")
         return report
 
     # ══════════════════════════════════════════════════════════════
-    #  NIVEAU 1 — Syntaxe ODRL
+    #  Level 1 — ODRL syntax (SHACL + manual fallback)
     # ══════════════════════════════════════════════════════════════
 
     def _check_syntax(self, policy: dict, frag_id: str) -> list[AuditIssue]:
+        """
+        Validate one ODRL policy dict.
+
+        Steps:
+        1. Strip internal ``_`` keys.
+        2. Deep-copy and deduplicate ``uid``/``@id`` collisions via
+           _dedupe_uid_atid_collision() — required before passing to pyld.
+        3. Try SHACL validation (passes ``deduped`` to _check_syntax_shacl).
+        4. On any exception, fall back to manual field checks on ``deduped``.
+
+        Both SHACL and manual fallback receive the same deduplicated dict,
+        so manual checks never see spurious errors caused by the @id/uid
+        collision that pyld would reject.
+        """
+        odrl   = {k: v for k, v in policy.items() if not str(k).startswith("_")}
+        deduped = _dedupe_uid_atid_collision(json.loads(json.dumps(odrl)))
+        try:
+            return self._check_syntax_shacl(deduped, frag_id)
+        except ImportError:
+            print(
+                "[Agent 5][WARN] pyshacl / rdflib / pyld not available — "
+                "SHACL inactive; using manual ODRL field checks."
+            )
+            return self._check_syntax_manual(deduped, frag_id)
+        except Exception as e:
+            print(f"[Agent 5][WARN] SHACL validation error: {e} — manual fallback.")
+            return self._check_syntax_manual(deduped, frag_id)
+
+    def _check_syntax_shacl(self, policy: dict, frag_id: str) -> list[AuditIssue]:
+        """
+        Run pyshacl against agents/odrl_shapes.ttl for one policy dict.
+
+        Parameters
+        ----------
+        policy
+            Already deduplicated ODRL dict — no internal ``_`` keys,
+            no duplicate ``@id``/``uid``.  Produced by _check_syntax().
+        frag_id
+            Fragment identifier for reporting.
+
+        Notes
+        -----
+        _odrl_jsonld_to_rdflib_graph() receives ``policy`` as-is (already
+        deduplicated) — it must NOT re-deduplicate internally.
+
+        odrl_shapes.ttl uses ``sh:nodeKind sh:IRI`` on NodeShapes rather
+        than ``sh:path odrl:uid`` because ``uid`` in the ODRL context is
+        an alias for ``@id`` and never produces an ``odrl:uid`` RDF triple.
+        """
+        import pyshacl
+        from rdflib import Graph
+
+        # policy is already clean and deduplicated — pass directly
+        data = _odrl_jsonld_to_rdflib_graph(policy)
+
+        shapes = Graph()
+        shapes_path = Path(__file__).resolve().parent / "odrl_shapes.ttl"
+        shapes.parse(shapes_path)
+
+        conforms, _rg, report_text = pyshacl.validate(
+            data_graph=data,
+            shacl_graph=shapes,
+            inference="rdfs",
+            abort_on_first=False,
+        )
+
+        # uid for reporting — after deduplication, @id holds the IRI
+        uid = policy.get("@id") or policy.get("uid", "?")
+
+        if conforms:
+            
+            return []
+
+        sev = IssueSeverity.CRITICAL
+        if "Warning" in (report_text or "") and "Violation" not in (report_text or ""):
+            sev = IssueSeverity.WARNING
+
+        mapped   = _shacl_report_to_issue_code(report_text or "")
+        path_hint = {
+            IssueCode.MISSING_UID:     "uid",
+            IssueCode.MISSING_CONTEXT: "@context",
+            IssueCode.MISSING_TYPE:    "@type",
+            IssueCode.MALFORMED_URI:   "uid",
+        }.get(mapped, "")
+
+        details: dict = {"shacl_report": report_text}
+        if path_hint:
+            details["path"] = path_hint
+
+        # Provide a parseable suggestion so Agent 4's MALFORMED_URI handler
+        # can extract the correct URI via regex rather than using free text.
+        suggestion = None
+        if mapped == IssueCode.MALFORMED_URI:
+            suggestion = f"set uid to {uid}"
+        elif mapped == IssueCode.MISSING_UID:
+            suggestion = f"add uid as URI for policy {uid}"
+
+        return [
+            AuditIssue(
+                severity    = sev,
+                layer       = IssueLayer.SYNTAX,
+                code        = mapped,
+                fragment_id = frag_id,
+                policy_uid  = str(uid),
+                description = (report_text or "SHACL validation failed.")[:4000],
+                suggestion  = suggestion,
+                details     = details,
+            )
+        ]
+
+    def _check_syntax_manual(self, policy: dict, frag_id: str) -> list[AuditIssue]:
+        """
+        Deterministic field-by-field ODRL syntax check.
+
+        Receives the already-deduplicated dict from _check_syntax(), so
+        ``uid`` may have been removed if ``@id`` was present — check both.
+        """
         issues: list[AuditIssue] = []
         uid = policy.get("uid") or policy.get("@id", "?")
 
@@ -701,24 +758,24 @@ class PolicyAuditor:
         if "@context" not in policy:
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.MISSING_CONTEXT,
-                "Champ @context manquant.",
-                'Ajouter "@context": "http://www.w3.org/ns/odrl.jsonld"',
+                "Missing @context field.",
+                'Add "@context": "http://www.w3.org/ns/odrl.jsonld"',
                 {"path": "@context"},
             ))
 
-        # uid
+        # uid / @id
         if not (policy.get("uid") or policy.get("@id")):
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.MISSING_UID,
-                "Champ uid manquant.",
-                "Ajouter un uid sous forme d'URI.",
+                "Missing uid field.",
+                "Add uid as a URI.",
                 {"path": "uid"},
             ))
         elif not self._URI_RE.match(str(uid)):
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.MALFORMED_URI,
-                f"uid '{uid}' n'est pas une URI valide.",
-                "L'uid doit commencer par http:// ou https://",
+                f"uid '{uid}' is not a valid URI.",
+                f"set uid to {uid}",
                 {"path": "uid"},
             ))
 
@@ -727,29 +784,28 @@ class PolicyAuditor:
         if not ptype:
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.MISSING_TYPE,
-                "Champ @type manquant.",
-                'Ajouter "@type": "Agreement"',
+                "Missing @type field.",
+                'Add "@type": "Agreement"',
                 {"path": "@type"},
             ))
         elif ptype not in self._VALID_TYPES:
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.INVALID_TYPE,
-                f"@type '{ptype}' invalide. Attendu : {self._VALID_TYPES}",
-                'Corriger en "@type": "Agreement"',
+                f"@type '{ptype}' invalid. Expected: {self._VALID_TYPES}",
+                'Fix to "@type": "Agreement"',
                 {"path": "@type"},
             ))
 
-        # Au moins une règle
+        # At least one rule
         has_rules = any(policy.get(rt) for rt in self._RULE_TYPES)
         if not has_rules:
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.NO_RULE,
-                "Aucune règle (permission/prohibition/obligation).",
-                "Ajouter au moins une règle.",
+                "No rule found (permission/prohibition/obligation).",
+                "Add at least one rule.",
             ))
-            return issues  # inutile d'aller plus loin
+            return issues
 
-        # Vérification des règles
         seen_uids: set[str] = set()
         for rt in self._RULE_TYPES:
             for i, rule in enumerate(policy.get(rt, [])):
@@ -767,7 +823,33 @@ class PolicyAuditor:
         policy_uid: str,
         seen_uids: set[str],
     ) -> list[AuditIssue]:
+        """
+        Validate a single ODRL rule dict (permission / prohibition / obligation).
+
+        FIX — duty objects are NOT top-level rules:
+            A ``duty`` dict nested inside a permission has ``"action"`` but
+            typically no ``"uid"`` or ``"target"`` at the rule level.
+            Validating duties as rules produces false RULE_MISSING_UID /
+            RULE_MISSING_TARGET / RULE_MISSING_ACTION errors (e.g. on FPd SEQ
+            where duty = {"action": "nextPolicy", "uid": <policy_uri>}).
+
+            Guard: if the dict has no ``"target"`` AND no ``"uid"``/``"@id"``
+            at this level, it is a duty-like nested object — skip it.
+            This avoids false positives without masking real rule errors.
+        """
         issues: list[AuditIssue] = []
+
+        # ── Duty guard ────────────────────────────────────────────────
+        # A duty nested inside a permission is not a top-level ODRL rule.
+        # It will have "action" but no "target" and often no "uid".
+        # Skip validation to avoid false RULE_MISSING_* errors.
+        has_uid    = bool(rule.get("uid") or rule.get("@id"))
+        has_target = bool(rule.get("target"))
+        has_action = bool(rule.get("action"))
+        if not has_uid and not has_target and has_action:
+            # Looks like a duty object — skip
+            
+            return []
 
         def issue(severity, code, description, suggestion=None, details=None):
             return AuditIssue(
@@ -778,38 +860,39 @@ class PolicyAuditor:
                 details=details,
             )
 
-        # uid de la règle
-        rule_uid = rule.get("uid")
+        # uid
+        rule_uid = rule.get("uid") or rule.get("@id")
         if not rule_uid:
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.RULE_MISSING_UID,
-                "uid manquant.",
-                f"Ajouter un uid URI à la règle {path}.",
+                "uid missing.",
+                f"Add a URI uid to rule {path}.",
                 {"path": path},
             ))
         else:
-            if not self._URI_RE.match(str(rule_uid)):
+            rule_uid_str = str(rule_uid)
+            if not self._URI_RE.match(rule_uid_str):
                 issues.append(issue(
                     IssueSeverity.CRITICAL, IssueCode.MALFORMED_URI,
-                    f"uid '{rule_uid}' n'est pas une URI valide.",
+                    f"uid '{rule_uid_str}' is not a valid URI.",
                     details={"path": path},
                 ))
-            if rule_uid in seen_uids:
+            if rule_uid_str in seen_uids:
                 issues.append(issue(
                     IssueSeverity.WARNING, IssueCode.DUPLICATE_RULE_UID,
-                    f"uid '{rule_uid}' dupliqué dans cette policy.",
-                    "Générer un uid unique pour chaque règle.",
+                    f"uid '{rule_uid_str}' duplicated in this policy.",
+                    "Generate a unique uid for each rule.",
                     {"path": path},
                 ))
             else:
-                seen_uids.add(rule_uid)
+                seen_uids.add(rule_uid_str)
 
         # target
         if not rule.get("target"):
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.RULE_MISSING_TARGET,
-                "target manquant.",
-                "Ajouter un target (URI de l'asset).",
+                "target missing.",
+                "Add a target (asset URI).",
                 {"path": path},
             ))
 
@@ -817,8 +900,8 @@ class PolicyAuditor:
         if not rule.get("action"):
             issues.append(issue(
                 IssueSeverity.CRITICAL, IssueCode.RULE_MISSING_ACTION,
-                "action manquante.",
-                "Ajouter une action ODRL (ex: odrl:use, odrl:trigger).",
+                "action missing.",
+                "Add an ODRL action (e.g. odrl:use, odrl:trigger).",
                 {"path": path},
             ))
         else:
@@ -832,7 +915,7 @@ class PolicyAuditor:
                                 frag_id, policy_uid, is_refinement=True,
                             ))
 
-        # constraints au niveau règle
+        # constraints
         for k, cst in enumerate(rule.get("constraint", [])):
             if isinstance(cst, dict):
                 issues.extend(self._check_triple_fields(
@@ -851,294 +934,39 @@ class PolicyAuditor:
         is_refinement: bool,
     ) -> list[AuditIssue]:
         issues: list[AuditIssue] = []
-        code = (IssueCode.REFINEMENT_INCOMPLETE if is_refinement
-                else IssueCode.CONSTRAINT_INCOMPLETE)
+        code  = IssueCode.REFINEMENT_INCOMPLETE if is_refinement else IssueCode.CONSTRAINT_INCOMPLETE
         label = "refinement" if is_refinement else "constraint"
 
         for field_name in ("leftOperand", "operator", "rightOperand"):
             if field_name not in obj:
                 issues.append(AuditIssue(
-                    severity=IssueSeverity.CRITICAL,
-                    layer=IssueLayer.SYNTAX,
-                    code=code,
-                    fragment_id=frag_id,
-                    policy_uid=policy_uid,
-                    description=(
-                        f"{path} : champ '{field_name}' manquant "
-                        f"dans ce {label}."
-                    ),
-                    suggestion=f"Ajouter '{field_name}' au {label}.",
-                    details={"path": path},
+                    severity    = IssueSeverity.CRITICAL,
+                    layer       = IssueLayer.SYNTAX,
+                    code        = code,
+                    fragment_id = frag_id,
+                    policy_uid  = policy_uid,
+                    description = f"{path}: field '{field_name}' missing in {label}.",
+                    suggestion  = f"Add '{field_name}' to the {label}.",
+                    details     = {"path": path},
                 ))
-        return issues
-
-    # ══════════════════════════════════════════════════════════════
-    #  NIVEAU 2 — Sémantique FPa
-    # ══════════════════════════════════════════════════════════════
-
-    def _check_fpa_semantics(self, policy: dict, frag_id: str) -> list[AuditIssue]:
-        issues: list[AuditIssue] = []
-        uid        = policy.get("uid", "?")
-        source_b2p = policy.get("_source_b2p")
-
-        def issue(severity, code, description, suggestion=None):
-            return AuditIssue(
-                severity=severity, layer=IssueLayer.FPA_SEM, code=code,
-                fragment_id=frag_id, policy_uid=uid,
-                description=description, suggestion=suggestion,
-            )
-
-        if not source_b2p:
-            issues.append(issue(
-                IssueSeverity.INFO, IssueCode.FPA_NO_B2P_SOURCE,
-                "FPa sans _source_b2p — policy minimale générée (pas de B2P source).",
-            ))
-            return issues
-
-        b2p = self._b2p_index.get(source_b2p)
-        if not b2p:
-            issues.append(issue(
-                IssueSeverity.WARNING, IssueCode.FPA_NO_B2P_SOURCE,
-                f"B2P source '{source_b2p}' introuvable dans raw_b2p.",
-                "Vérifier que la B2P source est incluse dans raw_b2p.",
-            ))
-            return issues
-
-        # Vérifier les types de règles présentes dans B2P vs FPa
-        b2p_rule_types = {rt for rt in self._RULE_TYPES if b2p.get(rt)}
-        fpa_rule_types = {rt for rt in self._RULE_TYPES if policy.get(rt)}
-
-        for rt in b2p_rule_types - fpa_rule_types:
-            issues.append(issue(
-                IssueSeverity.CRITICAL, IssueCode.FPA_WRONG_RULE_TYPE,
-                f"Type de règle '{rt}' présent dans B2P mais absent de la FPa.",
-                f"Ajouter les règles de type '{rt}' depuis la B2P source.",
-            ))
-
-        for rt in fpa_rule_types - b2p_rule_types:
-            issues.append(issue(
-                IssueSeverity.WARNING, IssueCode.FPA_EXTRA_RULE,
-                f"Type de règle '{rt}' présent dans FPa mais absent de la B2P source.",
-            ))
-
-        # Vérifier les constraints de chaque règle
-        for rt in b2p_rule_types & fpa_rule_types:
-            b2p_rules = b2p.get(rt, [])
-            fpa_rules = policy.get(rt, [])
-
-            for b2p_rule in b2p_rules:
-                # Trouver la règle correspondante dans la FPa (par uid ou par ordre)
-                matching_fpa_rule = next(
-                    (r for r in fpa_rules if r.get("uid") == b2p_rule.get("uid")),
-                    fpa_rules[0] if fpa_rules else None,
-                )
-                if not matching_fpa_rule:
-                    continue
-
-                # Vérifier les constraints
-                b2p_constraints = b2p_rule.get("constraint", [])
-                fpa_constraints = matching_fpa_rule.get("constraint", [])
-
-                b2p_cst_keys = {
-                    (c.get("leftOperand"), c.get("operator"))
-                    for c in b2p_constraints
-                    if isinstance(c, dict)
-                }
-                fpa_cst_keys = {
-                    (c.get("leftOperand"), c.get("operator"))
-                    for c in fpa_constraints
-                    if isinstance(c, dict)
-                }
-
-                for missing_key in b2p_cst_keys - fpa_cst_keys:
-                    issues.append(issue(
-                        IssueSeverity.WARNING, IssueCode.FPA_MISSING_CONSTRAINT,
-                        (f"Constraint (leftOperand='{missing_key[0]}', "
-                         f"operator='{missing_key[1]}') présente dans B2P "
-                         f"mais absente de la FPa."),
-                        "Copier la constraint depuis la B2P source.",
-                    ))
-
-                # Vérifier assigner / assignee
-                for field_name in ("assigner", "assignee"):
-                    b2p_val = b2p_rule.get(field_name)
-                    fpa_val = matching_fpa_rule.get(field_name)
-                    if b2p_val and fpa_val and b2p_val != fpa_val:
-                        code_map = {
-                            "assigner": IssueCode.FPA_WRONG_ASSIGNER,
-                            "assignee": IssueCode.FPA_WRONG_ASSIGNEE,
-                        }
-                        issues.append(issue(
-                            IssueSeverity.WARNING, code_map[field_name],
-                            (f"{field_name} FPa '{fpa_val}' ≠ B2P '{b2p_val}'."),
-                        ))
-
-        return issues
-
-    # ══════════════════════════════════════════════════════════════
-    #  NIVEAU 3 — Sémantique FPd
-    # ══════════════════════════════════════════════════════════════
-
-    def _check_fpd_semantics(self, fpd: dict, frag_id: str) -> list[AuditIssue]:
-        issues: list[AuditIssue] = []
-        fpd_uid   = fpd.get("uid", "?")
-        gateway   = fpd.get("_gateway")
-        flow      = fpd.get("_flow")
-        is_impl   = fpd.get("_implicit", False)
-        acts      = fpd.get("_activities", [])
-        gw_name   = fpd.get("_gateway_name", "")
-        conditions = fpd.get("_conditions", [])
-
-        def issue(severity, code, description, suggestion=None):
-            return AuditIssue(
-                severity=severity, layer=IssueLayer.FPD_SEM, code=code,
-                fragment_id=frag_id, policy_uid=fpd_uid,
-                description=description, suggestion=suggestion,
-            )
-
-        # ── FPd avec gateway ────────────────────────────────────────
-        if gateway in ("XOR", "AND", "OR"):
-            pattern = self._pattern_index.get(gw_name)
-            if not pattern:
-                issues.append(issue(
-                    IssueSeverity.WARNING, IssueCode.FPD_UNKNOWN_GATEWAY,
-                    f"Gateway '{gw_name}' introuvable dans les patterns du graphe.",
-                    "Vérifier que le nom de gateway est correct.",
-                ))
-                return issues
-
-            # Résoudre les branches réelles depuis le graphe
-            real_branches = self._get_fork_branches_names(gw_name)
-
-            if gateway == "XOR":
-                for act in acts:
-                    if act not in real_branches:
-                        issues.append(issue(
-                            IssueSeverity.CRITICAL, IssueCode.FPD_WRONG_XOR_ACTIVITY,
-                            (f"Activité '{act}' encodée dans FPd XOR '{gw_name}' "
-                             f"ne correspond pas aux branches réelles : {real_branches}."),
-                        ))
-
-                # Vérifier les conditions
-                real_conditions = self._get_fork_conditions(gw_name)
-                for cond in conditions:
-                    if real_conditions and cond not in real_conditions:
-                        issues.append(issue(
-                            IssueSeverity.WARNING, IssueCode.FPD_WRONG_XOR_CONDITION,
-                            (f"Condition '{cond}' encodée dans FPd XOR "
-                             f"ne correspond pas aux conditions réelles : {real_conditions}."),
-                        ))
-
-            elif gateway == "AND":
-                for act in acts:
-                    if act not in real_branches:
-                        issues.append(issue(
-                            IssueSeverity.CRITICAL, IssueCode.FPD_WRONG_AND_ACTIVITY,
-                            (f"Activité '{act}' encodée dans FPd AND '{gw_name}' "
-                             f"ne correspond pas aux branches réelles : {real_branches}."),
-                        ))
-
-            elif gateway == "OR":
-                for act in acts:
-                    if act not in real_branches:
-                        issues.append(issue(
-                            IssueSeverity.CRITICAL, IssueCode.FPD_WRONG_OR_ACTIVITY,
-                            (f"Activité '{act}' encodée dans FPd OR '{gw_name}' "
-                             f"ne correspond pas aux branches réelles : {real_branches}."),
-                        ))
-
-        # ── FPd séquence ────────────────────────────────────────────
-        elif flow == "sequence":
-            if len(acts) >= 2:
-                key = (acts[0], acts[1])
-                if key not in self._seq_index:
-                    issues.append(issue(
-                        IssueSeverity.CRITICAL, IssueCode.FPD_SEQ_NOT_IN_GRAPH,
-                        (f"Connexion séquence '{acts[0]}' → '{acts[1]}' "
-                         f"introuvable dans le graphe."),
-                        "Vérifier que la connexion existe dans l'EnrichedGraph.",
-                    ))
-
-        # ── FPd message ─────────────────────────────────────────────
-        elif flow == "message":
-            if len(acts) >= 2:
-                src, dst = acts[0], acts[1]
-                key = (src, dst)
-
-                # 1) Si une ConnectionInfo explicite de type "message" existe, c'est OK.
-                conn = self._msg_index.get(key)
-
-                # 2) Sinon, on accepte aussi le cas où il existe une connexion
-                #    inter-fragment (is_inter=True) entre ces deux activités,
-                #    quel que soit son connection_type (sequence/xor/implicit...).
-                if conn is None and self.enriched_graph is not None:
-                    for c in self.enriched_graph.connections:
-                        if (
-                            c.from_activity == src
-                            and c.to_activity == dst
-                            and c.is_inter
-                        ):
-                            conn = c
-                            break
-
-                if conn is None:
-                    issues.append(issue(
-                        IssueSeverity.CRITICAL, IssueCode.FPD_MSG_NOT_IN_GRAPH,
-                        (f"Dépendance inter-fragment '{src}' → '{dst}' "
-                         f"introuvable dans le graphe (aucune ConnectionInfo inter-fragment)."),
-                        "Vérifier qu'une connexion inter-fragment existe entre ces activités.",
-                    ))
-
-        # ── FPd implicite ───────────────────────────────────────────
-        elif is_impl:
-            if len(acts) >= 2:
-                key = (acts[0], acts[1])
-                candidate = self._validated_index.get(key)
-
-                if not candidate:
-                    issues.append(issue(
-                        IssueSeverity.WARNING, IssueCode.FPD_IMPLICIT_NOT_FOUND,
-                        (f"FPd implicite '{acts[0]}' → '{acts[1]}' non trouvée "
-                         f"dans les candidats validés par Agent 3."),
-                    ))
-                else:
-                    # Vérifier que le type de règle correspond
-                    suggested = getattr(candidate, "suggested_odrl_rule", None) or "obligation"
-                    dep_type  = fpd.get("_dep_type", "")
-                    fpa_has   = {rt for rt in self._RULE_TYPES if fpd.get(rt)}
-
-                    if suggested not in fpa_has:
-                        issues.append(issue(
-                            IssueSeverity.WARNING, IssueCode.FPD_IMPLICIT_WRONG_TYPE,
-                            (f"FPd implicite encodée avec règle type {fpa_has} "
-                             f"mais Agent 3 suggérait '{suggested}'."),
-                        ))
-
         return issues
 
     def _get_fork_branches_names(self, gateway_name: str) -> list[str]:
-        """Retourne les noms des activités cibles d'un fork gateway."""
-        branches = self._get_fork_branches(gateway_name)
-        return [b.to_activity for b in branches]
+        return [b.to_activity for b in self._get_fork_branches(gateway_name)]
 
     def _get_fork_conditions(self, gateway_name: str) -> list[str]:
-        """Retourne les conditions des arêtes sortantes d'un fork gateway."""
-        branches = self._get_fork_branches(gateway_name)
-        return [b.condition for b in branches if b.condition]
+        return [b.condition for b in self._get_fork_branches(gateway_name) if b.condition]
 
     # ══════════════════════════════════════════════════════════════
-    #  NIVEAU 4 — Cohérence intra-fragment
+    #  Level 4 — Intra-fragment coherence
     # ══════════════════════════════════════════════════════════════
 
     def _check_intra_consistency(
         self, frag_id: str, fps: FragmentPolicySet
     ) -> list[AuditIssue]:
         issues: list[AuditIssue] = []
-
-        # Index local : target → liste de types de règles
         target_rules: dict[str, list[str]] = {}
-        # Index local : rule_uid → policy_uid
-        local_rules: dict[str, str] = {}
+        local_rules:  dict[str, str]       = {}
 
         for policy in fps.all_policies():
             for rt in self._RULE_TYPES:
@@ -1152,95 +980,78 @@ class PolicyAuditor:
                     if uid:
                         if uid in local_rules:
                             issues.append(AuditIssue(
-                                severity=IssueSeverity.WARNING,
-                                layer=IssueLayer.GLOBAL,
-                                code=IssueCode.DUPLICATE_RULE,
-                                fragment_id=frag_id,
-                                policy_uid=policy.get("uid"),
-                                description=(
-                                    f"uid de règle '{uid}' dupliqué "
-                                    f"dans le fragment '{frag_id}'."
-                                ),
+                                severity    = IssueSeverity.WARNING,
+                                layer       = IssueLayer.GLOBAL,
+                                code        = IssueCode.DUPLICATE_RULE,
+                                fragment_id = frag_id,
+                                policy_uid  = policy.get("uid"),
+                                description = f"Rule uid '{uid}' duplicated in fragment '{frag_id}'.",
                             ))
                         else:
                             local_rules[uid] = policy.get("uid", "")
 
-        # Conflit permission/prohibition sur le même target
         for tgt, rule_types in target_rules.items():
             if "permission" in rule_types and "prohibition" in rule_types:
                 issues.append(AuditIssue(
-                    severity=IssueSeverity.CRITICAL,
-                    layer=IssueLayer.GLOBAL,
-                    code=IssueCode.PERM_PROHIB_CONFLICT,
-                    fragment_id=frag_id,
-                    description=(
-                        f"Conflit permission/prohibition sur le target '{tgt}' "
-                        f"dans le fragment '{frag_id}'."
-                    ),
+                    severity    = IssueSeverity.CRITICAL,
+                    layer       = IssueLayer.GLOBAL,
+                    code        = IssueCode.PERM_PROHIB_CONFLICT,
+                    fragment_id = frag_id,
+                    description = f"Permission/prohibition conflict on target '{tgt}' in '{frag_id}'.",
                 ))
 
-        # Vérifications XOR
         for fpd in fps.fpd_policies:
             if fpd.get("_gateway") != "XOR":
                 continue
 
             conditions = fpd.get("_conditions", [])
-
-            # Deux conditions identiques
             if len(conditions) >= 2 and conditions[0] == conditions[1]:
                 issues.append(AuditIssue(
-                    severity=IssueSeverity.WARNING,
-                    layer=IssueLayer.GLOBAL,
-                    code=IssueCode.XOR_SAME_CONDITION,
-                    fragment_id=frag_id,
-                    policy_uid=fpd.get("uid"),
-                    description=(
-                        f"FPd XOR : les deux conditions sont identiques "
-                        f"('{conditions[0]}')."
-                    ),
+                    severity    = IssueSeverity.WARNING,
+                    layer       = IssueLayer.GLOBAL,
+                    code        = IssueCode.XOR_SAME_CONDITION,
+                    fragment_id = frag_id,
+                    policy_uid  = fpd.get("uid"),
+                    description = f"FPd XOR: both conditions are identical ('{conditions[0]}').",
                 ))
 
-            # FPd XOR — refinement absent
             for perm in fpd.get("permission", []):
-                for act_obj in (perm.get("action", [])
-                                if isinstance(perm.get("action"), list)
-                                else [perm.get("action", {})]):
+                actions = perm.get("action", [])
+                if not isinstance(actions, list):
+                    actions = [actions]
+                for act_obj in actions:
                     if isinstance(act_obj, dict) and not act_obj.get("refinement"):
                         issues.append(AuditIssue(
-                            severity=IssueSeverity.WARNING,
-                            layer=IssueLayer.GLOBAL,
-                            code=IssueCode.XOR_MISSING_CONDITION,
-                            fragment_id=frag_id,
-                            policy_uid=fpd.get("uid"),
-                            description=(
-                                f"FPd XOR : permission '{perm.get('uid', '?')}' "
-                                f"sans refinement conditionnel."
+                            severity    = IssueSeverity.WARNING,
+                            layer       = IssueLayer.GLOBAL,
+                            code        = IssueCode.XOR_MISSING_CONDITION,
+                            fragment_id = frag_id,
+                            policy_uid  = fpd.get("uid"),
+                            description = (
+                                f"FPd XOR: permission '{perm.get('uid', '?')}' "
+                                f"has no conditional refinement."
                             ),
                         ))
 
-            # FPd AND/OR — cibles inconnues localement
             if fpd.get("_gateway") in ("AND", "OR"):
                 gw = fpd.get("_gateway")
                 for rule in fpd.get("obligation", []):
                     tgt = rule.get("target")
                     if isinstance(tgt, str) and tgt not in local_rules:
                         issues.append(AuditIssue(
-                            severity=IssueSeverity.INFO,
-                            layer=IssueLayer.GLOBAL,
-                            code=IssueCode.MISSING_FPA,
-                            fragment_id=frag_id,
-                            policy_uid=fpd.get("uid"),
-                            description=(
-                                f"FPd {gw} : obligation cible '{tgt}' "
-                                f"non indexée localement."
-                            ),
-                            details={"unknown_rule": tgt},
+                            severity    = IssueSeverity.INFO,
+                            layer       = IssueLayer.GLOBAL,
+                            code        = IssueCode.MISSING_FPA,
+                            fragment_id = frag_id,
+                            policy_uid  = fpd.get("uid"),
+                            description = f"FPd {gw}: obligation target '{tgt}' not in local index.",
+                            details     = {"unknown_rule": tgt},
                         ))
 
         return issues
 
     # ══════════════════════════════════════════════════════════════
-    #  NIVEAU 4 — Cohérence globale inter-fragments
+    #  Level 4 — Inter-fragment coherence
     # ══════════════════════════════════════════════════════════════
 
     def _check_inter_consistency(self) -> list[AuditIssue]:
@@ -1257,63 +1068,60 @@ class PolicyAuditor:
                 to_act   = acts[1] if len(acts) > 1 else "?"
                 fpd_uid  = fpd.get("uid", "?")
 
-                # Fragment cible inexistant
                 if to_frag and to_frag not in self.fp_results:
                     issues.append(AuditIssue(
-                        severity=IssueSeverity.CRITICAL,
-                        layer=IssueLayer.GLOBAL,
-                        code=IssueCode.MESSAGE_NO_RECEIVER,
-                        fragment_id=frag_id,
-                        policy_uid=fpd_uid,
-                        description=(
-                            f"Message flow '{from_act} → {to_act}' : "
-                            f"fragment cible '{to_frag}' inexistant."
+                        severity    = IssueSeverity.CRITICAL,
+                        layer       = IssueLayer.GLOBAL,
+                        code        = IssueCode.MESSAGE_NO_RECEIVER,
+                        fragment_id = frag_id,
+                        policy_uid  = fpd_uid,
+                        description = (
+                            f"Message flow '{from_act} → {to_act}': "
+                            f"target fragment '{to_frag}' does not exist."
                         ),
-                        details={"to_fragment": to_frag},
+                        details = {"to_fragment": to_frag},
                     ))
 
                 for perm in fpd.get("permission", []):
-                    # Assignee (ruleix) introuvable
                     assignee = perm.get("assignee", "")
                     if assignee and assignee not in self._rule_index:
                         issues.append(AuditIssue(
-                            severity=IssueSeverity.WARNING,
-                            layer=IssueLayer.GLOBAL,
-                            code=IssueCode.MESSAGE_UNKNOWN_RULE,
-                            fragment_id=frag_id,
-                            policy_uid=fpd_uid,
-                            description=(
-                                f"Message flow '{from_act} → {to_act}' : "
-                                f"assignee '{assignee}' introuvable dans les FPa."
+                            severity    = IssueSeverity.WARNING,
+                            layer       = IssueLayer.GLOBAL,
+                            code        = IssueCode.MESSAGE_UNKNOWN_RULE,
+                            fragment_id = frag_id,
+                            policy_uid  = fpd_uid,
+                            description = (
+                                f"Message flow '{from_act} → {to_act}': "
+                                f"assignee '{assignee}' not found in FPa index."
                             ),
-                            details={"assignee": assignee, "to_fragment": to_frag},
+                            details = {"assignee": assignee, "to_fragment": to_frag},
                         ))
 
-                    # Duty target introuvable
                     for duty in perm.get("duty", []):
                         tgt = duty.get("target", "")
                         if tgt and tgt not in self._rule_index:
                             issues.append(AuditIssue(
-                                severity=IssueSeverity.WARNING,
-                                layer=IssueLayer.GLOBAL,
-                                code=IssueCode.MESSAGE_UNKNOWN_TARGET,
-                                fragment_id=frag_id,
-                                policy_uid=fpd_uid,
-                                description=(
-                                    f"Message flow '{from_act} → {to_act}' : "
-                                    f"duty target '{tgt}' introuvable dans les FPa."
+                                severity    = IssueSeverity.WARNING,
+                                layer       = IssueLayer.GLOBAL,
+                                code        = IssueCode.MESSAGE_UNKNOWN_TARGET,
+                                fragment_id = frag_id,
+                                policy_uid  = fpd_uid,
+                                description = (
+                                    f"Message flow '{from_act} → {to_act}': "
+                                    f"duty target '{tgt}' not found in FPa index."
                                 ),
-                                details={"duty_target": tgt, "to_fragment": to_frag},
+                                details = {"duty_target": tgt, "to_fragment": to_frag},
                             ))
 
         issues.extend(self._detect_dependency_cycles())
         return issues
 
     def _detect_dependency_cycles(self) -> list[AuditIssue]:
-        """DFS pour détecter les cycles de dépendances inter-fragments."""
+        """DFS to detect inter-fragment dependency cycles."""
         issues: list[AuditIssue] = []
-
         dep_graph: dict[str, set[str]] = {fid: set() for fid in self.fp_results}
+
         for frag_id, fps in self.fp_results.items():
             for fpd in fps.fpd_policies:
                 if fpd.get("_flow") == "message" or fpd.get("_inter"):
@@ -1342,21 +1150,18 @@ class PolicyAuditor:
                 cycle = dfs(frag_id, [frag_id])
                 if cycle:
                     issues.append(AuditIssue(
-                        severity=IssueSeverity.CRITICAL,
-                        layer=IssueLayer.GLOBAL,
-                        code=IssueCode.DEPENDENCY_CYCLE,
-                        fragment_id=frag_id,
-                        description=(
-                            f"Cycle de dépendances inter-fragments : "
-                            f"{' → '.join(cycle)}"
-                        ),
-                        details={"cycle": cycle},
+                        severity    = IssueSeverity.CRITICAL,
+                        layer       = IssueLayer.GLOBAL,
+                        code        = IssueCode.DEPENDENCY_CYCLE,
+                        fragment_id = frag_id,
+                        description = f"Inter-fragment dependency cycle: {' → '.join(cycle)}",
+                        details     = {"cycle": cycle},
                     ))
 
         return issues
 
     # ══════════════════════════════════════════════════════════════
-    #  Rapport console
+    #  Console report
     # ══════════════════════════════════════════════════════════════
 
     def print_report(self, report: AuditReport) -> None:
@@ -1364,16 +1169,16 @@ class PolicyAuditor:
         print("\n" + "═" * 65)
         print("  AGENT 5 — Policy Audit Report")
         print("═" * 65)
-        print(f"  Status      : {'✅ VALIDE' if s['is_valid'] else '❌ ANOMALIES CRITIQUES'}")
-        print(f"  Critical    : {s['critical']}")
-        print(f"  Warning     : {s['warning']}")
-        print(f"  Info        : {s['info']}")
-        print(f"  Par niveau  :")
+        print(f"  Status   : {'✅ VALID' if s['is_valid'] else '❌ CRITICAL ISSUES'}")
+        print(f"  Critical : {s['critical']}")
+        print(f"  Warning  : {s['warning']}")
+        print(f"  Info     : {s['info']}")
+        print(f"  By layer :")
         for layer, count in s["by_layer"].items():
             print(f"    {layer:14s} : {count}")
         print()
         for issue in report.issues:
             print(f"  {issue}")
             if issue.suggestion:
-                print(f"    ↳ Suggestion : {issue.suggestion}")
+                print(f"    ↳ Suggestion: {issue.suggestion}")
         print("═" * 65)

@@ -17,12 +17,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Import all modules
-from bpmn_parser import BPMNParser
-from enhanced_fragmenter import EnhancedFragmenter
+# Import all modules (baseline reste sous src/baseline/)
+from baseline.bpmn_parser import BPMNParser
+from baseline.enhanced_fragmenter import EnhancedFragmenter
 # Policy generators are imported conditionally within _process_model
-from policy_consistency_checker import PolicyConsistencyChecker
-from policy_reconstructor import PolicyReconstructor
+from .policy_consistency_checker import PolicyConsistencyChecker
+from .policy_reconstructor import PolicyReconstructor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

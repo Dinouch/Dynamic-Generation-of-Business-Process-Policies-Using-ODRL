@@ -36,6 +36,11 @@ class GatewayType(Enum):
     XOR = "XOR"  # Exclusif  → une seule branche
     AND = "AND"  # Parallèle → toutes les branches
     OR = "OR"    # Inclusif  → une ou plusieurs branches
+    EVENT_BASED_EXCLUSIVE = "EVENT_BASED_EXCLUSIVE"  # Event-based gateway (exclusive)
+    EVENT_BASED_PARALLEL = "EVENT_BASED_PARALLEL"    # Event-based gateway (parallel)
+    COMPLEX = "COMPLEX"                              # Complex gateway
+    DEFAULT = "DEFAULT"                              # Default flow (marker, rarely as node type)
+    CONDITIONAL = "CONDITIONAL"                      # Conditional sequence (marker)
 
 
 class EdgeType(Enum):
@@ -320,6 +325,64 @@ class BPMNGraph:
                     return True
         return False
 
+    def _cycle_involved_node_ids(self) -> set[str]:
+        """Nœuds du graphe situés sur au moins un cycle orienté (arêtes de retour)."""
+        if not self.has_cycle():
+            return set()
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: dict[str, int] = {nid: WHITE for nid in self._nodes}
+        involved_nodes: set[str] = set()
+        stack_path: list[str] = []
+
+        def dfs(v: str) -> None:
+            color[v] = GRAY
+            stack_path.append(v)
+            for succ in self.successors(v):
+                w = succ.id
+                if w not in self._nodes:
+                    continue
+                cw = color.get(w, WHITE)
+                if cw == WHITE:
+                    dfs(w)
+                elif cw == GRAY:
+                    i = stack_path.index(w)
+                    involved_nodes.update(stack_path[i:])
+            stack_path.pop()
+            color[v] = BLACK
+
+        for nid in self._nodes:
+            if color[nid] == WHITE:
+                dfs(nid)
+        return involved_nodes
+
+    def cycle_involved_fragment_ids(self) -> list[str]:
+        """
+        Retourne les identifiants de fragments distincts dont au moins un nœud
+        appartient à un cycle orienté.
+
+        Utilisé pour le pattern ``loop`` (hors COVERED_PATTERNS) : une FPd
+        unhandled est dupliquée dans ``fps.fpd_policies`` de chaque fragment listé.
+        """
+        involved_nodes = self._cycle_involved_node_ids()
+        frags: set[str] = set()
+        for nid in involved_nodes:
+            n = self._nodes.get(nid)
+            if n and n.fragment_id:
+                frags.add(n.fragment_id)
+        return sorted(frags)
+
+    def cycle_involved_activity_names(self) -> list[str]:
+        """
+        Noms des activités (``ActivityNode``) dont le nœud appartient à un cycle.
+        Utilisé pour documenter la FPd ``loop`` (cible / libellé lisibles).
+        """
+        names: set[str] = set()
+        for nid in self._cycle_involved_node_ids():
+            n = self._nodes.get(nid)
+            if isinstance(n, ActivityNode) and n.name:
+                names.add(n.name)
+        return sorted(names, key=lambda s: s.lower())
+
     # ── Représentation ────────────────────────────
 
     def summary(self) -> dict:
@@ -427,12 +490,15 @@ def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
         "XOR": GatewayType.XOR,
         "AND": GatewayType.AND,
         "OR": GatewayType.OR,
+        "EVENT_BASED_EXCLUSIVE": GatewayType.EVENT_BASED_EXCLUSIVE,
+        "EVENT_BASED_PARALLEL": GatewayType.EVENT_BASED_PARALLEL,
+        "COMPLEX": GatewayType.COMPLEX,
     }
 
     for gw in bp_model.get("gateways", []):
         gw_id = gw.get("id") or gw.get("name")
         gw_name = gw.get("name") or gw_id
-        gw_type_str = str(gw.get("type", "")).upper()
+        gw_type_str = str(gw.get("type", "")).upper().replace("-", "_")
         gw_type = gw_type_map.get(gw_type_str)
 
         node = GatewayNode(

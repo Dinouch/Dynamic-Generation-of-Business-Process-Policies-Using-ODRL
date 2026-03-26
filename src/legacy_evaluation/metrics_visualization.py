@@ -9,8 +9,8 @@ et permet l'export JSON.
 
 USAGE
 ────
-    from pipeline_metrics import PipelineMetricsCollector
-    from metrics_visualization import export_metrics_json, print_metrics_report
+    from legacy_evaluation.pipeline_metrics import PipelineMetricsCollector
+    from legacy_evaluation.metrics_visualization import export_metrics_json, print_metrics_report
 
     collector = PipelineMetricsCollector(...)
     metrics = collector.compute_all()

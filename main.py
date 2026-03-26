@@ -12,8 +12,33 @@ Mode looped orchestration (end-to-end, with loops)
 
 """
 
+import io
 import os
 import sys
+
+
+def _configure_windows_console_stdio() -> None:
+    """Évite UnicodeEncodeError sous Windows (cp1252) lors des print Unicode (═, etc.)."""
+    if sys.platform != "win32":
+        return
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        elif hasattr(sys.stdout, "buffer"):
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        elif hasattr(sys.stderr, "buffer"):
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+    except Exception:
+        pass
+
+
+_configure_windows_console_stdio()
 
 _ROOT = os.path.abspath(os.path.dirname(__file__))
 _SRC = os.path.join(_ROOT, "src")

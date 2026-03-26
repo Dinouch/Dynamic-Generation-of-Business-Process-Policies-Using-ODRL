@@ -2,6 +2,9 @@ matplotlib
 pandas
 python-dotenv
 openai
+rdflib
+pyld
+pyshacl
 numpy
 lxml
 requests

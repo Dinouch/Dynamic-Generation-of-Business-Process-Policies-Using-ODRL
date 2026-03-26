@@ -26,7 +26,7 @@ Sortie : EnrichedGraph contenant
       from .structural_analyzer import AgentMessage, MessageType, ReanalysisLimitError
 
   Méthodes multi-agent de StructuralAnalyzer :
-      register_send_callback(fn)  — connecte Agent 1 → Agent 2
+      register_send_callback(fn)  — connecte Agent 1 → Agent 3
       send(msg)                   — émet un AgentMessage
       receive(msg)                — accepte STRUCTURAL_UPDATE de Agent 3
       analyze_and_send()          — analyze() + émet GRAPH_READY
@@ -48,9 +48,13 @@ Sortie : EnrichedGraph contenant
 """
 
 import datetime
+import re
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
+
+from .pipeline_registry import BPMN_SEMANTICS, COVERED_PATTERNS
 
 # Import fragmenter à la demande dans analyze() pour éviter dépendance circulaire
 # et garder l'agent utilisable sans fragmenter si fragments est fourni.
@@ -59,7 +63,6 @@ from graph import (
     BPMNGraph,
     ActivityNode,
     GatewayNode,
-    EventNode,
     Edge,
     NodeType,
     GatewayType,
@@ -77,32 +80,28 @@ class MessageType(Enum):
     """
     Types de messages échangés entre agents.
 
-    Flux complet du pipeline :
-        Agent 1 ──GRAPH_READY──────────► Agent 2
-        Agent 2 ──CANDIDATES_READY─────► Agent 3
+    Flux principal :
+        Agent 1 ──GRAPH_READY──────────► Agent 3
+        Agent 3 ──GRAPH_READY──────────► Agent 2   (si patterns non couverts)
+        Agent 2 ──UNHANDLED_PROPOSALS──► Agent 3
         Agent 3 ──REFORMULATE──────────► Agent 2   (boucle courte)
         Agent 3 ──STRUCTURAL_UPDATE────► Agent 1   (boucle structurelle)
         Agent 3 ──VALIDATION_DONE──────► Agent 4
-        Agent 4 ──POLICIES_READY───────► Agent 5
+        Agent 4 ──POLICIES_READY───────► Agent 3   (validation sémantique)
+        Agent 3 ──SEMANTIC_CORRECTION──► Agent 4
+        Agent 3 ──SEMANTIC_VALIDATED───► Agent 4 → POLICIES_READY → Agent 5
         Agent 5 ──SYNTAX_CORRECTION────► Agent 4   (boucle syntaxique)
-        Agent 5 ──ODRL_VALID───────────► pipeline
-        Agent 5 ──ODRL_SYNTAX_ERROR────► pipeline
+        Agent 5 ──ODRL_VALID / ODRL_SYNTAX_ERROR──► pipeline
     """
-    # Agent 1 → Agent 2
     GRAPH_READY        = "graph_ready"
-    # Agent 3 → Agent 1  (boucle structurelle)
     STRUCTURAL_UPDATE  = "structural_update"
-    # Agent 2 → Agent 3
-    CANDIDATES_READY   = "candidates_ready"
-    # Agent 3 → Agent 2  (boucle courte)
+    UNHANDLED_PROPOSALS = "unhandled_proposals"
     REFORMULATE        = "reformulate"
-    # Agent 3 → Agent 4
     VALIDATION_DONE    = "validation_done"
-    # Agent 4 → Agent 5
     POLICIES_READY     = "policies_ready"
-    # Agent 5 → Agent 4  (boucle syntaxique)
+    SEMANTIC_CORRECTION = "semantic_correction"
+    SEMANTIC_VALIDATED = "semantic_validated"
     SYNTAX_CORRECTION  = "syntax_correction"
-    # Agent 5 → pipeline (signal final)
     ODRL_VALID         = "odrl_valid"
     ODRL_SYNTAX_ERROR  = "odrl_syntax_error"
 
@@ -165,6 +164,39 @@ class StructuralPattern:
     involved_nodes: list[str]  # IDs des nœuds impliqués
     fragment_id: Optional[str]  # Fragment concerné (None si inter-fragment)
     description: str  # Explication humaine du pattern
+    involved_fragment_ids: list[str] = field(default_factory=list)
+    involved_activity_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class UnhandledPattern:
+    """
+    BPMN structural pattern not covered by deterministic Agent 4 templates.
+    Routed to Agent 2 for LLM formulation.
+    """
+
+    pattern_type: str
+    gateway_id: str
+    gateway_name: str
+    fragment_id: str
+    description: str
+    bpmn_semantic: str
+    involved_fragment_ids: list[str] = field(default_factory=list)
+    involved_activity_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SemanticHint:
+    """
+    Semantic correction hint from Agent 3 for Agent 4 to patch generated ODRL.
+    """
+
+    policy_uid: str
+    field_path: str
+    issue: str
+    suggested_fix: str
+    odrl_template_key: str
+    confidence: float
 
 
 @dataclass
@@ -240,6 +272,9 @@ class EnrichedGraph:
     global_contexts: dict[str, FragmentContext]  # fragment_id → contexte global
     raw_bpmn: dict  # BPMN original (référence)
     raw_b2p: list[dict]  # B2P policies originales
+    unhandled_patterns: list[UnhandledPattern] = field(default_factory=list)
+    # Reserved — B2P ambiguity LLM moved to Agent 3; always None.
+    structural_llm_report: Optional[dict] = None
 
 
 # ─────────────────────────────────────────────
@@ -264,12 +299,11 @@ class StructuralAnalyzer:
     Produit :
         - EnrichedGraph : graphe formel enrichi, prêt pour les agents suivants
 
-    Cet agent est DÉTERMINISTE — pas de LLM, pas d'aléatoire.
-    Chaque opération est traceable et justifiable.
+    Analyse entièrement DÉTERMINISTE (graphe, patterns, connexions, mapping B2P heuristique).
 
     ── Couche multi-agent ──────────────────────────────────────────────
     En mode connecté (pipeline complet) :
-        analyzer.register_send_callback(agent2.receive)
+        analyzer.register_send_callback(agent3.receive)
         analyzer.analyze_and_send()   # démarre le pipeline
 
     En mode standalone (tests unitaires) :
@@ -285,7 +319,21 @@ class StructuralAnalyzer:
         fragments: Optional[list[dict]] = None,
         b2p_policies: Optional[list[dict]] = None,
         fragmentation_strategy: str = "gateway",
+        api_key: Optional[str] = None,
+        *,
+        azure_endpoint: Optional[str] = None,
+        azure_api_version: Optional[str] = None,
+        azure_deployment: Optional[str] = None,
     ):
+        """
+        Initialize the structural analyzer.
+
+        Parameters
+        ----------
+        api_key, azure_* :
+            Ignored — retained for backward compatibility; B2P ambiguity LLM runs in Agent 3.
+        """
+        _ = (api_key, azure_endpoint, azure_api_version, azure_deployment)
         self.bp_model = bp_model
         self.fragments = fragments
         self.b2p_policies = b2p_policies or []
@@ -307,8 +355,8 @@ class StructuralAnalyzer:
 
     def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
         """
-        Enregistre le callback vers Agent 2.
-        En mode pipeline : analyzer.register_send_callback(agent2.receive)
+        Enregistre le callback vers Agent 3.
+        En mode pipeline : analyzer.register_send_callback(agent3.receive)
         """
         self._on_send = fn
         print(f"[Agent 1] Callback send enregistré → {fn}")
@@ -336,7 +384,7 @@ class StructuralAnalyzer:
     def analyze_and_send(self) -> None:
         """
         Version connectée de analyze() pour le mode pipeline.
-        Lance l'analyse complète puis émet GRAPH_READY vers Agent 2.
+        Lance l'analyse complète puis émet GRAPH_READY vers Agent 3.
 
         En mode standalone (tests), utiliser analyze() directement.
         """
@@ -344,13 +392,16 @@ class StructuralAnalyzer:
         self._last_enriched_graph = enriched_graph
         self.send(AgentMessage(
             sender    = self.AGENT_NAME,
-            recipient = "agent2",
+            recipient = "agent3",
             msg_type  = MessageType.GRAPH_READY,
             payload   = {
-                "enriched_graph":     enriched_graph,
-                "fragment_ids":       list(enriched_graph.fragment_contexts.keys()),
-                "reanalysis":         False,
-                "affected_fragments": None,
+                "enriched_graph":         enriched_graph,
+                "fragment_ids":           list(enriched_graph.fragment_contexts.keys()),
+                "reanalysis":             False,
+                "affected_fragments":     None,
+                "structural_llm_report":  getattr(
+                    enriched_graph, "structural_llm_report", None
+                ),
             },
         ))
 
@@ -397,14 +448,17 @@ class StructuralAnalyzer:
         # Conserver le loop_turn reçu — Agent 3 avait déjà incrémenté
         self.send(AgentMessage(
             sender    = self.AGENT_NAME,
-            recipient = "agent2",
+            recipient = "agent3",
             msg_type  = MessageType.GRAPH_READY,
             payload   = {
-                "enriched_graph":     self._last_enriched_graph,
-                "fragment_ids":       list(self._last_enriched_graph.fragment_contexts.keys()),
-                "reanalysis":         True,
-                "affected_fragments": affected_frags,
-                "new_connections":    new_connections,
+                "enriched_graph":         self._last_enriched_graph,
+                "fragment_ids":           list(self._last_enriched_graph.fragment_contexts.keys()),
+                "reanalysis":             True,
+                "affected_fragments":     affected_frags,
+                "new_connections":        new_connections,
+                "structural_llm_report":  getattr(
+                    self._last_enriched_graph, "structural_llm_report", None
+                ),
             },
             loop_turn = msg.loop_turn,  # pas d'incrémentation ici
         ))
@@ -549,11 +603,12 @@ class StructuralAnalyzer:
         b2p_mappings = self._map_b2p_to_activities()
         print(f"[Agent 1] B2P mappings : {len(b2p_mappings)} activités mappées")
 
-        # Étape 3 — Détection des patterns
-        patterns = self._detect_patterns()
+        # Étape 3 — Détection des patterns (+ unhandled vs pipeline_registry)
+        patterns, unhandled_patterns = self._detect_patterns()
         print(f"[Agent 1] Patterns détectés : {len(patterns)}")
         for p in patterns:
             print(f"    -> [{p.pattern_type}] {p.gateway_name} : {p.description}")
+        print(f"[Agent 1] Patterns non couverts (unhandled) : {len(unhandled_patterns)}")
 
         # Étape 4 — Construction des ConnectionInfo
         connections = self._build_connections()
@@ -573,6 +628,8 @@ class StructuralAnalyzer:
             global_contexts=global_contexts,
             raw_bpmn=self.bp_model,
             raw_b2p=self.b2p_policies,
+            unhandled_patterns=unhandled_patterns,
+            structural_llm_report=None,
         )
 
     def _compute_fragments(self) -> list[dict]:
@@ -625,15 +682,19 @@ class StructuralAnalyzer:
             self._name_to_id[act["name"]] = node_id
 
         # ── Nœuds Gateway ──
+        gw_type_map = {
+            "XOR": GatewayType.XOR,
+            "AND": GatewayType.AND,
+            "OR": GatewayType.OR,
+            "EVENT_BASED_EXCLUSIVE": GatewayType.EVENT_BASED_EXCLUSIVE,
+            "EVENT_BASED_PARALLEL": GatewayType.EVENT_BASED_PARALLEL,
+            "COMPLEX": GatewayType.COMPLEX,
+        }
         for gw in self.bp_model.get("gateways", []):
             node_id = f"gw_{gw['name'].replace(' ', '_')}"
 
-            gw_type_str = gw.get("type", "XOR").upper()
-            gw_type = {
-                "XOR": GatewayType.XOR,
-                "AND": GatewayType.AND,
-                "OR": GatewayType.OR,
-            }.get(gw_type_str, GatewayType.XOR)
+            gw_type_str = str(gw.get("type", "XOR")).upper().replace("-", "_")
+            gw_type = gw_type_map.get(gw_type_str, GatewayType.XOR)
 
             node = GatewayNode(
                 id=node_id,
@@ -672,6 +733,13 @@ class StructuralAnalyzer:
             if gw_name and gw_name in self._name_to_id:
                 gw_id = self._name_to_id[gw_name]
 
+            cond = flow.get("condition") or flow.get("conditionExpression")
+            edge_meta: dict = {}
+            if flow.get("isDefault") or flow.get("default"):
+                edge_meta["is_default"] = True
+            if flow.get("conditionExpression"):
+                edge_meta["condition_expression"] = flow.get("conditionExpression")
+
             edge = Edge(
                 id=f"e{i}_{from_name.replace(' ', '_')}_{to_name.replace(' ', '_')}",
                 source=from_id,
@@ -679,7 +747,8 @@ class StructuralAnalyzer:
                 edge_type=edge_type,
                 dependency_type=dep_type,
                 gateway_id=gw_id,
-                condition=flow.get("condition"),
+                condition=cond,
+                metadata=edge_meta,
             )
             self.graph.add_edge(edge)
 
@@ -748,32 +817,112 @@ class StructuralAnalyzer:
 
     def _name_matches_target(self, activity_name: str, target_uri: str) -> bool:
         """
-        Vérifie si l'activité est ciblée par l'URI ODRL.
+        Vérifie si l'activité est ciblée par l'URI ODRL (heuristique).
 
-        Normalise les deux chaînes pour la comparaison.
+        - Cas historique : le nom d'activité normalisé apparaît dans l'URI normalisée
+          (adapté quand l'URI est longue ou reprend le libellé complet).
+        - Souvent l'URI est plus courte (slug) : on teste si le dernier segment de
+          chemin est contenu **dans** le nom d'activité (libellé BPMN plus long).
+        - Plusieurs mots dans le BPMN : si au moins la moitié des tokens significatifs
+          (longueur ≥ 3) apparaissent dans la cible, on accepte (URI compacte avec
+          quelques mots-clés communs).
+
+        Les **synonymes** purs (autre vocabulaire sans morceau de texte commun) ne
+        sont pas détectés ici ; ils restent du ressort du LLM (cibles orphelines).
         """
         normalized_name = activity_name.lower().replace(" ", "_").replace("-", "_")
         normalized_target = target_uri.lower().replace("-", "_").replace("/", "_")
-        return normalized_name in normalized_target
+        if normalized_name in normalized_target:
+            return True
+
+        # Dernier segment de chemin (souvent un slug court) ⊂ nom d'activité long
+        try:
+            path = (urlparse(target_uri).path or "").rstrip("/")
+            if path:
+                last_seg = path.split("/")[-1].lower().replace("-", "_")
+                if len(last_seg) >= 3 and last_seg in normalized_name:
+                    return True
+        except Exception:
+            pass
+
+        # Plusieurs mots dans le BPMN ; l'URI ne contient qu'une partie des mots
+        tokens = re.split(r"[\s_\-]+", activity_name.lower())
+        tokens = [t for t in tokens if len(t) >= 3]
+        if len(tokens) >= 2:
+            hits = sum(1 for t in tokens if t in normalized_target)
+            if hits >= max(2, (len(tokens) + 1) // 2):
+                return True
+
+        return False
 
     # ─────────────────────────────────────────
     #  Étape 3 — Détection des patterns
     # ─────────────────────────────────────────
 
-    def _detect_patterns(self) -> list[StructuralPattern]:
+    def _append_pattern_with_registry(
+        self,
+        patterns: list[StructuralPattern],
+        unhandled: list[UnhandledPattern],
+        pattern: StructuralPattern,
+    ) -> None:
         """
-        Détecte les patterns structurels BPMN dans le graphe.
+        Append a structural pattern and, if its type is not in COVERED_PATTERNS,
+        record an UnhandledPattern for downstream Agent 2.
+        """
+        patterns.append(pattern)
+        if pattern.pattern_type not in COVERED_PATTERNS:
+            sem = BPMN_SEMANTICS.get(
+                pattern.pattern_type,
+                "BPMN structural pattern without deterministic ODRL template coverage.",
+            )
+            unhandled.append(
+                UnhandledPattern(
+                    pattern_type=pattern.pattern_type,
+                    gateway_id=pattern.gateway_id,
+                    gateway_name=pattern.gateway_name,
+                    fragment_id=pattern.fragment_id or "unknown",
+                    description=pattern.description,
+                    bpmn_semantic=sem,
+                    involved_fragment_ids=list(pattern.involved_fragment_ids or []),
+                    involved_activity_names=list(pattern.involved_activity_names or []),
+                )
+            )
 
-        Patterns détectés :
-            - fork_xor  : gateway XOR avec plusieurs sorties
-            - fork_and  : gateway AND avec plusieurs sorties
-            - fork_or   : gateway OR avec plusieurs sorties
-            - join_xor  : gateway XOR avec plusieurs entrées
-            - join_and  : gateway AND avec plusieurs entrées
-            - sync      : point de synchronisation (join_and critique)
-            - loop      : cycle détecté
+    def _fork_pattern_type(self, gw: GatewayNode) -> str:
+        """Map gateway fork node to canonical pattern_type string."""
+        gt = gw.gateway_type
+        if gt == GatewayType.EVENT_BASED_EXCLUSIVE:
+            return "fork_event_based_exclusive"
+        if gt == GatewayType.EVENT_BASED_PARALLEL:
+            return "fork_event_based_parallel"
+        if gt == GatewayType.COMPLEX:
+            return "fork_complex"
+        if gt:
+            return f"fork_{gt.value.lower()}"
+        return "fork_unknown"
+
+    def _join_pattern_type(self, gw: GatewayNode) -> str:
+        """Map gateway join node to canonical pattern_type string."""
+        gt = gw.gateway_type
+        if gt == GatewayType.OR:
+            return "join_or"
+        if gt:
+            return f"join_{gt.value.lower()}"
+        return "join_unknown"
+
+    def _detect_patterns(self) -> tuple[list[StructuralPattern], list[UnhandledPattern]]:
+        """
+        Detect BPMN structural patterns on the formal graph and raw BPMN hints.
+
+        Returns
+        -------
+        patterns
+            All detected StructuralPattern records.
+        unhandled
+            Subset not covered by ``pipeline_registry.COVERED_PATTERNS`` (for Agent 2).
         """
         patterns: list[StructuralPattern] = []
+        unhandled: list[UnhandledPattern] = []
 
         for node in self.graph.all_nodes():
             if not isinstance(node, GatewayNode):
@@ -783,13 +932,13 @@ class StructuralAnalyzer:
             in_count = len(self.graph.in_edges(node.id))
             gw_type = node.gateway_type
 
-            # Fork patterns (plusieurs sorties)
             if out_count > 1:
                 involved = [e.target for e in self.graph.out_edges(node.id)]
-                pattern_type = f"fork_{gw_type.value.lower()}" if gw_type else "fork_unknown"
-
+                pattern_type = self._fork_pattern_type(node)
                 description = self._describe_fork(gw_type, node.name, involved)
-                patterns.append(
+                self._append_pattern_with_registry(
+                    patterns,
+                    unhandled,
                     StructuralPattern(
                         pattern_type=pattern_type,
                         gateway_id=node.id,
@@ -797,16 +946,16 @@ class StructuralAnalyzer:
                         involved_nodes=[node.id] + involved,
                         fragment_id=node.fragment_id,
                         description=description,
-                    )
+                    ),
                 )
 
-            # Join patterns (plusieurs entrées)
             if in_count > 1:
                 involved = [e.source for e in self.graph.in_edges(node.id)]
-                pattern_type = f"join_{gw_type.value.lower()}" if gw_type else "join_unknown"
-
+                pattern_type = self._join_pattern_type(node)
                 description = self._describe_join(gw_type, node.name, involved)
-                patterns.append(
+                self._append_pattern_with_registry(
+                    patterns,
+                    unhandled,
                     StructuralPattern(
                         pattern_type=pattern_type,
                         gateway_id=node.id,
@@ -814,12 +963,13 @@ class StructuralAnalyzer:
                         involved_nodes=involved + [node.id],
                         fragment_id=node.fragment_id,
                         description=description,
-                    )
+                    ),
                 )
 
-                # Sync point : join AND = synchronisation obligatoire
                 if gw_type == GatewayType.AND:
-                    patterns.append(
+                    self._append_pattern_with_registry(
+                        patterns,
+                        unhandled,
                         StructuralPattern(
                             pattern_type="sync",
                             gateway_id=node.id,
@@ -831,23 +981,179 @@ class StructuralAnalyzer:
                                 f"Toutes les branches parallèles doivent se terminer "
                                 f"avant de continuer."
                             ),
-                        )
+                        ),
                     )
 
-        # Détection de loop
         if self.graph.has_cycle():
-            patterns.append(
+            cfids = self.graph.cycle_involved_fragment_ids()
+            if not cfids:
+                cfids = sorted(
+                    {
+                        n.fragment_id
+                        for n in self.graph.all_nodes()
+                        if getattr(n, "fragment_id", None)
+                    }
+                )
+            cacts = self.graph.cycle_involved_activity_names()
+            primary = cfids[0] if cfids else None
+            loop_desc = "Un cycle a été détecté dans le graphe. Vérifier les boucles BPMN."
+            if cacts:
+                loop_desc = (
+                    f"Cycle de contrôle sur les activités : {', '.join(cacts)}. "
+                    + loop_desc
+                )
+            self._append_pattern_with_registry(
+                patterns,
+                unhandled,
                 StructuralPattern(
                     pattern_type="loop",
                     gateway_id="",
                     gateway_name="cycle_detected",
                     involved_nodes=[],
-                    fragment_id=None,
-                    description="Un cycle a été détecté dans le graphe. Vérifier les boucles BPMN.",
-                )
+                    fragment_id=primary,
+                    description=loop_desc,
+                    involved_fragment_ids=cfids,
+                    involved_activity_names=cacts,
+                ),
             )
 
-        return patterns
+        self._detect_flow_edge_patterns(patterns, unhandled)
+        self._detect_activity_shape_patterns(patterns, unhandled)
+
+        return patterns, unhandled
+
+    def _detect_flow_edge_patterns(
+        self,
+        patterns: list[StructuralPattern],
+        unhandled: list[UnhandledPattern],
+    ) -> None:
+        """
+        Detect default and conditional sequence flows from edge metadata and topology.
+
+        Inputs
+        ------
+        patterns, unhandled
+            Lists updated in place.
+        """
+        for edge in self.graph.all_edges():
+            src = self.graph.get_node(edge.source)
+            tgt = self.graph.get_node(edge.target)
+            if not isinstance(src, ActivityNode) or not isinstance(tgt, ActivityNode):
+                continue
+            frag = src.fragment_id or "unknown"
+            if edge.metadata.get("is_default"):
+                self._append_pattern_with_registry(
+                    patterns,
+                    unhandled,
+                    StructuralPattern(
+                        pattern_type="default_flow",
+                        gateway_id=edge.id,
+                        gateway_name=f"{src.name}→{tgt.name}",
+                        involved_nodes=[src.id, tgt.id],
+                        fragment_id=frag,
+                        description=(
+                            f"Default sequence flow from '{src.name}' to '{tgt.name}' "
+                            f"(fallback when no other condition matches)."
+                        ),
+                    ),
+                )
+            if (
+                edge.gateway_id is None
+                and edge.condition
+                and edge.edge_type == EdgeType.SEQUENCE
+            ):
+                self._append_pattern_with_registry(
+                    patterns,
+                    unhandled,
+                    StructuralPattern(
+                        pattern_type="conditional_flow",
+                        gateway_id=edge.id,
+                        gateway_name=f"{src.name}→{tgt.name}",
+                        involved_nodes=[src.id, tgt.id],
+                        fragment_id=frag,
+                        description=(
+                            f"Conditional sequence flow from '{src.name}' to '{tgt.name}' "
+                            f"without an intermediate splitting gateway."
+                        ),
+                    ),
+                )
+
+    def _detect_activity_shape_patterns(
+        self,
+        patterns: list[StructuralPattern],
+        unhandled: list[UnhandledPattern],
+    ) -> None:
+        """
+        Detect advanced activity / subprocess constructs from the raw BPMN dict.
+
+        Inputs
+        ------
+        patterns, unhandled
+            Lists updated in place.
+        """
+        for act in self.bp_model.get("activities", []):
+            name = act.get("name")
+            if not name or name not in self._name_to_id:
+                continue
+            node_id = self._name_to_id[name]
+            frag = self._fragment_of.get(name, "unknown")
+            meta = act.get("metadata") or {}
+
+            def _add(ptype: str, desc: str) -> None:
+                self._append_pattern_with_registry(
+                    patterns,
+                    unhandled,
+                    StructuralPattern(
+                        pattern_type=ptype,
+                        gateway_id=node_id,
+                        gateway_name=name,
+                        involved_nodes=[node_id],
+                        fragment_id=frag,
+                        description=desc,
+                    ),
+                )
+
+            if act.get("event_subprocess") or meta.get("event_subprocess"):
+                _add(
+                    "event_subprocess",
+                    f"Activity '{name}' is modeled as or contains an event subprocess.",
+                )
+            if act.get("compensation") or meta.get("compensation"):
+                _add(
+                    "compensation",
+                    f"Activity '{name}' has compensation boundary or handler semantics.",
+                )
+            lc = act.get("loopCharacteristics") or meta.get("loopCharacteristics")
+            if isinstance(lc, dict):
+                mi = lc.get("multiInstance") or lc.get("multiInstanceCharacteristics")
+                if isinstance(mi, dict):
+                    if mi.get("isSequential") is True:
+                        _add(
+                            "multi_instance_sequential",
+                            f"Activity '{name}' uses sequential multi-instance execution.",
+                        )
+                    else:
+                        _add(
+                            "multi_instance_parallel",
+                            f"Activity '{name}' uses parallel multi-instance execution.",
+                        )
+                else:
+                    _add(
+                        "loop_activity",
+                        f"Activity '{name}' declares standard loop characteristics.",
+                    )
+            elif act.get("loop") or meta.get("loop"):
+                _add("loop_activity", f"Activity '{name}' is marked as looping.")
+            if act.get("adHocSubprocess") or meta.get("ad_hoc_subprocess"):
+                _add(
+                    "ad_hoc_subprocess",
+                    f"Activity '{name}' is an ad-hoc subprocess.",
+                )
+            if act.get("callActivity") or meta.get("call_activity"):
+                _add(
+                    "call_activity",
+                    f"Activity '{name}' is a call activity referencing another process.",
+                )
 
     def _describe_fork(self, gw_type: Optional[GatewayType], gw_name: str, targets: list[str]) -> str:
         if gw_type == GatewayType.XOR:
@@ -865,6 +1171,12 @@ class StructuralAnalyzer:
                 f"Fork inclusif en '{gw_name}' : une ou plusieurs branches parmi {len(targets)}. "
                 f"Les policies doivent implémenter enable(ruleA OR ruleB)."
             )
+        if gw_type == GatewayType.EVENT_BASED_EXCLUSIVE:
+            return f"Fork event-based exclusif en '{gw_name}' : premier événement reçu."
+        if gw_type == GatewayType.EVENT_BASED_PARALLEL:
+            return f"Fork event-based parallèle en '{gw_name}' : tous les événements attendus."
+        if gw_type == GatewayType.COMPLEX:
+            return f"Fork complexe en '{gw_name}' : condition d'activation personnalisée."
         return f"Fork inconnu en '{gw_name}'."
 
     def _describe_join(self, gw_type: Optional[GatewayType], gw_name: str, sources: list[str]) -> str:
@@ -877,6 +1189,10 @@ class StructuralAnalyzer:
             return (
                 f"Join alternatif en '{gw_name}' : la première branche complétée continue. "
                 f"Les autres branches sont ignorées."
+            )
+        if gw_type == GatewayType.OR:
+            return (
+                f"Join inclusif en '{gw_name}' : fusion des branches OR entrantes."
             )
         return f"Join inconnu en '{gw_name}'."
 

@@ -1,10 +1,10 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:FPd_XOR_70c0a63e",
+  "uid": "http://example.com/policy:FPd_XOR_22ca2663",
   "@type": "Set",
   "permission": [
     {
-      "uid": "http://example.com/rules/XOR_ij_perform_checks_for_large_amount_8722566c",
+      "uid": "http://example.com/rules/XOR_ij_perform_checks_for_large_amount_61da3acf",
       "target": "http://example.com/rules/largeAmountRule",
       "action": [
         {
@@ -22,7 +22,7 @@
       ]
     },
     {
-      "uid": "http://example.com/rules/XOR_ik_perform_checks_for_small_amount_0d3339de",
+      "uid": "http://example.com/rules/XOR_ik_perform_checks_for_small_amount_edb64a5b",
       "target": "http://example.com/rules/smallAmountRule",
       "action": [
         {

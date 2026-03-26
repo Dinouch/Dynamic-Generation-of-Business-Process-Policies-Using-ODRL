@@ -1,11 +1,21 @@
 import os
+import sys
 import json
-import policy_metrics
+
+_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import matplotlib.pyplot as plt
 
-from fragmenter import Fragmenter
-from policy_generator import PolicyGenerator
-from policy_checker import PolicyChecker
+from baseline.fragmenter import Fragmenter
+from legacy_evaluation import policy_metrics
+from legacy_evaluation.policy_checker import PolicyChecker
+
+try:
+    from policy_generator import PolicyGenerator
+except ImportError:
+    PolicyGenerator = None  # module absent du dépôt — voir run_experiment_on_model
 
 def run_experiment_on_model(model_path, global_policy_path=None):
     """
@@ -19,6 +29,12 @@ def run_experiment_on_model(model_path, global_policy_path=None):
        "conflicts": ...
     }
     """
+    if PolicyGenerator is None:
+        raise ImportError(
+            "Le module 'policy_generator' est absent de ce dépôt. "
+            "Ajoutez-le sous src/ ou retirez l'appel à run_experiments."
+        )
+
     with open(model_path, "r") as f:
         bp_model = json.load(f)
 

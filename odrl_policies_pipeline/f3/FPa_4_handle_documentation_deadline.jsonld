@@ -1,12 +1,12 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:101",
+  "uid": "http://example.com/policy:FPa_handle_documentation_deadline_9a58daee",
   "@type": "Agreement",
   "obligation": [
     {
-      "uid": "http://example.com/rules/largeAmountRule",
-      "target": "http://example.com/asset/perform-checks-for-large-amount",
-      "assigner": "http://example.com/CentralBankDBOwner:org:CBDB",
+      "uid": "http://example.com/rules/documentationDeadlineRule",
+      "target": "http://example.com/asset/handle-documentation-deadline",
+      "assigner": "http://example.com/FinancialBank:org:FB",
       "assignee": "http://example.com/staff/FinancialBank:org:FB",
       "action": [
         {
@@ -15,9 +15,9 @@
           },
           "refinement": [
             {
-              "leftOperand": "Spatial",
+              "leftOperand": "event",
               "operator": "eq",
-              "rightOperand": "X"
+              "rightOperand": "documentation-deadline"
             }
           ]
         }

@@ -1,6 +1,6 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:FPa_ask_for_more_information_14b074d7",
+  "uid": "http://example.com/policy:FPa_ask_for_more_information_99565f05",
   "@type": "Agreement",
   "prohibition": [
     {

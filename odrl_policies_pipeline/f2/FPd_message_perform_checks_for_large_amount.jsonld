@@ -1,10 +1,10 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:FPd_MSG_811228c3",
+  "uid": "http://example.com/policy:FPd_MSG_2ae7680b",
   "@type": "Set",
   "permission": [
     {
-      "uid": "http://example.com/rules/MSG_perform_checks_for_large_amount_make_decision_499ed5b7",
+      "uid": "http://example.com/rules/MSG_perform_checks_for_large_amount_make_decision_599d2d76",
       "target": "http://example.com/messages/msg_f2_f3",
       "assignee": "http://example.com/rules/largeAmountRule",
       "action": [
@@ -24,7 +24,9 @@
       "duty": [
         {
           "target": "http://example.com/rules/decisionMakingRule",
-          "action": "enable",
+          "action": {
+            "@id": "odrl:enable"
+          },
           "constraint": [
             {
               "leftOperand": "event",
