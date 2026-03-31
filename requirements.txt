@@ -13,3 +13,6 @@ networkx
 pytest
 tqdm
 seaborn
+fastapi
+python-multipart
+uvicorn[standard]

@@ -1,0 +1,31 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy:documentation-followup-deadline-obligation",
+  "obligation": [
+    {
+      "uid": "http://example.com/policy:documentation-followup-deadline-obligation#obligation1",
+      "target": "http://example.com/asset/handle-documentation-deadline",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "documentation-deadline"
+        },
+        {
+          "leftOperand": "bpmn:gateway",
+          "operator": "eq",
+          "rightOperand": "documentation-followup"
+        },
+        {
+          "leftOperand": "bpmn:exclusiveFirstEvent",
+          "operator": "eq",
+          "rightOperand": true
+        }
+      ]
+    }
+  ]
+}

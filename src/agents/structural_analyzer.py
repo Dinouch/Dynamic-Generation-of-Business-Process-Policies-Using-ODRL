@@ -56,10 +56,10 @@ from typing import Callable, Optional
 
 from .pipeline_registry import BPMN_SEMANTICS, COVERED_PATTERNS
 
-# Import fragmenter à la demande dans analyze() pour éviter dépendance circulaire
-# et garder l'agent utilisable sans fragmenter si fragments est fourni.
+# Import fragmentation à la demande dans analyze() pour éviter dépendance circulaire
+# et garder l'agent utilisable si fragments est fourni en entrée.
 
-from graph import (
+from orchestration.graph import (
     BPMNGraph,
     ActivityNode,
     GatewayNode,
@@ -69,6 +69,8 @@ from graph import (
     EdgeType,
     DependencyType,
 )
+
+from baseline.semantic_fragmenter import normalize_fragment_slug
 
 
 # ─────────────────────────────────────────────
@@ -83,7 +85,7 @@ class MessageType(Enum):
     Flux principal :
         Agent 1 ──GRAPH_READY──────────► Agent 3
         Agent 3 ──GRAPH_READY──────────► Agent 2   (si patterns non couverts)
-        Agent 2 ──UNHANDLED_PROPOSALS──► Agent 3
+        Agent 2 ──UNSUPPORTED_PROPOSALS──► Agent 3
         Agent 3 ──REFORMULATE──────────► Agent 2   (boucle courte)
         Agent 3 ──STRUCTURAL_UPDATE────► Agent 1   (boucle structurelle)
         Agent 3 ──VALIDATION_DONE──────► Agent 4
@@ -95,7 +97,7 @@ class MessageType(Enum):
     """
     GRAPH_READY        = "graph_ready"
     STRUCTURAL_UPDATE  = "structural_update"
-    UNHANDLED_PROPOSALS = "unhandled_proposals"
+    UNSUPPORTED_PROPOSALS = "unsupported_proposals"
     REFORMULATE        = "reformulate"
     VALIDATION_DONE    = "validation_done"
     POLICIES_READY     = "policies_ready"
@@ -169,7 +171,7 @@ class StructuralPattern:
 
 
 @dataclass
-class UnhandledPattern:
+class UnsupportedPattern:
     """
     BPMN structural pattern not covered by deterministic Agent 4 templates.
     Routed to Agent 2 for LLM formulation.
@@ -239,8 +241,8 @@ class FragmentContext:
     """
 
     fragment_id: str
-    activities: list[str]  # Noms des activités du fragment
-    gateways: list[str]  # Noms des gateways du fragment
+    activities: list[str]  # Slugs d activités (cf. fragments.json)
+    gateways: list[str]  # Noms de gateways (slugs si issus du fragmenteur)
     b2p_mappings: list[ActivityB2PMapping]
     connections: list[ConnectionInfo]  # Connexions internes
     upstream_deps: list[ConnectionInfo]  # Dépendances entrantes (inter)
@@ -272,7 +274,7 @@ class EnrichedGraph:
     global_contexts: dict[str, FragmentContext]  # fragment_id → contexte global
     raw_bpmn: dict  # BPMN original (référence)
     raw_b2p: list[dict]  # B2P policies originales
-    unhandled_patterns: list[UnhandledPattern] = field(default_factory=list)
+    unsupported_patterns: list[UnsupportedPattern] = field(default_factory=list)
     # Reserved — B2P ambiguity LLM moved to Agent 3; always None.
     structural_llm_report: Optional[dict] = None
 
@@ -288,12 +290,11 @@ class StructuralAnalyzer:
 
     Reçoit :
         - bp_model   : dict BPMN (activities, gateways, flows)
-        - fragments  : list de fragments (output du Fragmenter), ou None pour les calculer
+        - fragments  : list de fragments (même format que ``fragments.json``), ou None pour les calculer
         - b2p_policies : list de policies ODRL du BP global
-        - fragmentation_strategy : si fragments=None, stratégie pour EnhancedFragmenter
-                                  ('gateway', 'activity', 'connected', 'hierarchical')
+        - fragmentation_strategy : conservé pour compatibilité d'API ; la fragmentation auto est pilotée par LLM
 
-    Si fragments est None, l'agent utilise EnhancedFragmenter pour calculer les fragments
+    Si fragments est None, l'agent utilise la fragmentation LLM (baseline) pour les fragments
     à partir du bp_model. Les ids sont normalisés en "f1", "f2", ... pour cohérence.
 
     Produit :
@@ -342,7 +343,7 @@ class StructuralAnalyzer:
 
         # Index interne : nom → id (pour la résolution des flows)
         self._name_to_id: dict[str, str] = {}
-        self._fragment_of: dict[str, str] = {}  # node_name → fragment_id
+        self._fragment_of: dict[str, str] = {}  # slug activité (cf. fragments.json) → fragment_id
 
         # ── Attributs multi-agent ──────────────────────────────────
         self._on_send:            Optional[Callable[[AgentMessage], None]] = None
@@ -581,7 +582,7 @@ class StructuralAnalyzer:
         Lance l'analyse complète.
 
         Étapes :
-            0. Si fragments non fourni : calcul via EnhancedFragmenter
+            0. Si fragments non fourni : calcul via fragmentation LLM
             1. Construire le graphe formel G depuis le BPMN
             2. Mapper les B2P policies aux activités
             3. Détecter les patterns structurels
@@ -593,7 +594,7 @@ class StructuralAnalyzer:
         # Étape 0 — Calcul des fragments si non fournis
         if self.fragments is None:
             self.fragments = self._compute_fragments()
-            print(f"[Agent 1] Fragments calculés par EnhancedFragmenter : {len(self.fragments)}")
+            print(f"[Agent 1] Fragments calculés (LLM) : {len(self.fragments)}")
 
         # Étape 1 — Construction du graphe formel
         self._build_graph()
@@ -603,12 +604,12 @@ class StructuralAnalyzer:
         b2p_mappings = self._map_b2p_to_activities()
         print(f"[Agent 1] B2P mappings : {len(b2p_mappings)} activités mappées")
 
-        # Étape 3 — Détection des patterns (+ unhandled vs pipeline_registry)
-        patterns, unhandled_patterns = self._detect_patterns()
+        # Étape 3 — Détection des patterns (+ unsupported vs pipeline_registry)
+        patterns, unsupported_patterns = self._detect_patterns()
         print(f"[Agent 1] Patterns détectés : {len(patterns)}")
         for p in patterns:
             print(f"    -> [{p.pattern_type}] {p.gateway_name} : {p.description}")
-        print(f"[Agent 1] Patterns non couverts (unhandled) : {len(unhandled_patterns)}")
+        print(f"[Agent 1] Patterns non couverts (unsupported) : {len(unsupported_patterns)}")
 
         # Étape 4 — Construction des ConnectionInfo
         connections = self._build_connections()
@@ -628,20 +629,20 @@ class StructuralAnalyzer:
             global_contexts=global_contexts,
             raw_bpmn=self.bp_model,
             raw_b2p=self.b2p_policies,
-            unhandled_patterns=unhandled_patterns,
+            unsupported_patterns=unsupported_patterns,
             structural_llm_report=None,
         )
 
     def _compute_fragments(self) -> list[dict]:
         """
-        Calcule les fragments via EnhancedFragmenter.
+        Calcule les fragments via ``SemanticFragmenter`` (LLM + gateways BPMN).
         Normalise les ids en "f1", "f2", ... pour cohérence avec les tests.
         """
-        from enhanced_fragmenter import EnhancedFragmenter
+        from baseline.semantic_fragmenter import SemanticFragmenter
 
-        fragmenter = EnhancedFragmenter(self.bp_model)
+        fragmenter = SemanticFragmenter(self.bp_model)
         raw_fragments = fragmenter.fragment_process(strategy=self.fragmentation_strategy)
-        # Normaliser les ids (EnhancedFragmenter renvoie 0, 1, 2...)
+        # Normaliser les ids (SemanticFragmenter.fragment_process renvoie 0, 1, 2...)
         normalized = []
         for i, frag in enumerate(raw_fragments):
             f = dict(frag)
@@ -661,12 +662,12 @@ class StructuralAnalyzer:
             frag_id = frag.get("id", f"f{i}")
             frag["id"] = frag_id
             for act_name in frag.get("activities", []):
-                self._fragment_of[act_name] = frag_id
+                self._fragment_of[normalize_fragment_slug(act_name)] = frag_id
 
         # ── Nœuds Activity ──
         for act in self.bp_model.get("activities", []):
             node_id = f"act_{act['name'].replace(' ', '_')}"
-            frag_id = self._fragment_of.get(act["name"])
+            frag_id = self._fragment_of.get(normalize_fragment_slug(act["name"]))
 
             node = ActivityNode(
                 id=node_id,
@@ -862,12 +863,12 @@ class StructuralAnalyzer:
     def _append_pattern_with_registry(
         self,
         patterns: list[StructuralPattern],
-        unhandled: list[UnhandledPattern],
+        unsupported: list[UnsupportedPattern],
         pattern: StructuralPattern,
     ) -> None:
         """
         Append a structural pattern and, if its type is not in COVERED_PATTERNS,
-        record an UnhandledPattern for downstream Agent 2.
+        record an UnsupportedPattern for downstream Agent 2.
         """
         patterns.append(pattern)
         if pattern.pattern_type not in COVERED_PATTERNS:
@@ -875,8 +876,8 @@ class StructuralAnalyzer:
                 pattern.pattern_type,
                 "BPMN structural pattern without deterministic ODRL template coverage.",
             )
-            unhandled.append(
-                UnhandledPattern(
+            unsupported.append(
+                UnsupportedPattern(
                     pattern_type=pattern.pattern_type,
                     gateway_id=pattern.gateway_id,
                     gateway_name=pattern.gateway_name,
@@ -910,7 +911,7 @@ class StructuralAnalyzer:
             return f"join_{gt.value.lower()}"
         return "join_unknown"
 
-    def _detect_patterns(self) -> tuple[list[StructuralPattern], list[UnhandledPattern]]:
+    def _detect_patterns(self) -> tuple[list[StructuralPattern], list[UnsupportedPattern]]:
         """
         Detect BPMN structural patterns on the formal graph and raw BPMN hints.
 
@@ -918,11 +919,11 @@ class StructuralAnalyzer:
         -------
         patterns
             All detected StructuralPattern records.
-        unhandled
+        unsupported
             Subset not covered by ``pipeline_registry.COVERED_PATTERNS`` (for Agent 2).
         """
         patterns: list[StructuralPattern] = []
-        unhandled: list[UnhandledPattern] = []
+        unsupported: list[UnsupportedPattern] = []
 
         for node in self.graph.all_nodes():
             if not isinstance(node, GatewayNode):
@@ -938,7 +939,7 @@ class StructuralAnalyzer:
                 description = self._describe_fork(gw_type, node.name, involved)
                 self._append_pattern_with_registry(
                     patterns,
-                    unhandled,
+                    unsupported,
                     StructuralPattern(
                         pattern_type=pattern_type,
                         gateway_id=node.id,
@@ -955,7 +956,7 @@ class StructuralAnalyzer:
                 description = self._describe_join(gw_type, node.name, involved)
                 self._append_pattern_with_registry(
                     patterns,
-                    unhandled,
+                    unsupported,
                     StructuralPattern(
                         pattern_type=pattern_type,
                         gateway_id=node.id,
@@ -969,7 +970,7 @@ class StructuralAnalyzer:
                 if gw_type == GatewayType.AND:
                     self._append_pattern_with_registry(
                         patterns,
-                        unhandled,
+                        unsupported,
                         StructuralPattern(
                             pattern_type="sync",
                             gateway_id=node.id,
@@ -1004,7 +1005,7 @@ class StructuralAnalyzer:
                 )
             self._append_pattern_with_registry(
                 patterns,
-                unhandled,
+                unsupported,
                 StructuralPattern(
                     pattern_type="loop",
                     gateway_id="",
@@ -1017,22 +1018,22 @@ class StructuralAnalyzer:
                 ),
             )
 
-        self._detect_flow_edge_patterns(patterns, unhandled)
-        self._detect_activity_shape_patterns(patterns, unhandled)
+        self._detect_flow_edge_patterns(patterns, unsupported)
+        self._detect_activity_shape_patterns(patterns, unsupported)
 
-        return patterns, unhandled
+        return patterns, unsupported
 
     def _detect_flow_edge_patterns(
         self,
         patterns: list[StructuralPattern],
-        unhandled: list[UnhandledPattern],
+        unsupported: list[UnsupportedPattern],
     ) -> None:
         """
         Detect default and conditional sequence flows from edge metadata and topology.
 
         Inputs
         ------
-        patterns, unhandled
+        patterns, unsupported
             Lists updated in place.
         """
         for edge in self.graph.all_edges():
@@ -1044,7 +1045,7 @@ class StructuralAnalyzer:
             if edge.metadata.get("is_default"):
                 self._append_pattern_with_registry(
                     patterns,
-                    unhandled,
+                    unsupported,
                     StructuralPattern(
                         pattern_type="default_flow",
                         gateway_id=edge.id,
@@ -1064,7 +1065,7 @@ class StructuralAnalyzer:
             ):
                 self._append_pattern_with_registry(
                     patterns,
-                    unhandled,
+                    unsupported,
                     StructuralPattern(
                         pattern_type="conditional_flow",
                         gateway_id=edge.id,
@@ -1081,14 +1082,14 @@ class StructuralAnalyzer:
     def _detect_activity_shape_patterns(
         self,
         patterns: list[StructuralPattern],
-        unhandled: list[UnhandledPattern],
+        unsupported: list[UnsupportedPattern],
     ) -> None:
         """
         Detect advanced activity / subprocess constructs from the raw BPMN dict.
 
         Inputs
         ------
-        patterns, unhandled
+        patterns, unsupported
             Lists updated in place.
         """
         for act in self.bp_model.get("activities", []):
@@ -1096,13 +1097,13 @@ class StructuralAnalyzer:
             if not name or name not in self._name_to_id:
                 continue
             node_id = self._name_to_id[name]
-            frag = self._fragment_of.get(name, "unknown")
+            frag = self._fragment_of.get(normalize_fragment_slug(name), "unknown")
             meta = act.get("metadata") or {}
 
             def _add(ptype: str, desc: str) -> None:
                 self._append_pattern_with_registry(
                     patterns,
-                    unhandled,
+                    unsupported,
                     StructuralPattern(
                         pattern_type=ptype,
                         gateway_id=node_id,

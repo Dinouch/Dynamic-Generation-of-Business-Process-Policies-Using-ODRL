@@ -1,0 +1,42 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy/loop-f1-completeness-check-business-hours",
+  "obligation": [
+    {
+      "uid": "http://example.com/policy/loop-f1-completeness-check-business-hours/obligation/1",
+      "target": "http://example.com/asset/check-for-completeness",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "cycle_detected"
+        },
+        {
+          "leftOperand": "odrl:purpose",
+          "operator": "eq",
+          "rightOperand": "http://example.com/purpose/loop-iteration"
+        },
+        {
+          "leftOperand": "dateTime",
+          "operator": "gteq",
+          "rightOperand": {
+            "@value": "08:00",
+            "@type": "xsd:time"
+          }
+        },
+        {
+          "leftOperand": "dateTime",
+          "operator": "lteq",
+          "rightOperand": {
+            "@value": "18:00",
+            "@type": "xsd:time"
+          }
+        }
+      ]
+    }
+  ]
+}

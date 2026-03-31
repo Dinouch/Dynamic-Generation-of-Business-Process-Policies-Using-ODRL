@@ -1,0 +1,29 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPd_SEQ_bbd202af",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/SEQ_receive_missing_documents_request_credit_card_f8882add",
+      "target": "http://example.com/rules/receiveMissingDocumentsRule",
+      "action": {
+        "@id": "odrl:enable"
+      },
+      "duty": [
+        {
+          "action": "nextPolicy",
+          "uid": "http://example.com/policy:207"
+        }
+      ],
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "gt",
+          "rightOperand": {
+            "@id": "odrl:policyUsage"
+          }
+        }
+      ]
+    }
+  ]
+}

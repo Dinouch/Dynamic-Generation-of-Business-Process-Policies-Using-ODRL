@@ -1,0 +1,21 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy:loop-f1-obligation-ask-more-info-on-incomplete",
+  "obligation": [
+    {
+      "uid": "http://example.com/policy:loop-f1-obligation-ask-more-info-on-incomplete#rule1",
+      "target": "http://example.com/asset/ask-for-more-information",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "completeness_not_met"
+        }
+      ]
+    }
+  ]
+}

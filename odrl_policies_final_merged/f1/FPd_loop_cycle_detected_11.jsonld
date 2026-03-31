@@ -1,0 +1,21 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy/loop-f1-completeness-recheck",
+  "obligation": [
+    {
+      "uid": "http://example.com/policy/loop-f1-completeness-recheck/obligation/1",
+      "target": "http://example.com/asset/check-for-completeness",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "more-information-requested"
+        }
+      ]
+    }
+  ]
+}

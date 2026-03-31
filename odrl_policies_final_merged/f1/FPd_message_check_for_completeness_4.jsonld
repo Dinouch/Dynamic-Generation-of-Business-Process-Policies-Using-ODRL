@@ -1,0 +1,43 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPd_MSG_aee31399",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/MSG_check_for_completeness_check_credit_amount_7398f816",
+      "target": "http://example.com/messages/msg_f1_f2",
+      "assignee": "http://example.com/rules/completenessCheckRule",
+      "action": [
+        {
+          "rdf:value": {
+            "@id": "odrl:transfer"
+          },
+          "refinement": [
+            {
+              "leftOperand": "recipient",
+              "operator": "eq",
+              "rightOperand": "http://example.com/rules/creditAmountCheckRule"
+            }
+          ]
+        }
+      ],
+      "duty": [
+        {
+          "target": "http://example.com/rules/creditAmountCheckRule",
+          "action": {
+            "@id": "odrl:enable"
+          },
+          "constraint": [
+            {
+              "leftOperand": "event",
+              "operator": "gt",
+              "rightOperand": {
+                "@id": "odrl:policyUsage"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

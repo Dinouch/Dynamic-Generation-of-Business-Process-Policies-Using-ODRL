@@ -1,0 +1,29 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy:loop-f1-cycle_detected-obligation",
+  "obligation": [
+    {
+      "uid": "http://example.com/policy:loop-f1-cycle_detected-obligation#obl-1",
+      "target": "http://example.com/asset/loop-body/ask-for-more-information_then_check-for-completeness",
+      "action": {
+        "@id": "odrl:enable"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "http://example.com/bpmn/gateway/cycle_detected"
+        },
+        {
+          "leftOperand": "count",
+          "operator": "gt",
+          "rightOperand": {
+            "@value": 1,
+            "@type": "xsd:integer"
+          }
+        }
+      ]
+    }
+  ]
+}

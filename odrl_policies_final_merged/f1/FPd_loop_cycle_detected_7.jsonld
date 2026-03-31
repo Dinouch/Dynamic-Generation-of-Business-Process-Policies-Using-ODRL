@@ -1,0 +1,26 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy/loop-f1-prohibit-ask-more-info-when-complete",
+  "prohibition": [
+    {
+      "uid": "http://example.com/policy/loop-f1-prohibition-1",
+      "target": "http://example.com/asset/ask-for-more-information",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "http://example.com/operand/event",
+          "operator": "odrl:eq",
+          "rightOperand": "cycle_detected"
+        },
+        {
+          "leftOperand": "http://example.com/operand/status",
+          "operator": "odrl:eq",
+          "rightOperand": "complete"
+        }
+      ]
+    }
+  ]
+}

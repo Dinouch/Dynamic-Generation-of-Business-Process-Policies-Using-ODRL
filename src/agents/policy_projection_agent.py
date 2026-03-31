@@ -37,7 +37,7 @@ from .structural_analyzer import (
     MessageType,
 )
 from .constraint_validator import ValidationReport
-from .unhandled_case_formulator import UnhandledCaseProposal
+from .unsupported_case_formulator import UnsupportedCaseProposal
 
 
 # ─────────────────────────────────────────────
@@ -166,7 +166,7 @@ class PolicyProjectionAgent:
     MODEL = "gpt-4o"
     TEMPERATURE = 0.2
 
-    _UNHANDLED_SYSTEM = (
+    _UNSUPPORTED_SYSTEM = (
         "You are an ODRL 2.2 expert. You output only valid JSON (no markdown fences). "
         "The JSON must include keys problem_interpretation, business_intent, odrl_policy."
     )
@@ -186,8 +186,8 @@ class PolicyProjectionAgent:
         self._activity_rule_index:   dict[str, str] = {}
         self._activity_policy_index: dict[str, str] = {}
 
-        self._unhandled_fpd_llm_cache: dict[str, dict] = {}
-        self._unhandled_cache_lock = threading.Lock()
+        self._unsupported_fpd_llm_cache: dict[str, dict] = {}
+        self._unsupported_cache_lock = threading.Lock()
         self._use_azure = False
         self._deployment: Optional[str] = None
         self.client: Optional[Any] = None
@@ -564,12 +564,12 @@ class PolicyProjectionAgent:
                         continue
         return json.loads(text)
 
-    def _unhandled_structural_context(self, proposal: UnhandledCaseProposal) -> Optional[dict]:
-        """Contexte Agent 1 (UnhandledPattern) pour enrichir le prompt — même flux pour tous les types."""
+    def _unsupported_structural_context(self, proposal: UnsupportedCaseProposal) -> Optional[dict]:
+        """Contexte Agent 1 (UnsupportedPattern) pour enrichir le prompt — même flux pour tous les types."""
         eg = self.enriched_graph
         if not eg:
             return None
-        patterns = getattr(eg, "unhandled_patterns", None) or []
+        patterns = getattr(eg, "unsupported_patterns", None) or []
         for up in patterns:
             if up.pattern_type != proposal.pattern_type:
                 continue
@@ -602,7 +602,7 @@ class PolicyProjectionAgent:
         response = self.client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content
         if not content:
-            raise RuntimeError("Empty LLM response (Agent 4 unhandled)")
+            raise RuntimeError("Empty LLM response (Agent 4 unsupported)")
         return content
 
     def _normalize_odrl_actions_in_policy(self, policy: dict) -> None:
@@ -615,19 +615,19 @@ class PolicyProjectionAgent:
                 if isinstance(rule, dict) and "action" in rule:
                     rule["action"] = _coerce_odrl_action_from_hint(rule.get("action"))
 
-    def _llm_synthesize_unhandled_policy(self, proposal: UnhandledCaseProposal) -> Optional[dict]:
+    def _llm_synthesize_unsupported_policy(self, proposal: UnsupportedCaseProposal) -> Optional[dict]:
         """
         Interprète le cas, déduit l'intention métier et produit un document ODRL JSON-LD
         (même chemin pour tous les pattern_type, sans branche spéciale).
         """
-        structural = self._unhandled_structural_context(proposal)
+        structural = self._unsupported_structural_context(proposal)
         payload = {
             "proposal": proposal.to_dict(),
             "bpmn_structural_context": structural,
             "base_uri": BASE_URI,
             "requested_rule_type": proposal.odrl_rule_type,
         }
-        user_prompt = f"""You assist in BPMN-to-ODRL translation for a validated unhandled pattern.
+        user_prompt = f"""You assist in BPMN-to-ODRL translation for a validated unsupported pattern.
 
 Work through these steps internally, then output JSON only:
 1) INTERPRET the structural problem (cycles, gateways, activities, fragments, hints from Agent 2).
@@ -652,16 +652,16 @@ Respond with JSON only:
   "odrl_policy": {{ ... }}
 }}
 """
-        raw = self._call_llm(self._UNHANDLED_SYSTEM, user_prompt)
+        raw = self._call_llm(self._UNSUPPORTED_SYSTEM, user_prompt)
         data = self._parse_llm_json_object(raw)
         interp = data.get("problem_interpretation", "")
         intent = data.get("business_intent", "")
         if interp or intent:
             print(
-                f"[Agent 4] Unhandled LLM — interprétation: {interp[:160]}{'…' if len(interp) > 160 else ''}"
+                f"[Agent 4] Unsupported LLM — interprétation: {interp[:160]}{'…' if len(interp) > 160 else ''}"
             )
             print(
-                f"[Agent 4] Unhandled LLM — intention métier: {intent[:160]}{'…' if len(intent) > 160 else ''}"
+                f"[Agent 4] Unsupported LLM — intention métier: {intent[:160]}{'…' if len(intent) > 160 else ''}"
             )
         odrl = data.get("odrl_policy")
         if not isinstance(odrl, dict):
@@ -674,9 +674,9 @@ Respond with JSON only:
         self._normalize_odrl_actions_in_policy(odrl)
         return odrl
 
-    def _fallback_minimal_unhandled_fpd(
+    def _fallback_minimal_unsupported_fpd(
         self,
-        proposal: UnhandledCaseProposal,
+        proposal: UnsupportedCaseProposal,
         target_fragment_id: Optional[str],
     ) -> dict:
         """Repli sans LLM : policy minimale cohérente, sans logique spécifique à un pattern."""
@@ -700,7 +700,7 @@ Respond with JSON only:
             "@type": "Set",
             "_fragment_id": frag,
             "_type": "FPd",
-            "_unhandled_pattern": proposal.pattern_type,
+            "_unsupported_pattern": proposal.pattern_type,
             "_gateway_name": proposal.gateway_name,
             "_hint_text": proposal.hint_text,
         }
@@ -709,39 +709,39 @@ Respond with JSON only:
         out[rt] = [rule_body]
         return out
 
-    def _generate_fpd_from_unhandled_proposal(
+    def _generate_fpd_from_unsupported_proposal(
         self,
-        proposal: UnhandledCaseProposal,
+        proposal: UnsupportedCaseProposal,
         target_fragment_id: Optional[str] = None,
     ) -> Optional[dict]:
         """
-        FPd depuis une proposition unhandled validée : synthèse LLM (interprétation → intention → ODRL),
+        FPd depuis une proposition unsupported validée : synthèse LLM (interprétation → intention → ODRL),
         avec cache par proposition pour les fragments multiples.
         """
         cache_key = json.dumps(proposal.to_dict(), sort_keys=True)
-        with self._unhandled_cache_lock:
-            if cache_key not in self._unhandled_fpd_llm_cache:
+        with self._unsupported_cache_lock:
+            if cache_key not in self._unsupported_fpd_llm_cache:
                 body: Optional[dict] = None
                 if self.client:
                     try:
-                        body = self._llm_synthesize_unhandled_policy(proposal)
+                        body = self._llm_synthesize_unsupported_policy(proposal)
                     except Exception as e:
-                        print(f"[Agent 4][WARN] LLM unhandled synthesis failed: {e}")
+                        print(f"[Agent 4][WARN] LLM unsupported synthesis failed: {e}")
                 if body is None:
                     print(
-                        "[Agent 4] Repli déterministe minimal pour unhandled "
+                        "[Agent 4] Repli déterministe minimal pour unsupported "
                         f"({proposal.pattern_type}, fragment cible "
                         f"{target_fragment_id or proposal.fragment_id})"
                     )
-                    body = self._fallback_minimal_unhandled_fpd(proposal, target_fragment_id)
-                self._unhandled_fpd_llm_cache[cache_key] = body
+                    body = self._fallback_minimal_unsupported_fpd(proposal, target_fragment_id)
+                self._unsupported_fpd_llm_cache[cache_key] = body
 
-            base = self._unhandled_fpd_llm_cache[cache_key]
+            base = self._unsupported_fpd_llm_cache[cache_key]
         out = copy.deepcopy(base)
         frag = target_fragment_id or proposal.fragment_id or "fragment"
         out["_fragment_id"] = frag
         out["_type"] = "FPd"
-        out["_unhandled_pattern"] = proposal.pattern_type
+        out["_unsupported_pattern"] = proposal.pattern_type
         out["_gateway_name"] = proposal.gateway_name
         out["_hint_text"] = proposal.hint_text
         return out
@@ -775,6 +775,47 @@ Respond with JSON only:
 
         return self.generate()
 
+    def generate_unsupported_only(
+        self,
+        enriched_graph: EnrichedGraph,
+        validation_report: ValidationReport,
+    ) -> dict[str, "FragmentPolicySet"]:
+        """
+        Generate ONLY FPd policies derived from accepted unsupported proposals.
+
+        This supports the additive merge strategy:
+        - keep already-generated template policies (FPa + FPd templates) untouched
+        - append the FPd unsupported policies produced here.
+        """
+        self.enriched_graph = enriched_graph
+        self.validation_report = validation_report
+
+        # Pre-index activities to reuse stable rule/policy identifiers for cross-links.
+        self._preindex_all_activities()
+
+        results: dict[str, FragmentPolicySet] = {
+            frag_id: FragmentPolicySet(fragment_id=frag_id)
+            for frag_id in self.enriched_graph.fragment_contexts.keys()
+        }
+
+        if not self.validation_report:
+            return results
+
+        accepted = getattr(self.validation_report, "accepted_unsupported_proposals", []) or []
+        for raw in accepted:
+            prop = UnsupportedCaseProposal.from_dict(raw) if isinstance(raw, dict) else raw
+            targets = list(prop.involved_fragment_ids or [])
+            if not targets:
+                targets = [prop.fragment_id] if prop.fragment_id else []
+            for frag_id in targets:
+                if frag_id not in results:
+                    continue
+                fpd = self._generate_fpd_from_unsupported_proposal(prop, target_fragment_id=frag_id)
+                if fpd:
+                    results[frag_id].fpd_policies.append(fpd)
+
+        return results
+
     # ─────────────────────────────────────────
     #  Point d'entrée — génération (séquentielle)
     # ─────────────────────────────────────────
@@ -783,7 +824,7 @@ Respond with JSON only:
         """Génération séquentielle (comportement historique)."""
         print("[Agent 4] Policy Projection Agent — démarrage de la génération")
 
-        self._unhandled_fpd_llm_cache = {}
+        self._unsupported_fpd_llm_cache = {}
 
         # Pré-indexer TOUTES les activités avant de générer les FPd inter-fragments
         self._preindex_all_activities()
@@ -808,7 +849,7 @@ Respond with JSON only:
         - Ensuite chaque fragment est généré indépendamment.
         """
         print("[Agent 4] Policy Projection Agent — génération parallèle")
-        self._unhandled_fpd_llm_cache = {}
+        self._unsupported_fpd_llm_cache = {}
         self._preindex_all_activities()
 
         frag_ids = list(self.enriched_graph.fragment_contexts.keys())
@@ -860,19 +901,19 @@ Respond with JSON only:
             if fpd:
                 fps.fpd_policies.append(fpd)
 
-        # Étape 3 — FPd depuis propositions « unhandled » validées (Agent 3)
+        # Étape 3 — FPd depuis propositions « unsupported » validées (Agent 3)
         if self.validation_report:
             for prop in getattr(
-                self.validation_report, "accepted_unhandled_proposals", []
+                self.validation_report, "accepted_unsupported_proposals", []
             ) or []:
                 if isinstance(prop, dict):
-                    prop = UnhandledCaseProposal.from_dict(prop)
+                    prop = UnsupportedCaseProposal.from_dict(prop)
                 targets = list(prop.involved_fragment_ids or [])
                 if not targets:
                     targets = [prop.fragment_id] if prop.fragment_id else []
                 if fragment_id not in targets:
                     continue
-                fpd = self._generate_fpd_from_unhandled_proposal(
+                fpd = self._generate_fpd_from_unsupported_proposal(
                     prop, target_fragment_id=fragment_id
                 )
                 if fpd:
@@ -911,7 +952,7 @@ Respond with JSON only:
 
                 ptype    = policy.get("_type", "FP")
                 subtype  = (policy.get("_gateway") or policy.get("_flow") or
-                            policy.get("_dep_type") or policy.get("_unhandled_pattern") or
+                            policy.get("_dep_type") or policy.get("_unsupported_pattern") or
                             str(i))
                 activity = (policy.get("_activity") or
                             "_".join(policy.get("_activities", [])[:1]) or

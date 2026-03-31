@@ -1,0 +1,69 @@
+[
+  {
+    "id": "f1",
+    "activities": [
+      "check-for-completeness",
+      "ask-for-more-information",
+      "check-credit-amount"
+    ],
+    "gateways": [
+      {
+        "name": "application-completeness",
+        "type": "XOR"
+      },
+      {
+        "name": "credit-amount",
+        "type": "XOR"
+      }
+    ]
+  },
+  {
+    "id": "f2",
+    "activities": [
+      "perform-checks-for-large-amount",
+      "perform-checks-for-small-amount",
+      "make-decision"
+    ],
+    "gateways": [
+      {
+        "name": "credit-amount",
+        "type": "XOR"
+      },
+      {
+        "name": "decision-outcome",
+        "type": "XOR"
+      }
+    ]
+  },
+  {
+    "id": "f3",
+    "activities": [
+      "notify-rejection-by-email",
+      "notify-acceptance-by-email"
+    ],
+    "gateways": [
+      {
+        "name": "decision-outcome",
+        "type": "XOR"
+      },
+      {
+        "name": "documentation-follow-up",
+        "type": "EVENT_BASED_EXCLUSIVE"
+      }
+    ]
+  },
+  {
+    "id": "f4",
+    "activities": [
+      "handle-documentation-deadline",
+      "receive-missing-documents",
+      "request-credit-card"
+    ],
+    "gateways": [
+      {
+        "name": "documentation-follow-up",
+        "type": "EVENT_BASED_EXCLUSIVE"
+      }
+    ]
+  }
+]

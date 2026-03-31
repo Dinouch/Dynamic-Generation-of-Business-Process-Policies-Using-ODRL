@@ -1,0 +1,43 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "uid": "http://example.com/policy:FPd_XOR_c1fd6447",
+  "@type": "Set",
+  "permission": [
+    {
+      "uid": "http://example.com/rules/XOR_ij_perform_checks_for_large_amount_1d64644e",
+      "target": "http://example.com/rules/largeAmountRule",
+      "action": [
+        {
+          "rdf:value": {
+            "@id": "odrl:enable"
+          },
+          "refinement": [
+            {
+              "leftOperand": "product",
+              "operator": "eq",
+              "rightOperand": ">500"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "uid": "http://example.com/rules/XOR_ik_perform_checks_for_small_amount_472374c2",
+      "target": "http://example.com/rules/largeAmountRule",
+      "action": [
+        {
+          "rdf:value": {
+            "@id": "odrl:enable"
+          },
+          "refinement": [
+            {
+              "leftOperand": "product",
+              "operator": "eq",
+              "rightOperand": "<=500"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

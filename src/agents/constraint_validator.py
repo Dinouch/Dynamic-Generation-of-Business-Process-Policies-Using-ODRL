@@ -1,7 +1,7 @@
 """
 constraint_validator.py — Agent 3 : Constraint Validator
 
-Validates unhandled-case proposals from Agent 2, resolves B2P mapping ambiguity (LLM),
+Validates unsupported-case proposals from Agent 2, resolves B2P mapping ambiguity (LLM),
 runs semantic validation on policies from Agent 4, and routes messages in the pipeline.
 """
 
@@ -21,7 +21,7 @@ from .structural_analyzer import (
     MessageType,
     SemanticHint,
 )
-from .unhandled_case_formulator import UnhandledCaseProposal
+from .unsupported_case_formulator import UnsupportedCaseProposal
 
 
 class ValidationDecision(Enum):
@@ -42,9 +42,9 @@ class RejectionReason(Enum):
 
 @dataclass
 class ValidationResult:
-    """Outcome for one unhandled proposal (or structural error placeholder)."""
+    """Outcome for one unsupported proposal (or structural error placeholder)."""
 
-    proposal: Optional[UnhandledCaseProposal]
+    proposal: Optional[UnsupportedCaseProposal]
     decision: ValidationDecision
     decision_level: str
     reason: Optional[RejectionReason] = None
@@ -64,7 +64,7 @@ class ValidationReport:
     """Aggregate report for Agent 3 → Agent 4."""
 
     results: list[ValidationResult]
-    accepted_unhandled_proposals: list[UnhandledCaseProposal] = field(default_factory=list)
+    accepted_unsupported_proposals: list[UnsupportedCaseProposal] = field(default_factory=list)
     semantic_warnings: list[str] = field(default_factory=list)
     accepted: list[ValidationResult] = field(default_factory=list)
     rejected: list[ValidationResult] = field(default_factory=list)
@@ -78,14 +78,14 @@ class ValidationReport:
         self.structural_errors = [
             r for r in self.results if r.decision == ValidationDecision.STRUCTURAL_ERROR
         ]
-        self.accepted_unhandled_proposals = [
+        self.accepted_unsupported_proposals = [
             r.proposal for r in self.accepted if r.proposal is not None
         ]
 
 
 class ConstraintValidator:
     """
-    Agent 3 — B2P ambiguity resolution, unhandled proposal validation,
+    Agent 3 — B2P ambiguity resolution, unsupported proposal validation,
     semantic validation of generated ODRL (Time 2).
     """
 
@@ -150,7 +150,7 @@ class ConstraintValidator:
             self.client = OpenAI(api_key=key)
 
     def register_send_callback_agent2(self, fn: Callable[[AgentMessage], None]) -> None:
-        """Register Agent 2 for ``REFORMULATE`` and ``GRAPH_READY`` (unhandled path)."""
+        """Register Agent 2 for ``REFORMULATE`` and ``GRAPH_READY`` (unsupported path)."""
         self._on_send_agent2 = fn
 
     def register_send_callback_agent1(self, fn: Callable[[AgentMessage], None]) -> None:
@@ -177,7 +177,7 @@ class ConstraintValidator:
 
     def receive(self, msg: AgentMessage) -> None:
         """
-        Handle ``GRAPH_READY``, ``UNHANDLED_PROPOSALS``, or ``POLICIES_READY``.
+        Handle ``GRAPH_READY``, ``UNSUPPORTED_PROPOSALS``, or ``POLICIES_READY``.
 
         Parameters
         ----------
@@ -187,24 +187,24 @@ class ConstraintValidator:
         print(f"[Agent 3] ◄ RECEIVE {msg}")
         if msg.msg_type == MessageType.GRAPH_READY:
             self._handle_graph_ready(msg)
-        elif msg.msg_type == MessageType.UNHANDLED_PROPOSALS:
-            self._handle_unhandled_proposals(msg)
+        elif msg.msg_type == MessageType.UNSUPPORTED_PROPOSALS:
+            self._handle_unsupported_proposals(msg)
         elif msg.msg_type == MessageType.POLICIES_READY:
             self._handle_policies_ready(msg)
         else:
-            print(f"[Agent 3][WARN] Unhandled message type '{msg.msg_type.value}'.")
+            print(f"[Agent 3][WARN] Unknown message type '{msg.msg_type.value}'.")
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
         """
-        Entry from Agent 1. Forwards to Agent 2 if there are unhandled patterns;
+        Entry from Agent 1. Forwards to Agent 2 if there are unsupported patterns;
         otherwise resolves B2P ambiguity and emits ``VALIDATION_DONE``.
         """
         enriched: EnrichedGraph = msg.payload["enriched_graph"]
         self._last_enriched_graph = enriched
-        unhandled = list(getattr(enriched, "unhandled_patterns", []) or [])
+        unsupported = list(getattr(enriched, "unsupported_patterns", []) or [])
 
-        if unhandled and self._on_send_agent2:
-            print(f"[Agent 3] {len(unhandled)} unhandled pattern(s) — forwarding GRAPH_READY to Agent 2")
+        if unsupported and self._on_send_agent2:
+            print(f"[Agent 3] {len(unsupported)} unsupported pattern(s) — forwarding GRAPH_READY to Agent 2")
             self.send(
                 AgentMessage(
                     sender=self.AGENT_NAME,
@@ -219,7 +219,7 @@ class ConstraintValidator:
         self._resolve_b2p_ambiguity_llm(enriched)
         report = ValidationReport(
             results=[],
-            accepted_unhandled_proposals=[],
+            accepted_unsupported_proposals=[],
             semantic_warnings=[],
         )
         self.send(
@@ -235,29 +235,29 @@ class ConstraintValidator:
             )
         )
 
-    def _handle_unhandled_proposals(self, msg: AgentMessage) -> None:
+    def _handle_unsupported_proposals(self, msg: AgentMessage) -> None:
         """
         Process proposals from Agent 2: B2P ambiguity (T1), validate proposals,
         then emit ``VALIDATION_DONE`` or ``REFORMULATE`` / ``STRUCTURAL_UPDATE``.
         """
         enriched: EnrichedGraph = msg.payload["enriched_graph"]
-        raw_props = msg.payload.get("unhandled_proposals") or []
-        proposals = [UnhandledCaseProposal.from_dict(d) for d in raw_props]
+        raw_props = msg.payload.get("unsupported_proposals") or []
+        proposals = [UnsupportedCaseProposal.from_dict(d) for d in raw_props]
         self._last_enriched_graph = enriched
 
         self._resolve_b2p_ambiguity_llm(enriched)
 
         results: list[ValidationResult] = []
         for p in proposals:
-            self._normalize_unhandled_proposal(p)
-            results.append(self._llm_judge_unhandled(p, enriched))
+            self._normalize_unsupported_proposal(p)
+            results.append(self._llm_judge_unsupported(p, enriched))
 
         report = ValidationReport(results=results)
 
-        n_acc = len(report.accepted_unhandled_proposals)
+        n_acc = len(report.accepted_unsupported_proposals)
         n_rej = len(report.rejected)
         print(
-            f"[Agent 3] Rapport propositions unhandled : {n_acc} acceptée(s), "
+            f"[Agent 3] Rapport propositions unsupported : {n_acc} acceptée(s), "
             f"{n_rej} rejetée(s), {len(report.reformulate)} reformulation(s)."
         )
         for r in results:
@@ -403,18 +403,18 @@ class ConstraintValidator:
             )
         )
 
-    def _normalize_unhandled_proposal(self, p: UnhandledCaseProposal) -> None:
+    def _normalize_unsupported_proposal(self, p: UnsupportedCaseProposal) -> None:
         """Force un type de règle ODRL utilisable ; le juge LLM tranche ensuite."""
         rt = (p.odrl_rule_type or "").strip().lower()
         if rt not in ("permission", "prohibition", "obligation"):
             p.odrl_rule_type = "permission"
 
-    def _llm_judge_unhandled(
+    def _llm_judge_unsupported(
         self,
-        p: UnhandledCaseProposal,
+        p: UnsupportedCaseProposal,
         graph: EnrichedGraph,
     ) -> ValidationResult:
-        """LLM judge for semantic coherence of an unhandled proposal."""
+        """LLM judge for semantic coherence of an unsupported proposal."""
         b2p_json = json.dumps(graph.raw_b2p, ensure_ascii=False)
         user_prompt = f"""You validate an ODRL fragment-policy hint against B2P context.
 
@@ -678,14 +678,14 @@ Respond ONLY with:
         proposals: Optional[list] = None,
     ) -> ValidationReport:
         """
-        Standalone API: B2P ambiguity resolution plus optional unhandled proposal validation.
+        Standalone API: B2P ambiguity resolution plus optional unsupported proposal validation.
 
         Parameters
         ----------
         enriched_graph
             Output of Agent 1.
         proposals
-            ``UnhandledCaseProposal`` instances or dicts; omit or pass ``[]`` to skip.
+            ``UnsupportedCaseProposal`` instances or dicts; omit or pass ``[]`` to skip.
 
         Returns
         -------
@@ -698,12 +698,12 @@ Respond ONLY with:
         results: list[ValidationResult] = []
         for raw in raw_list:
             p = (
-                UnhandledCaseProposal.from_dict(raw)
+                UnsupportedCaseProposal.from_dict(raw)
                 if isinstance(raw, dict)
                 else raw
             )
-            self._normalize_unhandled_proposal(p)
-            results.append(self._llm_judge_unhandled(p, enriched_graph))
+            self._normalize_unsupported_proposal(p)
+            results.append(self._llm_judge_unsupported(p, enriched_graph))
         return ValidationReport(results=results)
 
     def _extract_edge_from_hint(self, hint: str) -> Optional[dict]:

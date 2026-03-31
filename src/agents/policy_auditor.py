@@ -488,6 +488,9 @@ class PolicyAuditor:
         if msg.msg_type == MessageType.POLICIES_READY:
             self.fp_results     = msg.payload["fp_results"]
             self.enriched_graph = msg.payload["enriched_graph"]
+            # Optional workflow metadata (ACL status / merge manifest)
+            self._workflow_status = msg.payload.get("status")
+            self._merge_manifest  = msg.payload.get("manifest")
             self._build_indexes()
             self._audit_and_route(loop_turn=msg.loop_turn)
         else:
@@ -546,6 +549,8 @@ class PolicyAuditor:
                 "summary":         report.summary(),
                 "syntax_score":    report.syntax_score(),
                 "loop_turns_used": self._syntax_loop_count,
+                "status":          getattr(self, "_workflow_status", None),
+                "manifest":        getattr(self, "_merge_manifest", None),
             },
             loop_turn = loop_turn,
         ))
@@ -585,7 +590,7 @@ class PolicyAuditor:
                             self._rule_index[uid] = (frag_id, policy.get("uid", ""), rt)
 
         if self.validation_report:
-            for p in getattr(self.validation_report, "accepted_unhandled_proposals", []) or []:
+            for p in getattr(self.validation_report, "accepted_unsupported_proposals", []) or []:
                 key = (getattr(p, "gateway_name", ""), getattr(p, "fragment_id", ""))
                 self._validated_index[key] = p
 

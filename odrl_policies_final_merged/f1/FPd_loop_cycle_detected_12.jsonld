@@ -1,0 +1,21 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy/prohibition-no-more-info-after-complete",
+  "prohibition": [
+    {
+      "uid": "http://example.com/policy/prohibition-no-more-info-after-complete/rule/1",
+      "target": "http://example.com/asset/ask-for-more-information",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "completeness-status:complete"
+        }
+      ]
+    }
+  ]
+}

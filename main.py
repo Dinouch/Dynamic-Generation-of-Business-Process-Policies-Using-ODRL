@@ -2,7 +2,7 @@
 main.py
 ═══════════════════════════════════════════════════════════════════════════════
 Pipeline complet — Agent 1 → Agent 2 <→ Agent 3 → Agent 4 <→ Agent 5
-Scénario: dataset/scenario1 (fragments BP + B2P).
+Scénario: src/dataset/scenario1 (fragments BP + B2P).
 
 Mode standalone (sans LLM) 
 
@@ -68,8 +68,11 @@ def _load_env():
 
 _load_env()
 
-from scenario_loader import load_scenario
-from runners import run_looped_orchestration, run_sequential_agents
+from orchestration.scenario_loader import load_scenario
+from orchestration.runners import (
+    run_looped_orchestration,
+    run_sequential_agents,
+)
 
 # Scénario par défaut
 _SCENARIO = "scenario1"
