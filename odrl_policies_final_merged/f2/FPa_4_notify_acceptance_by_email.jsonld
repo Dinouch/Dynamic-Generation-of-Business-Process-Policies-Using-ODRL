@@ -1,11 +1,11 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:FPa_ask_for_more_information_98d95449",
+  "uid": "http://example.com/policy:FPa_notify_acceptance_by_email_a89be2ef",
   "@type": "Agreement",
   "prohibition": [
     {
-      "uid": "http://example.com/rules/lateInfoRequestRule",
-      "target": "http://example.com/asset/ask-for-more-information",
+      "uid": "http://example.com/rules/rejectionNotifyRule",
+      "target": "http://example.com/asset/notify-rejection-by-email",
       "assigner": "http://example.com/FinancialBank:org:FB",
       "assignee": "http://example.com/staff/FinancialBank:org:FB",
       "action": [
@@ -15,12 +15,9 @@
           },
           "refinement": [
             {
-              "leftOperand": "dateTime",
-              "operator": "gteq",
-              "rightOperand": {
-                "@value": "2025-12-31",
-                "@type": "xsd:date"
-              }
+              "leftOperand": "event",
+              "operator": "neq",
+              "rightOperand": "credit rejection logged"
             }
           ]
         }

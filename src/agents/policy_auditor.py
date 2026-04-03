@@ -74,7 +74,7 @@ from .structural_analyzer import (
     MessageType,
     StructuralPattern,
 )
-from .constraint_validator import ValidationReport
+from .Agent_3.constraint_validator import ValidationReport
 from .policy_projection_agent import FragmentPolicySet
 
 

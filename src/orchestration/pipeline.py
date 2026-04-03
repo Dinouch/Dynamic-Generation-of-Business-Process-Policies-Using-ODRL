@@ -28,7 +28,7 @@ from agents.structural_analyzer import (
 )
 from agents.pipeline_registry import COVERED_PATTERNS
 from agents.unsupported_case_formulator import UnsupportedCaseFormulator
-from agents.constraint_validator import ConstraintValidator
+from agents.Agent_3.constraint_validator import ConstraintValidator
 from agents.policy_projection_agent import PolicyProjectionAgent
 from agents.policy_auditor import PolicyAuditor, AuditReport
 

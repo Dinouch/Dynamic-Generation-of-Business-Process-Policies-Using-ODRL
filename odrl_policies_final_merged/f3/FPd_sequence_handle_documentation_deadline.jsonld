@@ -1,10 +1,10 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:FPd_SEQ_0be63c90",
+  "uid": "http://example.com/policy:FPd_SEQ_ddae95a5",
   "@type": "Set",
   "permission": [
     {
-      "uid": "http://example.com/rules/SEQ_handle_documentation_deadline_request_credit_card_e90e3d00",
+      "uid": "http://example.com/rules/SEQ_handle_documentation_deadline_request_credit_card_2ac5e851",
       "target": "http://example.com/rules/documentationDeadlineRule",
       "action": {
         "@id": "odrl:enable"

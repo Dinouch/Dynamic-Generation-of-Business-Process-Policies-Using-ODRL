@@ -10,7 +10,7 @@ from typing import Any, Optional
 from agents.pipeline_registry import COVERED_PATTERNS
 from agents.structural_analyzer import StructuralAnalyzer, AgentMessage, MessageType
 from agents.unsupported_case_formulator import UnsupportedCaseFormulator
-from agents.constraint_validator import ConstraintValidator, ValidationReport
+from agents.Agent_3.constraint_validator import ConstraintValidator, ValidationReport
 from agents.policy_projection_agent import PolicyProjectionAgent
 from agents.policy_auditor import PolicyAuditor, AuditReport
 from agents.human_agent import HumanAgent, HumanDecisionBridge

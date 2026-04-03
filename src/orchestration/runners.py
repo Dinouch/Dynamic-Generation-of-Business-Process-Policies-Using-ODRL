@@ -176,7 +176,7 @@ def run_sequential_agents(
         print("  AGENT 2 & 3 — Unsupported formulation / validation (standalone stub)")
         print("=" * 60)
         try:
-            from agents.constraint_validator import ConstraintValidator
+            from agents.Agent_3.constraint_validator import ConstraintValidator
 
             validator = ConstraintValidator(enriched_graph=enriched_graph)
             validation_report = validator.validate(enriched_graph, proposals=[])

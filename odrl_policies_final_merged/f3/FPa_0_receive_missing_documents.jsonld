@@ -1,11 +1,11 @@
 {
   "@context": "http://www.w3.org/ns/odrl.jsonld",
-  "uid": "http://example.com/policy:FPa_check_credit_amount_98a42cc1",
+  "uid": "http://example.com/policy:FPa_receive_missing_documents_df959838",
   "@type": "Agreement",
   "permission": [
     {
-      "uid": "http://example.com/rules/creditAmountCheckRule",
-      "target": "http://example.com/asset/check-credit-amount",
+      "uid": "http://example.com/rules/receiveMissingDocumentsRule",
+      "target": "http://example.com/asset/receive-missing-documents",
       "assigner": "http://example.com/FinancialBank:org:FB",
       "assignee": "http://example.com/staff/FinancialBank:org:FB",
       "action": [
@@ -15,9 +15,9 @@
           },
           "refinement": [
             {
-              "leftOperand": "Spatial",
+              "leftOperand": "event",
               "operator": "eq",
-              "rightOperand": "http://example.com/location/InternalNetwork"
+              "rightOperand": "documents-received"
             }
           ]
         }

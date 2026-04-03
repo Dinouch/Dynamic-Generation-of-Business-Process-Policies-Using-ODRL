@@ -36,7 +36,7 @@ from .structural_analyzer import (
     ConnectionInfo,
     MessageType,
 )
-from .constraint_validator import ValidationReport
+from .Agent_3.constraint_validator import ValidationReport
 from .unsupported_case_formulator import UnsupportedCaseProposal
 
 
