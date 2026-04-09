@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -15,7 +16,7 @@ from agents.policy_projection_agent import PolicyProjectionAgent
 from agents.policy_auditor import PolicyAuditor, AuditReport
 from agents.human_agent import HumanAgent, HumanDecisionBridge
 
-from communication.acl import ACLEnvelope, ACLPerformative
+from communication.acl import ACLEnvelope, ACLPerformative, FIPA_EXPECTS_AGREE_KEY
 from communication.bus import AsyncBus, PublishHook
 
 
@@ -43,6 +44,8 @@ class PipelineAsyncResult:
     msg_type: str
     status: str  # partial_template_only | final_merged | final_validated
     manifest: Optional[dict] = None
+    scenario_id: str = ""
+    odrl_export_paths: Optional[dict[str, str]] = None
 
 
 class AsyncPipelineOrchestrator:
@@ -106,6 +109,7 @@ class AsyncPipelineOrchestrator:
             "true",
             "yes",
         }
+        self._odrl_export_paths: dict[str, str] = {}
 
     async def run(self) -> PipelineAsyncResult:
         loop = asyncio.get_running_loop()
@@ -159,25 +163,16 @@ class AsyncPipelineOrchestrator:
         # Agent 3 and human are orchestrated explicitly for HITL
         self.bus.register("agent3", lambda env: self._handle_agent3(env, agent3, agent4, agent5))
         self.bus.register("human3", self._handle_human3)
-        self.bus.register("pipeline", self._handle_pipeline_final)
+        self.bus.register("pipeline", self._handle_pipeline)
 
         await self.bus.start()
 
         try:
-            # Kick off analysis (legacy call), but route first message via bus
-            msg = AgentMessage(
-                sender="pipeline",
-                recipient="agent1",
-                msg_type=MessageType.GRAPH_READY,
-                payload={"_kickoff": True},
-            )
-            # Instead of sending kickoff to agent1.receive, just call analyze_and_send and intercept send
             def _threadsafe_publish(m: AgentMessage, *, status: Optional[str] = None) -> None:
                 loop.call_soon_threadsafe(asyncio.create_task, self._publish_legacy(m, status=status))
 
             agent1.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
             agent2.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
-            agent3.register_send_callback_agent1(lambda m: _threadsafe_publish(m, status=None))
             agent3.register_send_callback_agent2(lambda m: _threadsafe_publish(m, status=None))
 
             # Route Agent 3 -> Agent 4/1/2 through bus
@@ -185,9 +180,21 @@ class AsyncPipelineOrchestrator:
             agent4.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
             agent5.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
 
-            _ = msg
-            # Start actual pipeline from Agent 1
-            await asyncio.to_thread(agent1.analyze_and_send)
+            kick = ACLEnvelope(
+                performative=ACLPerformative.REQUEST,
+                sender="pipeline",
+                receiver="agent1",
+                ontology="graph-structural",
+                content={
+                    "utterance": (
+                        "Analyze this business process graph and produce an enriched structural model."
+                    ),
+                    "intent": "analyze-enriched-graph",
+                    FIPA_EXPECTS_AGREE_KEY: True,
+                },
+                conversation_id=self._conversation_id,
+            )
+            await self.bus.publish(kick)
 
             # Wait for final result
             while self._final_result is None:
@@ -235,9 +242,10 @@ class AsyncPipelineOrchestrator:
         ):
             self._partial_fp_results = env.content.get("fp_results")
             try:
-                out_dir = _default_output_dir("odrl_policies_partial_template_only")
+                out_dir = _scenario_odrl_stage_dir(self._scenario_id, "partial_template_only")
                 exporter = PolicyProjectionAgent(enriched_graph=self._enriched_graph, validation_report=None)
                 exporter.export(self._partial_fp_results, output_dir=str(out_dir))
+                self._odrl_export_paths["partial_template_only"] = str(out_dir)
             except Exception as e:
                 print(f"[AsyncPipeline][WARN] Export partial impossible : {e}")
         await asyncio.to_thread(agent.receive, msg)
@@ -288,6 +296,11 @@ class AsyncPipelineOrchestrator:
             asyncio.create_task(self._timeout_partial_templates(agent4, agent5, base_env=env))
             return
 
+        if msg.msg_type == MessageType.REFORMULATED_PROPOSALS:
+            # FIPA inform (not contract-net propose): skip HITL, deliver straight to Agent 3.
+            await asyncio.to_thread(agent3.receive, msg)
+            return
+
         # Default: deliver to legacy Agent 3 (semantic loop etc.)
         await asyncio.to_thread(agent3.receive, msg)
 
@@ -331,9 +344,10 @@ class AsyncPipelineOrchestrator:
         # if we already captured it, export now.
         try:
             if self._partial_fp_results is not None:
-                out_dir = _default_output_dir("odrl_policies_partial_template_only")
+                out_dir = _scenario_odrl_stage_dir(self._scenario_id, "partial_template_only")
                 exporter = PolicyProjectionAgent(enriched_graph=enriched, validation_report=None)
                 exporter.export(self._partial_fp_results, output_dir=str(out_dir))
+                self._odrl_export_paths["partial_template_only"] = str(out_dir)
         except Exception as e:
             print(f"[AsyncPipeline][WARN] Export partial impossible : {e}")
 
@@ -348,14 +362,71 @@ class AsyncPipelineOrchestrator:
             return
         await self.bus.publish(resp)
 
-    async def _handle_pipeline_final(self, env: ACLEnvelope) -> None:
+    async def _handle_pipeline(self, env: ACLEnvelope) -> None:
         """
-        Receive final signals from Agent 5 and set orchestrator result.
+        Orchestrator inbox: structural delegation (Agent 1), relay to Agent 3,
+        and terminal ODRL syntax audit outcome (forwarded by Agent 4).
+        """
+        # Agent 1 → pipeline: AGREE (delegation) or INFORM (GRAPH_READY relay to Agent 3)
+        if env.sender == "agent1" and env.receiver == "pipeline":
+            if env.performative == ACLPerformative.AGREE:
+                print("[AsyncPipeline] Agent 1 agreed to run structural analysis.")
+                return
+            if env.performative == ACLPerformative.INFORM:
+                c = env.content or {}
+                if c.get("msg_type") != MessageType.GRAPH_READY.value:
+                    return
+                loop_turn = int(c.get("loop_turn", 0) or 0)
+                payload = {k: v for k, v in c.items() if k not in ("msg_type", "loop_turn", "status")}
+                relay = AgentMessage(
+                    sender="pipeline",
+                    recipient="agent3",
+                    msg_type=MessageType.GRAPH_READY,
+                    payload=payload,
+                    loop_turn=loop_turn,
+                )
+                await self._publish_legacy(relay, status=None)
+            return
 
-        Also handles the 'final_merged' path: after human agrees, we create the
-        merged bundle and ask Agent 5 to audit again.
-        """
-        # Final from Agent 5 to pipeline
+        # Final audit outcome: Agent 4 forwards Agent 5's terminal INFORM to the orchestrator
+        if env.sender == "agent4" and env.receiver == "pipeline":
+            mt = str((env.content or {}).get("msg_type", ""))
+            if mt not in (MessageType.ODRL_VALID.value, MessageType.ODRL_SYNTAX_ERROR.value):
+                return
+            inferred = "final_validated"
+            if self._pending_unsupported_env is not None and self._partial_result is None:
+                inferred = "partial_template_only"
+            status = str((env.content or {}).get("status") or inferred)
+            payload = env.content or {}
+            report = payload.get("report")
+            summary = payload.get("summary") or {}
+            syntax_score = float(payload.get("syntax_score", 1.0) or 1.0)
+            msg_type = str(payload.get("msg_type") or payload.get("signal") or "")
+            is_valid = bool(payload.get("is_valid", False))
+
+            out = PipelineAsyncResult(
+                is_valid=is_valid,
+                report=report,
+                summary=summary,
+                syntax_score=syntax_score,
+                msg_type=msg_type,
+                status=status,
+                manifest=payload.get("manifest"),
+                scenario_id=self._scenario_id,
+                odrl_export_paths=dict(self._odrl_export_paths),
+            )
+            if status == "partial_template_only" and not self._auto_close_after_partial:
+                self._partial_result = out
+                print(
+                    "[AsyncPipeline] Partial bundle ready (template-only). "
+                    "Waiting for human decision to merge unsupported cases..."
+                )
+                return
+
+            self._final_result = out
+            return
+
+        # Legacy: direct Agent 5 → pipeline (kept for compatibility)
         if env.sender == "agent5" and env.receiver == "pipeline":
             # If we're still waiting for the human gate, the first Agent 5 result is a partial bundle.
             inferred = "final_validated"
@@ -377,6 +448,8 @@ class AsyncPipelineOrchestrator:
                 msg_type=msg_type,
                 status=status,
                 manifest=payload.get("manifest"),
+                scenario_id=self._scenario_id,
+                odrl_export_paths=dict(self._odrl_export_paths),
             )
             if status == "partial_template_only" and not self._auto_close_after_partial:
                 self._partial_result = out
@@ -423,6 +496,21 @@ class AsyncPipelineOrchestrator:
 
         # Human finished validating all proposals.
         if not self._unsupported_accepted:
+            propose_rw = self._pending_unsupported_env.reply_with
+            loop_t = int(self._pending_unsupported_env.content.get("loop_turn", 0) or 0)
+            rej = AgentMessage(
+                sender="agent3",
+                recipient="agent2",
+                msg_type=MessageType.REJECT_PROPOSAL_BATCH,
+                payload={
+                    "utterance": "Human operator rejected all proposed unsupported rules.",
+                    "acl_in_reply_to": propose_rw,
+                    "action": "human-gate-reject-all",
+                    "reason": "No unsupported proposals were accepted in human review.",
+                },
+                loop_turn=loop_t,
+            )
+            await self._publish_legacy(rej, status=None)
             self._pending_unsupported_env = None
             self._unsupported_queue = []
             self._unsupported_accepted = []
@@ -430,6 +518,23 @@ class AsyncPipelineOrchestrator:
             if self._partial_result is not None and self._final_result is None:
                 self._final_result = self._partial_result
             return
+
+        propose_rw = self._pending_unsupported_env.reply_with
+        loop_t = int(self._pending_unsupported_env.content.get("loop_turn", 0) or 0)
+        acc = AgentMessage(
+            sender="agent3",
+            recipient="agent2",
+            msg_type=MessageType.ACCEPT_PROPOSAL_BATCH,
+            payload={
+                "utterance": (
+                    "Human-approved unsupported proposals accepted; "
+                    "proceeding to merge and fragment-policy projection."
+                ),
+                "acl_in_reply_to": propose_rw,
+            },
+            loop_turn=loop_t,
+        )
+        await self._publish_legacy(acc, status=None)
 
         report = ValidationReport(results=[])
         report.accepted_unsupported_proposals = list(self._unsupported_accepted)
@@ -456,9 +561,10 @@ class AsyncPipelineOrchestrator:
 
         # Export final merged bundle (separate folder)
         try:
-            out_dir = _default_output_dir("odrl_policies_final_merged")
+            out_dir = _scenario_odrl_stage_dir(self._scenario_id, "final_merged")
             exporter = PolicyProjectionAgent(enriched_graph=enriched, validation_report=None)
             exporter.export(merged, output_dir=str(out_dir))
+            self._odrl_export_paths["final_merged"] = str(out_dir)
         except Exception as e:
             print(f"[AsyncPipeline][WARN] Export final merged impossible : {e}")
 
@@ -537,7 +643,7 @@ class AsyncPipelineOrchestrator:
         ]
 
         req = ACLEnvelope(
-            performative=ACLPerformative.QUERY_IF,
+            performative=ACLPerformative.REQUEST,
             sender="agent3",
             receiver="human3",
             ontology="human-gate",
@@ -628,8 +734,14 @@ async def run_pipeline_async(
     return await orch.run()
 
 
-def _default_output_dir(folder_name: str) -> Path:
-    # orchestration/ → src/ → racine du projet
-    root = Path(__file__).resolve().parents[2]
-    return (root / folder_name).resolve()
+def _scenario_odrl_stage_dir(scenario_id: str, stage: str) -> Path:
+    """
+    ``{projet}/output/{scenarioN}/odrl_fragment_policies/{stage}/``
+    Dossier d’export distinct du ``dataset/`` ; un sous-dossier par fragment (fichiers plats).
+    """
+    project_root = Path(__file__).resolve().parents[2]
+    sid = (scenario_id or "scenario1").strip()
+    if not re.fullmatch(r"scenario\d+", sid, re.IGNORECASE):
+        sid = "scenario1"
+    return (project_root / "output" / sid / "odrl_fragment_policies" / stage).resolve()
 

@@ -8,7 +8,7 @@ Mode standalone (sans LLM)
 
 Mode complet (avec LLM) 
 
-Mode looped orchestration (end-to-end, with loops)
+Mode pipeline : orchestration asynchrone (bus ACL), via ``run_looped_orchestration``.
 
 """
 
@@ -77,7 +77,7 @@ from orchestration.runners import (
 # Scénario par défaut
 _SCENARIO = "scenario1"
 
-# Mode d'exécution : True = pipeline (looped), False = standalone (sequential)
+# Mode d'exécution : True = pipeline async (bus + ACL), False = démo séquentielle locale
 # -> il suffit de modifier cette constante.
 USE_PIPELINE_MODE = True
 

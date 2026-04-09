@@ -7,9 +7,11 @@ Entrée : un ``bp_model`` déjà parsé (activities, gateways, flows) avec noms 
 Le LLM reçoit soit cette liste, soit un tableau d objets ``task`` + métadonnées gateway
 (``_structured_payload_for_llm``) lorsque ``decompose_tasks_with_llm(..., bp_model=...)`` est utilisé.
 
-Sortie : liste de fragments au même format que ``dataset/scenario1/fragments.json`` :
-activités et noms de gateways en **slugs** (kebab-case, sans ponctuation) ;
-``[{ "id": "f1", "activities": ["check-for-completeness", ...], "gateways": [...] }, ...]``.
+Sortie : liste de fragments au même format que ``dataset/scenario1/fragments.json`` ;
+``save_fragments_enhanced_json`` produit en parallèle ``fragments_enhanced.json`` (ordre global,
+connexions intra/inter, copie ``activities``/``gateways``/``flows`` pour reconstituer le bp global).
+Activités et gateways en **slugs** (kebab-case) ;
+``[{ "id": "f1", "activities": [...], "gateways": [...] }, ...]``.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import logging
 import os
 import re
 import unicodedata
+import copy
 from collections import Counter, deque
 from json import JSONDecodeError
 from typing import Any, Optional
@@ -749,18 +752,193 @@ class SemanticFragmenter:
         return saved
 
 
+def _normalized_fragments_for_export(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copie des fragments avec ids ``f1``, ``f2``, ... (même logique que ``save_fragments_json``)."""
+    out: list[dict[str, Any]] = []
+    for i, frag in enumerate(fragments):
+        fid = frag.get("id")
+        id_str = fid if isinstance(fid, str) and str(fid).startswith("f") else f"f{i + 1}"
+        out.append(
+            {
+                "id": id_str,
+                "activities": list(frag.get("activities", [])),
+                "gateways": copy.deepcopy(frag.get("gateways", [])),
+            }
+        )
+    return out
+
+
+def _activity_and_gateway_fragment_maps(
+    fragments_norm: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Activité (slug) → id fragment ; gateway (slug) → liste d ids de fragments qui la référencent."""
+    activity_to_frag: dict[str, str] = {}
+    gateway_to_frags: dict[str, list[str]] = {}
+    for frag in fragments_norm:
+        fid = str(frag["id"])
+        for a in frag.get("activities", []):
+            activity_to_frag[normalize_fragment_slug(str(a))] = fid
+        for gw in frag.get("gateways", []):
+            if isinstance(gw, dict) and gw.get("name") is not None:
+                gn = normalize_fragment_slug(str(gw["name"]))
+                if gn not in gateway_to_frags:
+                    gateway_to_frags[gn] = []
+                if fid not in gateway_to_frags[gn]:
+                    gateway_to_frags[gn].append(fid)
+    return activity_to_frag, gateway_to_frags
+
+
+def _resolve_node_fragment_ids(
+    node: str,
+    activity_to_frag: dict[str, str],
+    gateway_to_frags: dict[str, list[str]],
+) -> list[str]:
+    if not (node or "").strip():
+        return []
+    key = normalize_fragment_slug(str(node))
+    if key in activity_to_frag:
+        return [activity_to_frag[key]]
+    if key in gateway_to_frags:
+        return list(gateway_to_frags[key])
+    return []
+
+
+def _flow_scope(
+    from_frags: list[str],
+    to_frags: list[str],
+) -> str:
+    """
+    Inter / intra au sens « fragments distincts sur l arête » : si les deux extrémités
+    ont au moins un fragment en commun (ex. même gateway listée dans deux fragments),
+    c est **intra** ; sinon **inter** (vrai pont entre zones sans recouvrement).
+    """
+    if not from_frags or not to_frags:
+        return "unknown"
+    if set(from_frags) & set(to_frags):
+        return "intra"
+    return "inter"
+
+
+def _primary_fragment_id(
+    node_frags: list[str],
+    fragment_ids_order: list[str],
+) -> Optional[str]:
+    """Un seul fragment représentatif (ordre d apparition dans la découpe f1, f2, …)."""
+    if not node_frags:
+        return None
+    if len(node_frags) == 1:
+        return node_frags[0]
+    rank = {fid: i for i, fid in enumerate(fragment_ids_order)}
+    return min(node_frags, key=lambda x: rank.get(x, 10**9))
+
+
+def _flow_scope_by_primary(
+    from_frags: list[str],
+    to_frags: list[str],
+    fragment_ids_order: list[str],
+) -> str:
+    """
+    Inter / intra pour le reverse engineering : compare les fragments **primaires**
+    des deux nœuds (gateways multi-fragments → premier fragment d ordre processus).
+    """
+    pf = _primary_fragment_id(from_frags, fragment_ids_order)
+    pt = _primary_fragment_id(to_frags, fragment_ids_order)
+    if pf is None or pt is None:
+        return "unknown"
+    return "intra" if pf == pt else "inter"
+
+
+def build_fragments_enhanced_payload(
+    bp_model: dict[str, Any],
+    fragments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Document pour ``fragments_enhanced.json``.
+
+    - ``ordering`` : ordre des fragments (f1, f2, …), ordre global des tâches (tri topologique),
+      et pour chaque fragment la liste ordonnée des activités.
+    - ``connections`` : chaque flux du ``bp_model`` avec ``scope`` inter/intra (fragments **primaires**
+      des extrémités ; les gateways multi-fragments prennent le premier fragment d ordre processus),
+      plus ``scope_shared_fragment`` si les ensembles de fragments des deux nœuds se recoupent.
+    - ``activities`` / ``gateways`` / ``flows`` : copie du modèle global (reconstruction = ces trois clés).
+    """
+    fragments_norm = _normalized_fragments_for_export(fragments)
+    activity_to_frag, gateway_to_frags = _activity_and_gateway_fragment_maps(fragments_norm)
+
+    fragment_ids_order = [str(f["id"]) for f in fragments_norm]
+    global_task_order = linearize_tasks_topological(bp_model)
+    global_task_order_slugs = [normalize_fragment_slug(t) for t in global_task_order]
+
+    activity_order_per_fragment = {
+        str(f["id"]): [normalize_fragment_slug(str(a)) for a in f.get("activities", [])]
+        for f in fragments_norm
+    }
+
+    connections: list[dict[str, Any]] = []
+    for flow in bp_model.get("flows", []):
+        f_from = flow.get("from", "")
+        f_to = flow.get("to", "")
+        ff = _resolve_node_fragment_ids(str(f_from), activity_to_frag, gateway_to_frags)
+        tf = _resolve_node_fragment_ids(str(f_to), activity_to_frag, gateway_to_frags)
+        pf = _primary_fragment_id(ff, fragment_ids_order)
+        pt = _primary_fragment_id(tf, fragment_ids_order)
+        conn: dict[str, Any] = {
+            "from": f_from,
+            "to": f_to,
+            "type": flow.get("type", "sequence"),
+            "scope": _flow_scope_by_primary(ff, tf, fragment_ids_order),
+            "scope_shared_fragment": _flow_scope(ff, tf),
+            "from_fragment_ids": ff,
+            "to_fragment_ids": tf,
+            "from_primary_fragment_id": pf,
+            "to_primary_fragment_id": pt,
+        }
+        if flow.get("gateway") is not None:
+            conn["gateway"] = flow.get("gateway")
+        if flow.get("condition") is not None:
+            conn["condition"] = flow.get("condition")
+        connections.append(conn)
+
+    return {
+        "schema_version": 1,
+        "fragments": fragments_norm,
+        "ordering": {
+            "fragment_ids_in_process_order": fragment_ids_order,
+            "global_activity_order": global_task_order_slugs,
+            "activity_order_per_fragment": activity_order_per_fragment,
+        },
+        "connections": connections,
+        "activities": copy.deepcopy(bp_model.get("activities", [])),
+        "gateways": copy.deepcopy(bp_model.get("gateways", [])),
+        "flows": copy.deepcopy(bp_model.get("flows", [])),
+    }
+
+
 def save_fragments_json(fragments: list[dict[str, Any]], path: str) -> None:
     """Écrit un unique ``fragments.json`` (ids ``f1``, ``f2``, ...)."""
-    out = []
-    for i, frag in enumerate(fragments):
-        item = {
-            "id": frag.get("id") if isinstance(frag.get("id"), str) else f"f{i + 1}",
-            "activities": list(frag.get("activities", [])),
-            "gateways": list(frag.get("gateways", [])),
-        }
-        out.append(item)
+    out = _normalized_fragments_for_export(fragments)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
+
+
+def save_fragments_enhanced_json(
+    bp_model: dict[str, Any],
+    fragments: list[dict[str, Any]],
+    path: str,
+) -> None:
+    """Écrit ``fragments_enhanced.json`` (fragments + topologie enrichie + copie du bp_model)."""
+    doc = build_fragments_enhanced_payload(bp_model, fragments)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+
+
+def companion_fragments_enhanced_path(fragments_json_path: str) -> str:
+    """Même répertoire : ``fragments.json`` → ``fragments_enhanced.json`` ; sinon ``<stem>_enhanced.json``."""
+    base = os.path.basename(fragments_json_path)
+    if base == "fragments.json":
+        return os.path.join(os.path.dirname(fragments_json_path), "fragments_enhanced.json")
+    p = os.path.splitext(fragments_json_path)
+    return p[0] + "_enhanced.json"
 
 
 def bpmn_xml_to_fragments_json(
@@ -773,7 +951,8 @@ def bpmn_xml_to_fragments_json(
     llm_seed: int = LLM_FRAGMENTATION_SEED,
 ) -> list[dict[str, Any]]:
     """
-    Parse un fichier BPMN XML, fragmente, écrit ``fragments.json``.
+    Parse un fichier BPMN XML, fragmente, écrit ``fragments.json`` et le fichier jumeau enrichi
+    (``fragments_enhanced.json`` si ``-o fragments.json``, sinon ``<stem>_enhanced.json``).
     """
     from baseline.bpmn_parser import BPMNParser
 
@@ -796,6 +975,8 @@ def bpmn_xml_to_fragments_json(
         d["id"] = f"f{i + 1}"
         normalized.append(d)
     save_fragments_json(normalized, fragments_json_path)
+    enhanced_path = companion_fragments_enhanced_path(fragments_json_path)
+    save_fragments_enhanced_json(model, normalized, enhanced_path)
     return normalized
 
 
@@ -837,3 +1018,4 @@ if __name__ == "__main__":
         llm_seed=args.seed,
     )
     print(f"Écrit : {args.output}")
+    print(f"Écrit : {companion_fragments_enhanced_path(args.output)}")

@@ -1,0 +1,29 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy:loop-f1-prohibit-ask-more-info-after-2025-12-31",
+  "prohibition": [
+    {
+      "uid": "http://example.com/policy:loop-f1-prohibition-1",
+      "target": "http://example.com/asset/ask-for-more-information",
+      "action": {
+        "@id": "odrl:trigger"
+      },
+      "constraint": [
+        {
+          "leftOperand": "event",
+          "operator": "eq",
+          "rightOperand": "cycle_detected"
+        },
+        {
+          "leftOperand": "dateTime",
+          "operator": "gteq",
+          "rightOperand": {
+            "@value": "2025-12-31",
+            "@type": "xsd:date"
+          }
+        }
+      ]
+    }
+  ]
+}

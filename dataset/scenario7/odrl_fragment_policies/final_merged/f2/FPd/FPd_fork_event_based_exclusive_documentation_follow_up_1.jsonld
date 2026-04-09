@@ -1,0 +1,31 @@
+{
+  "@context": "http://www.w3.org/ns/odrl.jsonld",
+  "@type": "Set",
+  "uid": "http://example.com/policy:fork_event_based_exclusive_f2_documentation_follow_up",
+  "obligation": [
+    {
+      "uid": "http://example.com/policy:fork_event_based_exclusive_f2_documentation_follow_up#obligation1",
+      "target": "http://example.com/asset/handle-documentation-deadline",
+      "action": {
+        "@id": "odrl:enable"
+      },
+      "constraint": [
+        {
+          "leftOperand": "http://example.com/odrl/operand/event",
+          "operator": "odrl:eq",
+          "rightOperand": "http://example.com/event/documentation-deadline"
+        },
+        {
+          "leftOperand": "http://example.com/odrl/operand/bpmnGateway",
+          "operator": "odrl:eq",
+          "rightOperand": "http://example.com/bpmn/gateway/documentation-follow-up"
+        },
+        {
+          "leftOperand": "http://example.com/odrl/operand/bpmnEventBasedGatewayOutcome",
+          "operator": "odrl:eq",
+          "rightOperand": "http://example.com/bpmn/outcome/first"
+        }
+      ]
+    }
+  ]
+}

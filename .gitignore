@@ -35,6 +35,9 @@ ENV/
 *.swp
 *.swo
 
+# Exports ODRL générés par le pipeline (hors dataset/)
+output/
+
 # Dataset files 
 datasets/*/
 datasets/*

@@ -12,19 +12,16 @@ def run_looped_orchestration(
     b2p_policies: List[Dict[str, Any]],
     context_mode: str = "local",
 ) -> None:
-    """End-to-end orchestration via orchestration/pipeline.py (supports correction loops)."""
+    """Orchestration bout-en-bout : bus asyncio + enveloppes ACL (``run_pipeline_async``)."""
+    _ = context_mode
 
     print("\n" + "═" * 70)
-    print("  MODE LOOPED ORCHESTRATION — run_pipeline()")
+    print("  PIPELINE ASYNCHRONE — run_pipeline_async()")
     print("═" * 70)
 
-    try:
-        from .pipeline import run_pipeline
-    except ImportError as e:
-        print(f"[ERROR] Cannot import pipeline : {e}")
-        return
+    import asyncio
 
-    use_async = os.environ.get("USE_ASYNC_PIPELINE", "").strip().lower() in {"1", "true", "yes"}
+    from .async_pipeline import run_pipeline_async
 
     api_key = os.environ.get("OPENAI_API_KEY")
     azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -32,52 +29,33 @@ def run_looped_orchestration(
     azure_deploy = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
 
     try:
-        if use_async:
-            import asyncio
-            from .async_pipeline import run_pipeline_async
-
-            human_timeout_s = float(os.environ.get("HITL_TIMEOUT_S", "120") or 120)
-            result = asyncio.run(
-                run_pipeline_async(
-                    bp_model=bp_model,
-                    fragments=fragments,
-                    b2p_policies=b2p_policies,
-                    human_timeout_s=human_timeout_s,
-                    api_key=api_key,
-                    azure_endpoint=azure_endpoint or None,
-                    azure_api_version=azure_version or None,
-                    azure_deployment=azure_deploy or None,
-                )
-            )
-            print(f"\n  Final status   : {result.status}")
-            print(f"  Final signal   : {result.msg_type}")
-            print(f"  Valid          : {result.is_valid}")
-            print(f"  Syntax score   : {result.syntax_score:.2f}")
-            if result.manifest:
-                print(f"  Merge manifest : {json.dumps(result.manifest, indent=2)}")
-            return
-        else:
-            result = run_pipeline(
+        human_timeout_s = float(os.environ.get("HITL_TIMEOUT_S", "120") or 120)
+        result = asyncio.run(
+            run_pipeline_async(
                 bp_model=bp_model,
                 fragments=fragments,
                 b2p_policies=b2p_policies,
-                context_mode=context_mode,
+                human_timeout_s=human_timeout_s,
                 api_key=api_key,
                 azure_endpoint=azure_endpoint or None,
                 azure_api_version=azure_version or None,
                 azure_deployment=azure_deploy or None,
             )
-
-        print(f"\n  Final signal   : {result.msg_type.value}")
+        )
+        print(f"\n  Final status   : {result.status}")
+        print(f"  Final signal   : {result.msg_type}")
         print(f"  Valid          : {result.is_valid}")
         print(f"  Syntax score   : {result.syntax_score:.2f}")
-        print(f"  Syntax loops   : {result.loop_turns}")
-        print(f"  Total issues   : {result.summary.get('total_issues', '?')}")
-        print(f"    Critical     : {result.summary.get('critical', '?')}")
-        print(f"    Warning      : {result.summary.get('warning', '?')}")
-        print(f"    Info         : {result.summary.get('info', '?')}")
+        if result.manifest:
+            print(f"  Merge manifest : {json.dumps(result.manifest, indent=2)}")
 
-        by_layer = result.summary.get("by_layer", {})
+        summary = result.summary or {}
+        print(f"\n  Total issues   : {summary.get('total_issues', '?')}")
+        print(f"    Critical     : {summary.get('critical', '?')}")
+        print(f"    Warning      : {summary.get('warning', '?')}")
+        print(f"    Info         : {summary.get('info', '?')}")
+
+        by_layer = summary.get("by_layer", {})
         print("  Issues by layer:")
         print(f"    ODRL syntax       : {by_layer.get('syntax', '?')}")
         print(f"    FPa semantics     : {by_layer.get('fpa_semantic', '?')}")
@@ -85,7 +63,7 @@ def run_looped_orchestration(
         print(f"    Global coherence  : {by_layer.get('global', '?')}")
 
     except Exception as e:
-        print(f"[ERROR run_pipeline] {e}")
+        print(f"[ERROR run_pipeline_async] {e}")
         import traceback
 
         traceback.print_exc()
@@ -234,10 +212,17 @@ def run_sequential_agents(
         print("\n" + "-" * 60)
         print("  EXPORT JSON-LD")
         print("-" * 60)
-        output_dir = os.path.join(
-            os.path.abspath(os.path.dirname(__file__)), "..", "..", "odrl_policies"
+        output_dir = os.path.abspath(
+            os.path.join(
+                os.path.abspath(os.path.dirname(__file__)),
+                "..",
+                "..",
+                "output",
+                "scenario1",
+                "odrl_fragment_policies",
+                "cli_run",
+            )
         )
-        output_dir = os.path.abspath(output_dir)
         exported = projector.export(fp_results, output_dir=output_dir)
         total_files = sum(len(v) for v in exported.values())
         print(f"  {total_files} .jsonld file(s) → {output_dir}")

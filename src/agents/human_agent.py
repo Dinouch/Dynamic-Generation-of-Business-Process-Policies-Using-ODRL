@@ -19,6 +19,17 @@ class HumanDecision:
         out: dict[str, Any] = {"decision": self.decision, "comment": self.comment}
         if self.selected_option_id:
             out["selected_option_id"] = self.selected_option_id
+        # FIPA REFUSE / FAILURE tuple shape (action-expression, reason-proposition) for strict ACL checks
+        out["action"] = "human_gate_review_unsupported_proposal"
+        comment = (self.comment or "").strip()
+        if comment:
+            out["reason"] = comment
+        else:
+            out["reason"] = (
+                "operator agreed to the proposed unsupported rule"
+                if self.decision == "agree"
+                else "operator refused the proposed unsupported rule"
+            )
         return out
 
 

@@ -71,8 +71,8 @@ class PipelineMetricsCollector:
         run_context: Optional[dict] = None,
     ):
         """
-        pipeline_result : résultat de run_pipeline() (is_valid, report, summary,
-                           syntax_score, msg_type, loop_turns).
+        pipeline_result : résultat ``PipelineAsyncResult`` de ``run_pipeline_async()``
+                           (is_valid, report, summary, syntax_score, msg_type, status, manifest).
         fp_results       : dict[fragment_id → FragmentPolicySet] en sortie Agent 4.
         enriched_graph   : EnrichedGraph (connections, b2p_mappings, etc.).
         fragments        : liste des fragments (id, activities, gateways).
@@ -83,7 +83,7 @@ class PipelineMetricsCollector:
                            - time_per_agent    : {"agent1": float, ...}
                            - tokens            : {"agent2": {"prompt_tokens": int, "completion_tokens": int}, ...}
                            - reformulation_loops: int (tours Agent 2↔3)
-                           - structural_loops   : int (tours Agent 3→1)
+                           - structural_loops   : int (obsolète / non utilisé)
                            - message_hops      : int (total messages échangés)
         """
         self.pipeline_result = pipeline_result
@@ -388,7 +388,7 @@ class PipelineMetricsCollector:
         pr = self.pipeline_result
         ctx = self.run_context
 
-        # Boucle de correction syntaxique Agent 5 ↔ Agent 4 (déjà dans PipelineResult).
+        # Boucle de correction syntaxique Agent 5 ↔ Agent 4 (si exposée sur le résultat).
         # Justification : mesure directe de l’effort de correction ODRL.
         syntax_loops = getattr(pr, "loop_turns", 0) or 0
 
@@ -410,7 +410,7 @@ class PipelineMetricsCollector:
             "reformulation_loops":    reformulation_loops,
             "reformulation_rationale": "Tours Agent 3 → Agent 2 (REFORMULATE) — qualité des candidats implicites.",
             "structural_loops":       structural_loops,
-            "structural_rationale":   "Tours Agent 3 → Agent 1 (STRUCTURAL_UPDATE) — enrichissement du graphe.",
+            "structural_rationale":   "Mutation du graphe d'entrée désactivée (pas de STRUCTURAL_UPDATE).",
             "message_hops_total":     message_hops,
             "message_hops_rationale": "Nombre total de messages SEND pour coût et reproductibilité.",
         }

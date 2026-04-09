@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from enum import Enum
@@ -455,6 +456,7 @@ class PolicyAuditor:
 
         self._on_send:           Optional[Callable[[AgentMessage], None]] = None
         self._syntax_loop_count: int = 0
+        self._pending_syntax_agree_id: Optional[str] = None
 
         self._b2p_index:      dict[str, dict]                  = {
             b.get("uid", ""): b for b in raw_b2p if b.get("uid")
@@ -485,47 +487,120 @@ class PolicyAuditor:
 
     def receive(self, msg: AgentMessage) -> None:
         print(f"[Agent 5] ◄ RECEIVE {msg}")
-        if msg.msg_type == MessageType.POLICIES_READY:
-            self.fp_results     = msg.payload["fp_results"]
+        if msg.msg_type == MessageType.SYNTAX_AUDIT_REQUEST:
+            self._handle_syntax_audit_request(msg)
+        elif msg.msg_type == MessageType.SYNTAX_CORRECTION:
+            self._handle_syntax_correction_request(msg)
+        elif msg.msg_type == MessageType.POLICIES_READY:
+            self.fp_results = msg.payload["fp_results"]
             self.enriched_graph = msg.payload["enriched_graph"]
-            # Optional workflow metadata (ACL status / merge manifest)
             self._workflow_status = msg.payload.get("status")
-            self._merge_manifest  = msg.payload.get("manifest")
+            self._merge_manifest = msg.payload.get("manifest")
             self._build_indexes()
             self._audit_and_route(loop_turn=msg.loop_turn)
+        elif msg.msg_type == MessageType.DELEGATION_AGREE:
+            print("[Agent 5] Received delegation AGREE (informational).")
         else:
             print(f"[Agent 5][WARN] Message '{msg.msg_type.value}' not handled — ignored.")
+
+    def _handle_syntax_audit_request(self, msg: AgentMessage) -> None:
+        """FIPA: AGREE to Agent 4's REQUEST, then run the first audit round."""
+        req_id = msg.payload.get("syntax_audit_request_id")
+        agree_rw = uuid.uuid4().hex
+        self._pending_syntax_agree_id = agree_rw
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent4",
+                msg_type=MessageType.DELEGATION_AGREE,
+                payload={
+                    "utterance": "I will validate ODRL syntax and global coherence for these policies.",
+                    "_acl_ontology": "odrl-syntax-audit",
+                    "acl_in_reply_to": req_id,
+                    "_acl_reply_with": agree_rw,
+                },
+                loop_turn=msg.loop_turn,
+            )
+        )
+        self.fp_results = msg.payload["fp_results"]
+        self.enriched_graph = msg.payload["enriched_graph"]
+        self._workflow_status = msg.payload.get("status")
+        self._merge_manifest = msg.payload.get("manifest")
+        self._build_indexes()
+        self._audit_and_route(loop_turn=msg.loop_turn)
+
+    def _handle_syntax_correction_request(self, msg: AgentMessage) -> None:
+        """
+        Agent 4 issues REQUEST (SYNTAX_CORRECTION) after FAILURE — respond with AGREE only;
+        corrections are applied by Agent 4, then POLICIES_READY triggers re-audit.
+        """
+        req_id = msg.payload.get("syntax_correction_request_id")
+        agree_rw = uuid.uuid4().hex
+        self._pending_syntax_agree_id = agree_rw
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent4",
+                msg_type=MessageType.DELEGATION_AGREE,
+                payload={
+                    "utterance": "Acknowledged; awaiting repaired policies for re-audit.",
+                    "_acl_ontology": "odrl-syntax-audit",
+                    "acl_in_reply_to": req_id,
+                    "_acl_reply_with": agree_rw,
+                },
+                loop_turn=msg.loop_turn,
+            )
+        )
 
     def _audit_and_route(self, loop_turn: int) -> None:
         report = self.audit()
         any_critical = report.criticals
         critical_syntax_count = sum(1 for i in any_critical if i.layer == IssueLayer.SYNTAX)
 
+        errors = [
+            {
+                "policy_uid": i.policy_uid,
+                "code": _syntax_correction_wire_code(i.code),
+                "layer": i.layer.value,
+                "path": (i.details or {}).get("path", ""),
+                "suggestion": i.suggestion,
+            }
+            for i in any_critical
+        ]
+        affected_policies = list({i.policy_uid for i in any_critical if i.policy_uid})
+
         if any_critical and self._syntax_loop_count < self.MAX_SYNTAX_LOOPS:
             self._syntax_loop_count += 1
-            errors = [
-                {
-                    "policy_uid": i.policy_uid,
-                    "code":       _syntax_correction_wire_code(i.code),
-                    "layer":      i.layer.value,
-                    "path":       (i.details or {}).get("path", ""),
-                    "suggestion": i.suggestion,
-                }
-                for i in any_critical
-            ]
-            affected_policies = list({i.policy_uid for i in any_critical if i.policy_uid})
             print(
                 f"[Agent 5] {len(any_critical)} issue(s) CRITICAL "
-                f"({critical_syntax_count} syntax) — SYNTAX_CORRECTION "
-                f"to Agent 4 (loop #{self._syntax_loop_count})"
+                f"({critical_syntax_count} syntax) — FAILURE only; Agent 4 will request correction "
+                f"(loop #{self._syntax_loop_count})"
             )
-            self.send(AgentMessage(
-                sender    = self.AGENT_NAME,
-                recipient = "agent4",
-                msg_type  = MessageType.SYNTAX_CORRECTION,
-                payload   = {"affected_policies": affected_policies, "errors": errors},
-                loop_turn = self._syntax_loop_count,
-            ))
+            agree_id = self._pending_syntax_agree_id or ""
+            reason_bits = [
+                (i.suggestion or str(i.code.value))
+                for i in any_critical[:5]
+            ]
+            reason_txt = "; ".join(reason_bits)[:2000] or (
+                "Critical syntax or validation errors detected in ODRL policies."
+            )
+            # FIPA: FAILURE closes the current interaction; Agent 4 issues REQUEST SYNTAX_CORRECTION next.
+            self.send(
+                AgentMessage(
+                    sender=self.AGENT_NAME,
+                    recipient="agent4",
+                    msg_type=MessageType.ODRL_SYNTAX_FAILURE,
+                    payload={
+                        "acl_in_reply_to": agree_id,
+                        "action": "validate-odrl-syntax",
+                        "reason": reason_txt,
+                        "utterance": "Syntax validation failed; see reason proposition for details.",
+                        "affected_policies": affected_policies,
+                        "errors": errors,
+                    },
+                    loop_turn=self._syntax_loop_count,
+                )
+            )
             return
 
         if any_critical and self._syntax_loop_count >= self.MAX_SYNTAX_LOOPS:
@@ -539,21 +614,30 @@ class PolicyAuditor:
             f"[Agent 5] Final signal: {final_type.value} — "
             f"is_valid={report.is_valid}, syntax_loops_used={self._syntax_loop_count}"
         )
-        self.send(AgentMessage(
-            sender    = self.AGENT_NAME,
-            recipient = "pipeline",
-            msg_type  = final_type,
-            payload   = {
-                "report":          report,
-                "is_valid":        report.is_valid,
-                "summary":         report.summary(),
-                "syntax_score":    report.syntax_score(),
-                "loop_turns_used": self._syntax_loop_count,
-                "status":          getattr(self, "_workflow_status", None),
-                "manifest":        getattr(self, "_merge_manifest", None),
-            },
-            loop_turn = loop_turn,
-        ))
+        payload_out = {
+            "report": report,
+            "is_valid": report.is_valid,
+            "summary": report.summary(),
+            "syntax_score": report.syntax_score(),
+            "loop_turns_used": self._syntax_loop_count,
+            "status": getattr(self, "_workflow_status", None),
+            "manifest": getattr(self, "_merge_manifest", None),
+            "msg_type": final_type.value,
+            "utterance": (
+                "ODRL syntax audit passed; policies are syntactically valid."
+                if report.is_valid
+                else "ODRL syntax audit completed with remaining critical issues."
+            ),
+        }
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent4",
+                msg_type=final_type,
+                payload=payload_out,
+                loop_turn=loop_turn,
+            )
+        )
 
     # ═════════════════════════════════════════
     #  Index construction

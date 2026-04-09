@@ -182,24 +182,32 @@ class UnsupportedCaseFormulator:
             ``GRAPH_READY`` or ``REFORMULATE`` from Agent 3.
         """
         print(f"[Agent 2] ◄ RECEIVE {msg}")
-        if msg.msg_type == MessageType.GRAPH_READY:
+        if msg.msg_type in (MessageType.GRAPH_READY, MessageType.CFP_UNSUPPORTED):
             self._handle_graph_ready(msg)
         elif msg.msg_type == MessageType.REFORMULATE:
             self._handle_reformulate(msg)
+        elif msg.msg_type == MessageType.DELEGATION_AGREE:
+            print("[Agent 2] Received delegation AGREE (informational).")
         else:
             print(f"[Agent 2][WARN] Unknown message type '{msg.msg_type.value}'.")
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
-        """Process ``GRAPH_READY`` and emit ``UNSUPPORTED_PROPOSALS``."""
+        """Process ``CFP_UNSUPPORTED`` / ``GRAPH_READY`` and emit ``UNSUPPORTED_PROPOSALS`` (ACL PROPOSE)."""
         enriched_graph: EnrichedGraph = msg.payload["enriched_graph"]
         self._last_graph = enriched_graph
         self._reformulate_count = 0
+
+        proposer_reply_anchor: Optional[str] = None
+        if msg.msg_type == MessageType.CFP_UNSUPPORTED:
+            proposer_reply_anchor = msg.payload.get("cfp_call_id")
 
         unsupported = list(getattr(enriched_graph, "unsupported_patterns", []) or [])
         proposals: list[UnsupportedCaseProposal] = []
 
         if not unsupported:
-            self._emit_unsupported_proposals(enriched_graph, proposals, msg.loop_turn)
+            self._emit_unsupported_proposals(
+                enriched_graph, proposals, msg.loop_turn, proposal_anchor_id=proposer_reply_anchor
+            )
             return
 
         b2p_json = json.dumps(enriched_graph.raw_b2p, ensure_ascii=False)
@@ -210,24 +218,66 @@ class UnsupportedCaseFormulator:
                 proposals.extend(props)
 
         self._last_proposals = proposals
-        self._emit_unsupported_proposals(enriched_graph, proposals, msg.loop_turn)
+        self._emit_unsupported_proposals(
+            enriched_graph, proposals, msg.loop_turn, proposal_anchor_id=proposer_reply_anchor
+        )
 
     def _emit_unsupported_proposals(
         self,
         enriched_graph: EnrichedGraph,
         proposals: list[UnsupportedCaseProposal],
         loop_turn: int,
+        *,
+        proposal_anchor_id: Optional[str] = None,
     ) -> None:
-        """Send ``UNSUPPORTED_PROPOSALS`` to Agent 3."""
+        """Send ``UNSUPPORTED_PROPOSALS`` (ACL PROPOSE) to Agent 3."""
+        pl: dict = {
+            "enriched_graph": enriched_graph,
+            "unsupported_proposals": [p.to_dict() for p in proposals],
+            "utterance": (
+                "Here are proposed fragment-policy hints for the unsupported structural patterns."
+            ),
+        }
+        if proposal_anchor_id:
+            pl["acl_in_reply_to"] = proposal_anchor_id
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
                 recipient="agent3",
                 msg_type=MessageType.UNSUPPORTED_PROPOSALS,
-                payload={
-                    "enriched_graph": enriched_graph,
-                    "unsupported_proposals": [p.to_dict() for p in proposals],
-                },
+                payload=pl,
+                loop_turn=loop_turn,
+            )
+        )
+
+    def _emit_reformulated_inform(
+        self,
+        enriched_graph: EnrichedGraph,
+        proposals: list[UnsupportedCaseProposal],
+        loop_turn: int,
+        *,
+        reformulate_request_id: Optional[str] = None,
+    ) -> None:
+        """
+        After ``request`` (REFORMULATE) + ``agree``, emit **inform** (FIPA-Request follow-up),
+        not ``propose`` (Contract-Net).
+        """
+        pl: dict = {
+            "enriched_graph": enriched_graph,
+            "unsupported_proposals": [p.to_dict() for p in proposals],
+            "utterance": (
+                "Reformulated fragment-policy hints for the unsupported structural patterns "
+                "(inform following your reformulation request)."
+            ),
+        }
+        if reformulate_request_id:
+            pl["acl_in_reply_to"] = reformulate_request_id
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent3",
+                msg_type=MessageType.REFORMULATED_PROPOSALS,
+                payload=pl,
                 loop_turn=loop_turn,
             )
         )
@@ -248,14 +298,30 @@ class UnsupportedCaseFormulator:
                 "re-sending last proposals."
             )
             if self._last_graph:
-                self._emit_unsupported_proposals(
+                self._emit_reformulated_inform(
                     self._last_graph,
                     self._last_proposals,
                     msg.loop_turn,
+                    reformulate_request_id=msg.payload.get("reformulate_request_id"),
                 )
             return
 
         self._reformulate_count += 1
+        rid = msg.payload.get("reformulate_request_id")
+        if rid:
+            self.send(
+                AgentMessage(
+                    sender=self.AGENT_NAME,
+                    recipient="agent3",
+                    msg_type=MessageType.DELEGATION_AGREE,
+                    payload={
+                        "utterance": "I will reformulate the unsupported-case proposals using your hint.",
+                        "_acl_ontology": "unsupported-formulation",
+                        "acl_in_reply_to": rid,
+                    },
+                    loop_turn=msg.loop_turn,
+                )
+            )
         hint = msg.payload.get("hint", "")
         pt = msg.payload.get("pattern_type", "")
         gw = msg.payload.get("gateway_name", "")
@@ -295,10 +361,11 @@ class UnsupportedCaseFormulator:
                     self._last_proposals.extend(new_props)
                 break
 
-        self._emit_unsupported_proposals(
+        self._emit_reformulated_inform(
             self._last_graph,
             self._last_proposals,
             msg.loop_turn + 1,
+            reformulate_request_id=rid,
         )
 
     def _formulate_one(self, u, b2p_json: str) -> list[UnsupportedCaseProposal]:

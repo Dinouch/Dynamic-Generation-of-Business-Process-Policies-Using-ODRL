@@ -1,0 +1,557 @@
+{
+  "schema_version": 1,
+  "fragments": [
+    {
+      "id": "f1",
+      "activities": [
+        "check-for-completeness",
+        "ask-for-more-information",
+        "check-credit-amount"
+      ],
+      "gateways": [
+        {
+          "name": "application-completeness",
+          "type": "XOR"
+        },
+        {
+          "name": "credit-amount",
+          "type": "XOR"
+        }
+      ]
+    },
+    {
+      "id": "f2",
+      "activities": [
+        "perform-checks-for-large-amount",
+        "perform-checks-for-small-amount",
+        "make-decision",
+        "notify-rejection-by-email",
+        "notify-acceptance-by-email"
+      ],
+      "gateways": [
+        {
+          "name": "credit-amount",
+          "type": "XOR"
+        },
+        {
+          "name": "decision-outcome",
+          "type": "XOR"
+        },
+        {
+          "name": "documentation-follow-up",
+          "type": "EVENT_BASED_EXCLUSIVE"
+        }
+      ]
+    },
+    {
+      "id": "f3",
+      "activities": [
+        "receive-missing-documents",
+        "handle-documentation-deadline",
+        "request-credit-card"
+      ],
+      "gateways": [
+        {
+          "name": "documentation-follow-up",
+          "type": "EVENT_BASED_EXCLUSIVE"
+        }
+      ]
+    }
+  ],
+  "ordering": {
+    "fragment_ids_in_process_order": [
+      "f1",
+      "f2",
+      "f3"
+    ],
+    "global_activity_order": [
+      "check-for-completeness",
+      "ask-for-more-information",
+      "check-credit-amount",
+      "perform-checks-for-large-amount",
+      "perform-checks-for-small-amount",
+      "make-decision",
+      "notify-rejection-by-email",
+      "notify-acceptance-by-email",
+      "receive-missing-documents",
+      "handle-documentation-deadline",
+      "request-credit-card"
+    ],
+    "activity_order_per_fragment": {
+      "f1": [
+        "check-for-completeness",
+        "ask-for-more-information",
+        "check-credit-amount"
+      ],
+      "f2": [
+        "perform-checks-for-large-amount",
+        "perform-checks-for-small-amount",
+        "make-decision",
+        "notify-rejection-by-email",
+        "notify-acceptance-by-email"
+      ],
+      "f3": [
+        "receive-missing-documents",
+        "handle-documentation-deadline",
+        "request-credit-card"
+      ]
+    }
+  },
+  "connections": [
+    {
+      "from": "check-for-completeness",
+      "to": "application-completeness",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "application-completeness"
+    },
+    {
+      "from": "application-completeness",
+      "to": "ask-for-more-information",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "application-completeness",
+      "condition": "incomplete"
+    },
+    {
+      "from": "application-completeness",
+      "to": "check-credit-amount",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "application-completeness",
+      "condition": "complete"
+    },
+    {
+      "from": "ask-for-more-information",
+      "to": "check-for-completeness",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1"
+    },
+    {
+      "from": "check-credit-amount",
+      "to": "credit-amount",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1",
+        "f2"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "credit-amount"
+    },
+    {
+      "from": "credit-amount",
+      "to": "perform-checks-for-large-amount",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1",
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f2",
+      "gateway": "credit-amount",
+      "condition": ">500"
+    },
+    {
+      "from": "credit-amount",
+      "to": "perform-checks-for-small-amount",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1",
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f2",
+      "gateway": "credit-amount",
+      "condition": "<=500"
+    },
+    {
+      "from": "perform-checks-for-large-amount",
+      "to": "make-decision",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2"
+    },
+    {
+      "from": "perform-checks-for-small-amount",
+      "to": "make-decision",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2"
+    },
+    {
+      "from": "make-decision",
+      "to": "decision-outcome",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2",
+      "gateway": "decision-outcome"
+    },
+    {
+      "from": "decision-outcome",
+      "to": "notify-rejection-by-email",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2",
+      "gateway": "decision-outcome",
+      "condition": "rejected"
+    },
+    {
+      "from": "decision-outcome",
+      "to": "notify-acceptance-by-email",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2",
+      "gateway": "decision-outcome",
+      "condition": "accepted"
+    },
+    {
+      "from": "notify-acceptance-by-email",
+      "to": "documentation-follow-up",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2",
+        "f3"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2",
+      "gateway": "documentation-follow-up"
+    },
+    {
+      "from": "receive-missing-documents",
+      "to": "request-credit-card",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f3"
+      ],
+      "from_primary_fragment_id": "f3",
+      "to_primary_fragment_id": "f3"
+    },
+    {
+      "from": "handle-documentation-deadline",
+      "to": "request-credit-card",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f3"
+      ],
+      "from_primary_fragment_id": "f3",
+      "to_primary_fragment_id": "f3"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "receive-missing-documents",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2",
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f3"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f3",
+      "gateway": "documentation-follow-up",
+      "condition": "documents-received"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "handle-documentation-deadline",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2",
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f3"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f3",
+      "gateway": "documentation-follow-up",
+      "condition": "deadline"
+    }
+  ],
+  "activities": [
+    {
+      "name": "check-for-completeness",
+      "role": "staff",
+      "start": true
+    },
+    {
+      "name": "ask-for-more-information",
+      "role": "staff"
+    },
+    {
+      "name": "check-credit-amount",
+      "role": "staff"
+    },
+    {
+      "name": "perform-checks-for-large-amount",
+      "role": "central-bank"
+    },
+    {
+      "name": "perform-checks-for-small-amount",
+      "role": "staff"
+    },
+    {
+      "name": "make-decision",
+      "role": "manager"
+    },
+    {
+      "name": "notify-rejection-by-email",
+      "role": "staff",
+      "end": true
+    },
+    {
+      "name": "notify-acceptance-by-email",
+      "role": "staff"
+    },
+    {
+      "name": "receive-missing-documents",
+      "role": "staff"
+    },
+    {
+      "name": "handle-documentation-deadline",
+      "role": "staff"
+    },
+    {
+      "name": "request-credit-card",
+      "role": "staff",
+      "end": true
+    }
+  ],
+  "gateways": [
+    {
+      "name": "application-completeness",
+      "type": "XOR"
+    },
+    {
+      "name": "credit-amount",
+      "type": "XOR"
+    },
+    {
+      "name": "decision-outcome",
+      "type": "XOR"
+    },
+    {
+      "name": "documentation-follow-up",
+      "type": "EVENT_BASED_EXCLUSIVE"
+    }
+  ],
+  "flows": [
+    {
+      "from": "check-for-completeness",
+      "to": "application-completeness",
+      "type": "sequence",
+      "gateway": "application-completeness"
+    },
+    {
+      "from": "application-completeness",
+      "to": "ask-for-more-information",
+      "type": "sequence",
+      "gateway": "application-completeness",
+      "condition": "incomplete"
+    },
+    {
+      "from": "application-completeness",
+      "to": "check-credit-amount",
+      "type": "sequence",
+      "gateway": "application-completeness",
+      "condition": "complete"
+    },
+    {
+      "from": "ask-for-more-information",
+      "to": "check-for-completeness",
+      "type": "sequence"
+    },
+    {
+      "from": "check-credit-amount",
+      "to": "credit-amount",
+      "type": "sequence",
+      "gateway": "credit-amount"
+    },
+    {
+      "from": "credit-amount",
+      "to": "perform-checks-for-large-amount",
+      "type": "sequence",
+      "gateway": "credit-amount",
+      "condition": ">500"
+    },
+    {
+      "from": "credit-amount",
+      "to": "perform-checks-for-small-amount",
+      "type": "sequence",
+      "gateway": "credit-amount",
+      "condition": "<=500"
+    },
+    {
+      "from": "perform-checks-for-large-amount",
+      "to": "make-decision",
+      "type": "sequence"
+    },
+    {
+      "from": "perform-checks-for-small-amount",
+      "to": "make-decision",
+      "type": "sequence"
+    },
+    {
+      "from": "make-decision",
+      "to": "decision-outcome",
+      "type": "sequence",
+      "gateway": "decision-outcome"
+    },
+    {
+      "from": "decision-outcome",
+      "to": "notify-rejection-by-email",
+      "type": "sequence",
+      "gateway": "decision-outcome",
+      "condition": "rejected"
+    },
+    {
+      "from": "decision-outcome",
+      "to": "notify-acceptance-by-email",
+      "type": "sequence",
+      "gateway": "decision-outcome",
+      "condition": "accepted"
+    },
+    {
+      "from": "notify-acceptance-by-email",
+      "to": "documentation-follow-up",
+      "type": "sequence",
+      "gateway": "documentation-follow-up"
+    },
+    {
+      "from": "receive-missing-documents",
+      "to": "request-credit-card",
+      "type": "sequence"
+    },
+    {
+      "from": "handle-documentation-deadline",
+      "to": "request-credit-card",
+      "type": "sequence"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "receive-missing-documents",
+      "type": "sequence",
+      "gateway": "documentation-follow-up",
+      "condition": "documents-received"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "handle-documentation-deadline",
+      "type": "sequence",
+      "gateway": "documentation-follow-up",
+      "condition": "deadline"
+    }
+  ]
+}

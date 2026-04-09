@@ -14,8 +14,9 @@ Corrections v2 :
 Couche multi-agent :
     - receive()  : accepte VALIDATION_DONE et SYNTAX_CORRECTION
     - send()     : émet POLICIES_READY vers Agent 5
-    - Boucle syntaxique (max MAX_SYNTAX_LOOPS, géré par Agent 5) :
-        SYNTAX_CORRECTION reçu → corrections déterministes → POLICIES_READY ré-émis
+    - Boucle syntaxique (max MAX_SYNTAX_LOOPS, géré avec Agent 5) :
+        ODRL_SYNTAX_FAILURE (A5) → REQUEST SYNTAX_CORRECTION (A4→A5) → AGREE (A5) →
+        corrections déterministes → POLICIES_READY ré-émis
 """
 
 import copy
@@ -221,6 +222,10 @@ class PolicyProjectionAgent:
         self._on_send:             Optional[Callable[[AgentMessage], None]] = None
         self._last_fp_results:     Optional[dict] = None
         self._last_enriched_graph: Optional[EnrichedGraph] = None
+        # ACL FAILURE (semantic-audit) must reference this AGREE envelope id (see ``acl_failure_reply_target``).
+        self._semantic_agree_anchor: Optional[str] = None
+        # After ODRL FAILURE from Agent 5: payload until Agent 5 AGREE on our SYNTAX_CORRECTION request.
+        self._pending_syntax_correction: Optional[dict[str, Any]] = None
 
     # ═════════════════════════════════════════
     #  COUCHE MULTI-AGENT
@@ -251,23 +256,120 @@ class PolicyProjectionAgent:
         Tout autre type est ignoré avec un warning.
         """
         print(f"[Agent 4] ◄ RECEIVE {msg}")
+        if msg.msg_type == MessageType.DELEGATION_AGREE:
+            if (
+                msg.sender == "agent5"
+                and (msg.payload or {}).get("_acl_ontology") == "odrl-syntax-audit"
+                and self._pending_syntax_correction is not None
+            ):
+                pending = self._pending_syntax_correction
+                self._pending_syntax_correction = None
+                self._run_syntax_repair_after_a5_agree(pending)
+                return
+            print("[Agent 4] Received delegation AGREE (informational).")
+            return
+
         if msg.msg_type == MessageType.VALIDATION_DONE:
+            self._agree_semantic_delegation(
+                msg,
+                "projection_request_id",
+                "I will project fragment policies from the validation report for semantic audit.",
+            )
             validation_report = msg.payload["validation_report"]
-            enriched_graph    = msg.payload["enriched_graph"]
+            enriched_graph = msg.payload["enriched_graph"]
             self._last_enriched_graph = enriched_graph
             self._project_and_send(enriched_graph, validation_report, loop_turn=msg.loop_turn)
 
         elif msg.msg_type == MessageType.SEMANTIC_CORRECTION:
+            self._agree_semantic_delegation(
+                msg,
+                "semantic_correction_request_id",
+                "I will apply the semantic correction hints and resend projected policies.",
+            )
             self._handle_semantic_correction(msg)
 
         elif msg.msg_type == MessageType.SEMANTIC_VALIDATED:
             self._handle_semantic_validated(msg)
 
         elif msg.msg_type == MessageType.SYNTAX_CORRECTION:
-            self._handle_syntax_correction(msg)
+            # Legacy: Agent 5 used to push SYNTAX_CORRECTION; flow is now FAILURE → A4 REQUEST → A5 AGREE.
+            if msg.sender == "agent5":
+                print("[Agent 4][WARN] SYNTAX_CORRECTION from Agent 5 (legacy) — applying without AGREE handshake.")
+                self._handle_syntax_correction(msg)
+            else:
+                print(f"[Agent 4][WARN] SYNTAX_CORRECTION from {msg.sender} — ignoré.")
+
+        elif msg.msg_type == MessageType.ODRL_SYNTAX_FAILURE:
+            print(
+                f"[Agent 4] ODRL syntax FAILURE from Agent 5: "
+                f"{(msg.payload or {}).get('reason', '')}"
+            )
+            self._pending_syntax_correction = {
+                "affected_policies": list((msg.payload or {}).get("affected_policies") or []),
+                "errors": list((msg.payload or {}).get("errors") or []),
+                "loop_turn": int(msg.loop_turn or 0),
+            }
+            self.send(
+                AgentMessage(
+                    sender=self.AGENT_NAME,
+                    recipient="agent5",
+                    msg_type=MessageType.SYNTAX_CORRECTION,
+                    payload={
+                        "affected_policies": self._pending_syntax_correction["affected_policies"],
+                        "errors": self._pending_syntax_correction["errors"],
+                        "utterance": (
+                            "Requesting syntax repair round: apply deterministic fixes, "
+                            "then resubmit policies for audit."
+                        ),
+                    },
+                    loop_turn=msg.loop_turn,
+                )
+            )
+
+        elif msg.msg_type in (MessageType.ODRL_VALID, MessageType.ODRL_SYNTAX_ERROR):
+            self._forward_final_audit_to_pipeline(msg)
+
+        elif msg.msg_type == MessageType.SEMANTIC_VALIDATION_FAILURE:
+            print(
+                "[Agent 4] Semantic FAILURE from Agent 3: "
+                f"{(msg.payload or {}).get('reason', '')}"
+            )
 
         else:
             print(f"[Agent 4][WARN] Message '{msg.msg_type.value}' non géré — ignoré.")
+
+    def _agree_semantic_delegation(self, msg: AgentMessage, id_key: str, utterance: str) -> None:
+        rid = msg.payload.get(id_key)
+        if not rid:
+            return
+        agree_rw = uuid.uuid4().hex
+        self._semantic_agree_anchor = agree_rw
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent3",
+                msg_type=MessageType.DELEGATION_AGREE,
+                payload={
+                    "utterance": utterance,
+                    "_acl_ontology": "semantic-audit",
+                    "acl_in_reply_to": rid,
+                    "_acl_reply_with": agree_rw,
+                },
+                loop_turn=msg.loop_turn,
+            )
+        )
+
+    def _forward_final_audit_to_pipeline(self, msg: AgentMessage) -> None:
+        """Agent 5 completes ODRL syntax audit; Agent 4 forwards the terminal result to the orchestrator."""
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="pipeline",
+                msg_type=msg.msg_type,
+                payload=dict(msg.payload or {}),
+                loop_turn=msg.loop_turn,
+            )
+        )
 
     # ─────────────────────────────────────────
     #  Handlers internes
@@ -286,47 +388,68 @@ class PolicyProjectionAgent:
         fp_results = self.project(enriched_graph, validation_report)
         self._last_fp_results = fp_results
 
-        self.send(AgentMessage(
-            sender    = self.AGENT_NAME,
-            recipient = "agent3",
-            msg_type  = MessageType.POLICIES_READY,
-            payload   = {
-                "fp_results":     fp_results,
-                "enriched_graph": enriched_graph,
-            },
-            loop_turn = loop_turn,
-        ))
+        pl: dict[str, Any] = {
+            "fp_results": fp_results,
+            "enriched_graph": enriched_graph,
+        }
+        if self._semantic_agree_anchor:
+            pl["acl_failure_reply_target"] = self._semantic_agree_anchor
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent3",
+                msg_type=MessageType.POLICIES_READY,
+                payload=pl,
+                loop_turn=loop_turn,
+            )
+        )
+
+    def _run_syntax_repair_after_a5_agree(self, pending: dict[str, Any]) -> None:
+        """After Agent 5 AGREE on our SYNTAX_CORRECTION request, apply fixes and resubmit."""
+        affected_policies = list(pending.get("affected_policies") or [])
+        errors = list(pending.get("errors") or [])
+        loop_turn = int(pending.get("loop_turn", 0) or 0)
+        print(
+            f"[Agent 4] SYNTAX repair (post A5 AGREE) — "
+            f"{len(affected_policies)} policy(ies), {len(errors)} erreur(s)"
+        )
+        self._apply_syntax_corrections(affected_policies, errors)
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent5",
+                msg_type=MessageType.POLICIES_READY,
+                payload={
+                    "fp_results": self._last_fp_results,
+                    "enriched_graph": self._last_enriched_graph,
+                },
+                loop_turn=loop_turn + 1,
+            )
+        )
 
     def _handle_syntax_correction(self, msg: AgentMessage) -> None:
         """
-        Traite une demande de correction syntaxique depuis Agent 5.
-
-        Extrait la liste des policy_uid affectées et les erreurs,
-        applique les corrections déterministes sur self._last_fp_results,
-        puis ré-émet POLICIES_READY avec loop_turn+1.
+        Legacy path: correction payload from Agent 5 (deprecated — prefer FAILURE + A4 REQUEST + A5 AGREE).
         """
         affected_policies = msg.payload.get("affected_policies", [])
-        errors            = msg.payload.get("errors", [])
-
+        errors = msg.payload.get("errors", [])
         print(
-            f"[Agent 4] SYNTAX_CORRECTION reçu — "
-            f"{len(affected_policies)} policy(ies) affectée(s), "
-            f"{len(errors)} erreur(s) à corriger"
+            f"[Agent 4] SYNTAX_CORRECTION (legacy) — "
+            f"{len(affected_policies)} policy(ies), {len(errors)} erreur(s)"
         )
-
         self._apply_syntax_corrections(affected_policies, errors)
-
-        # Ré-émettre les policies corrigées vers Agent 5
-        self.send(AgentMessage(
-            sender    = self.AGENT_NAME,
-            recipient = "agent5",
-            msg_type  = MessageType.POLICIES_READY,
-            payload   = {
-                "fp_results":     self._last_fp_results,
-                "enriched_graph": self._last_enriched_graph,
-            },
-            loop_turn = msg.loop_turn + 1,
-        ))
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent5",
+                msg_type=MessageType.POLICIES_READY,
+                payload={
+                    "fp_results": self._last_fp_results,
+                    "enriched_graph": self._last_enriched_graph,
+                },
+                loop_turn=msg.loop_turn + 1,
+            )
+        )
 
     def _apply_syntax_corrections(
         self,
@@ -453,15 +576,18 @@ class PolicyProjectionAgent:
                 continue
             self._set_field_path(policy, path, h.get("suggested_fix", ""))
 
+        pl2: dict[str, Any] = {
+            "fp_results": self._last_fp_results,
+            "enriched_graph": self._last_enriched_graph,
+        }
+        if self._semantic_agree_anchor:
+            pl2["acl_failure_reply_target"] = self._semantic_agree_anchor
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
                 recipient="agent3",
                 msg_type=MessageType.POLICIES_READY,
-                payload={
-                    "fp_results": self._last_fp_results,
-                    "enriched_graph": self._last_enriched_graph,
-                },
+                payload=pl2,
                 loop_turn=msg.loop_turn + 1,
             )
         )
@@ -486,10 +612,11 @@ class PolicyProjectionAgent:
             AgentMessage(
                 sender=self.AGENT_NAME,
                 recipient="agent5",
-                msg_type=MessageType.POLICIES_READY,
+                msg_type=MessageType.SYNTAX_AUDIT_REQUEST,
                 payload={
                     "fp_results": self._last_fp_results,
                     "enriched_graph": self._last_enriched_graph,
+                    "utterance": "Validate ODRL syntax and global coherence for these projected fragment policies.",
                 },
                 loop_turn=msg.loop_turn,
             )
@@ -936,7 +1063,8 @@ Respond with JSON only:
     ) -> dict[str, list[str]]:
         """
         Sérialise chaque policy en JSON-LD ODRL valide.
-        Écrit un fichier .jsonld par policy dans output_dir/fragment_id/.
+        Un fichier .jsonld par policy sous ``output_dir/{fragment_id}/`` (sans sous-dossiers FPa/FPd).
+        Le préfixe du nom de fichier (FPa_, FPd_message_, etc.) permet de distinguer les familles.
         Retourne dict[fragment_id → liste des chemins fichiers].
         """
         os.makedirs(output_dir, exist_ok=True)
@@ -950,14 +1078,20 @@ Respond with JSON only:
             for i, policy in enumerate(fps.all_policies()):
                 odrl = {k: v for k, v in policy.items() if not k.startswith("_")}
 
-                ptype    = policy.get("_type", "FP")
-                subtype  = (policy.get("_gateway") or policy.get("_flow") or
-                            policy.get("_dep_type") or policy.get("_unsupported_pattern") or
-                            str(i))
-                activity = (policy.get("_activity") or
-                            "_".join(policy.get("_activities", [])[:1]) or
-                            policy.get("_gateway_name", "policy"))
-                filename = f"{ptype}_{subtype}_{activity.replace('-','_')}.jsonld"
+                ptype = policy.get("_type", "FP")
+                subtype = (
+                    policy.get("_gateway")
+                    or policy.get("_flow")
+                    or policy.get("_dep_type")
+                    or policy.get("_unsupported_pattern")
+                    or str(i)
+                )
+                activity = (
+                    policy.get("_activity")
+                    or "_".join(policy.get("_activities", [])[:1])
+                    or policy.get("_gateway_name", "policy")
+                )
+                filename = f"{ptype}_{subtype}_{activity.replace('-', '_')}.jsonld"
                 filepath = os.path.join(frag_dir, filename)
 
                 counter = 1

@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-from .acl import ACLEnvelope
+from .acl import ACLEnvelope, ACLSemanticRegistry, validate_acl_semantics
 
 
 Handler = Callable[[ACLEnvelope], Awaitable[None]]
@@ -29,9 +29,13 @@ class AsyncBus:
         self,
         config: Optional[BusConfig] = None,
         on_publish: Optional[PublishHook] = None,
+        *,
+        strict_semantics: bool = True,
     ):
         self.config = config or BusConfig()
         self._on_publish = on_publish
+        self._strict_semantics = strict_semantics
+        self._acl_registry = ACLSemanticRegistry()
         self._queues: dict[str, asyncio.Queue[ACLEnvelope]] = {}
         self._handlers: dict[str, Handler] = {}
         self._tasks: list[asyncio.Task] = []
@@ -43,6 +47,9 @@ class AsyncBus:
             self._queues[receiver] = asyncio.Queue(maxsize=self.config.queue_maxsize)
 
     async def publish(self, env: ACLEnvelope) -> None:
+        if self._strict_semantics:
+            validate_acl_semantics(env, self._acl_registry)
+            self._acl_registry.apply_publish_effects(env)
         if self._on_publish is not None:
             await self._on_publish(env)
         if env.receiver not in self._queues:

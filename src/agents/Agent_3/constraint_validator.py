@@ -97,7 +97,6 @@ class ConstraintValidator:
     TEMPERATURE = 0.1
 
     AGENT_NAME = "agent3"
-    MAX_STRUCTURAL_LOOPS = 1
     MAX_REFORMULATE = 3
     MAX_SEMANTIC_LOOPS = 4
 
@@ -117,13 +116,13 @@ class ConstraintValidator:
         self._deployment: Optional[str] = None
 
         self._on_send_agent2: Optional[Callable[[AgentMessage], None]] = None
-        self._on_send_agent1: Optional[Callable[[AgentMessage], None]] = None
         self._on_send_agent4: Optional[Callable[[AgentMessage], None]] = None
 
-        self._structural_loop_count = 0
         self._last_enriched_graph: Optional[EnrichedGraph] = None
         self._reformulate_sent_count: dict[tuple[str, str, str], int] = {}
         self._semantic_loop_count = 0
+        # Open Contract-Net PROPOSE envelope id (persists across REFORMULATED inform replies).
+        self._last_open_propose_id: Optional[str] = None
 
         key_azure = api_key or os.environ.get("AZURE_OPENAI_KEY") or os.environ.get(
             "AZURE_OPENAI_API_KEY"
@@ -157,10 +156,6 @@ class ConstraintValidator:
         """Register Agent 2 for ``REFORMULATE`` and ``GRAPH_READY`` (unsupported path)."""
         self._on_send_agent2 = fn
 
-    def register_send_callback_agent1(self, fn: Callable[[AgentMessage], None]) -> None:
-        """Register Agent 1 for ``STRUCTURAL_UPDATE``."""
-        self._on_send_agent1 = fn
-
     def register_send_callback_agent4(self, fn: Callable[[AgentMessage], None]) -> None:
         """Register Agent 4 for ``VALIDATION_DONE``, ``SEMANTIC_CORRECTION``, ``SEMANTIC_VALIDATED``."""
         self._on_send_agent4 = fn
@@ -170,7 +165,6 @@ class ConstraintValidator:
         print(f"[Agent 3] ► SEND {msg}")
         routes = {
             "agent2": self._on_send_agent2,
-            "agent1": self._on_send_agent1,
             "agent4": self._on_send_agent4,
         }
         fn = routes.get(msg.recipient)
@@ -189,14 +183,53 @@ class ConstraintValidator:
             Incoming pipeline message.
         """
         print(f"[Agent 3] ◄ RECEIVE {msg}")
+        if msg.msg_type == MessageType.DELEGATION_AGREE:
+            print("[Agent 3] Received delegation AGREE (informational).")
+            return
         if msg.msg_type == MessageType.GRAPH_READY:
             self._handle_graph_ready(msg)
-        elif msg.msg_type == MessageType.UNSUPPORTED_PROPOSALS:
+        elif msg.msg_type in (
+            MessageType.UNSUPPORTED_PROPOSALS,
+            MessageType.REFORMULATED_PROPOSALS,
+        ):
             self._handle_unsupported_proposals(msg)
         elif msg.msg_type == MessageType.POLICIES_READY:
             self._handle_policies_ready(msg)
         else:
             print(f"[Agent 3][WARN] Unknown message type '{msg.msg_type.value}'.")
+
+    def _emit_accept_proposal_batch(self, msg: AgentMessage, utterance: str) -> None:
+        pid = msg.payload.get("proposal_message_id") or self._last_open_propose_id
+        if not pid or not self._on_send_agent2:
+            return
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent2",
+                msg_type=MessageType.ACCEPT_PROPOSAL_BATCH,
+                payload={"utterance": utterance, "acl_in_reply_to": pid},
+                loop_turn=msg.loop_turn,
+            )
+        )
+
+    def _emit_reject_proposal_batch(self, msg: AgentMessage, reason: str) -> None:
+        pid = msg.payload.get("proposal_message_id") or self._last_open_propose_id
+        if not pid or not self._on_send_agent2:
+            return
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent2",
+                msg_type=MessageType.REJECT_PROPOSAL_BATCH,
+                payload={
+                    "utterance": reason[:500],
+                    "acl_in_reply_to": pid,
+                    "action": "reject-unsupported-proposals",
+                    "reason": reason[:2000],
+                },
+                loop_turn=msg.loop_turn,
+            )
+        )
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
         """
@@ -208,13 +241,24 @@ class ConstraintValidator:
         unsupported = list(getattr(enriched, "unsupported_patterns", []) or [])
 
         if unsupported and self._on_send_agent2:
-            print(f"[Agent 3] {len(unsupported)} unsupported pattern(s) — forwarding GRAPH_READY to Agent 2")
+            print(
+                f"[Agent 3] {len(unsupported)} unsupported pattern(s) — CFP to Agent 2 "
+                "(unsupported formulation)"
+            )
             self.send(
                 AgentMessage(
                     sender=self.AGENT_NAME,
                     recipient="agent2",
-                    msg_type=MessageType.GRAPH_READY,
-                    payload={"enriched_graph": enriched},
+                    msg_type=MessageType.CFP_UNSUPPORTED,
+                    payload={
+                        "enriched_graph": enriched,
+                        "utterance": (
+                            "Call for proposals: the following structural patterns are not covered by "
+                            "deterministic templates — propose ODRL fragment-policy hints with "
+                            "conditions and justification."
+                        ),
+                        "unsupported_pattern_count": len(unsupported),
+                    },
                     loop_turn=msg.loop_turn,
                 )
             )
@@ -242,8 +286,12 @@ class ConstraintValidator:
     def _handle_unsupported_proposals(self, msg: AgentMessage) -> None:
         """
         Process proposals from Agent 2: B2P ambiguity (T1), validate proposals,
-        then emit ``VALIDATION_DONE`` or ``REFORMULATE`` / ``STRUCTURAL_UPDATE``.
+        then emit ``VALIDATION_DONE`` or ``REFORMULATE`` (no graph mutation).
         """
+        pid = (msg.payload or {}).get("proposal_message_id")
+        if pid:
+            self._last_open_propose_id = pid
+
         enriched: EnrichedGraph = msg.payload["enriched_graph"]
         raw_props = msg.payload.get("unsupported_proposals") or []
         proposals = [UnsupportedCaseProposal.from_dict(d) for d in raw_props]
@@ -280,25 +328,23 @@ class ConstraintValidator:
                     f"({r.decision_level}){det}"
                 )
 
-        for vr in report.structural_errors:
-            if self._structural_loop_count < self.MAX_STRUCTURAL_LOOPS:
-                self._structural_loop_count += 1
-                edge_dict = self._extract_edge_from_hint(vr.hint or vr.reformulation_hint or "")
-                self.send(
-                    AgentMessage(
-                        sender=self.AGENT_NAME,
-                        recipient="agent1",
-                        msg_type=MessageType.STRUCTURAL_UPDATE,
-                        payload={
-                            "reason": vr.description or vr.explanation,
-                            "affected_fragments": [p.fragment_id for p in proposals if proposals],
-                            "hint": vr.hint or vr.reformulation_hint,
-                            "implicit_edges_to_add": [edge_dict] if edge_dict else [],
-                        },
-                        loop_turn=msg.loop_turn + 1,
-                    )
-                )
-                return
+        if report.structural_errors:
+            bits = [
+                (vr.description or vr.explanation or "").strip()
+                for vr in report.structural_errors[:8]
+            ]
+            bits = [b for b in bits if b]
+            rej_reason = (
+                "Structural issue detected in unsupported proposals; "
+                "BPMN input is not modified. "
+                + (" | ".join(bits)[:1900] if bits else "See validation report.")
+            )
+            self._emit_reject_proposal_batch(msg, rej_reason)
+            print(
+                "[Agent 3] Erreur(s) structurelle(s) — reject-proposal vers Agent 2 ; "
+                "graphe d'entrée inchangé."
+            )
+            return
 
         for vr in report.reformulate:
             if not vr.proposal:
@@ -312,6 +358,8 @@ class ConstraintValidator:
                 continue
             self._reformulate_sent_count[key] = self._reformulate_sent_count.get(key, 0) + 1
             if vr.proposal and self._on_send_agent2:
+                rreason = vr.reformulation_hint or vr.explanation or "Reformulation requested for unsupported proposals."
+                self._emit_reject_proposal_batch(msg, rreason)
                 self.send(
                     AgentMessage(
                         sender=self.AGENT_NAME,
@@ -322,6 +370,7 @@ class ConstraintValidator:
                             "pattern_type": vr.proposal.pattern_type,
                             "gateway_name": vr.proposal.gateway_name,
                             "fragment_id": vr.proposal.fragment_id,
+                            "utterance": "Please reformulate the proposal for this pattern with the given hint.",
                         },
                         loop_turn=msg.loop_turn,
                     )
@@ -329,6 +378,10 @@ class ConstraintValidator:
                 return
 
         print("[Agent 3] Emitting VALIDATION_DONE to Agent 4")
+        self._emit_accept_proposal_batch(
+            msg,
+            "Proposal batch accepted; proceeding to fragment-policy projection and semantic audit.",
+        )
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
@@ -392,6 +445,29 @@ class ConstraintValidator:
             )
             return
 
+        anchor = (msg.payload or {}).get("acl_failure_reply_target")
+        if anchor:
+            reason_bits = [f"{h.policy_uid}: {h.issue}" for h in hints[:10]]
+            reason_txt = ("; ".join(reason_bits))[:2000] or (
+                "Fragment policies failed semantic validation against the enriched graph."
+            )
+            self.send(
+                AgentMessage(
+                    sender=self.AGENT_NAME,
+                    recipient="agent4",
+                    msg_type=MessageType.SEMANTIC_VALIDATION_FAILURE,
+                    payload={
+                        "acl_in_reply_to": anchor,
+                        "action": "semantic-validation-failed",
+                        "reason": reason_txt,
+                        "utterance": "Semantic validation failed; issuing correction request next.",
+                        "fp_results": fp_results,
+                        "enriched_graph": enriched,
+                    },
+                    loop_turn=msg.loop_turn,
+                )
+            )
+
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
@@ -402,6 +478,7 @@ class ConstraintValidator:
                     "enriched_graph": enriched,
                     "semantic_hints": [asdict(h) for h in hints],
                     "loop_turn": msg.loop_turn + 1,
+                    "utterance": "Apply these semantic validation hints to the projected fragment policies.",
                 },
                 loop_turn=msg.loop_turn + 1,
             )
@@ -744,18 +821,3 @@ Respond ONLY with:
             self._normalize_unsupported_proposal(p)
             results.append(self._llm_judge_unsupported(p, enriched_graph))
         return ValidationReport(results=results)
-
-    def _extract_edge_from_hint(self, hint: str) -> Optional[dict]:
-        """Parse optional JSON edge description from a structural hint string."""
-        if not hint:
-            return None
-        try:
-            return json.loads(hint)
-        except (json.JSONDecodeError, ValueError):
-            pass
-        try:
-            start = hint.index("{")
-            end = hint.rindex("}") + 1
-            return json.loads(hint[start:end])
-        except (ValueError, json.JSONDecodeError):
-            return None

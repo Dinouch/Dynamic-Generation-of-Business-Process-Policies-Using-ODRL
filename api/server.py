@@ -35,6 +35,7 @@ load_dotenv(_SRC / ".env")
 from fastapi import File
 from fastapi import HTTPException
 from fastapi import FastAPI
+from fastapi import Query
 from fastapi import UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -45,6 +46,8 @@ from baseline.bpmn_parser import BPMNParser
 from baseline.semantic_fragmenter import (
     SemanticFragmenter,
     build_fragments_from_bp_model,
+    companion_fragments_enhanced_path,
+    save_fragments_enhanced_json,
     save_fragments_json,
 )
 from agents.policy_auditor import AuditReport
@@ -65,7 +68,7 @@ def _serialize_result(r: PipelineAsyncResult) -> dict[str, Any]:
         report_out = rep
     else:
         report_out = str(rep)
-    return {
+    out: dict[str, Any] = {
         "is_valid": r.is_valid,
         "status": r.status,
         "msg_type": r.msg_type,
@@ -73,7 +76,12 @@ def _serialize_result(r: PipelineAsyncResult) -> dict[str, Any]:
         "summary": r.summary or {},
         "manifest": r.manifest,
         "report_summary": report_out,
+        "scenario_id": getattr(r, "scenario_id", "") or "",
     }
+    oep = getattr(r, "odrl_export_paths", None)
+    if oep:
+        out["odrl_export_paths"] = oep
+    return out
 
 
 class StartRunBody(BaseModel):
@@ -115,7 +123,7 @@ def _parse_and_fragment_bpmn_bytes(
     llm_temperature: float,
     llm_seed: int,
 ) -> dict[str, Any]:
-    """Parse BPMN XML depuis des octets, fragmentation LLM, écriture JSON unique."""
+    """Parse BPMN XML depuis des octets, fragmentation LLM, écrit ``fragments`` + ``fragments_enhanced``."""
     import tempfile
 
     suf = file_suffix if file_suffix.lower() in (".bpmn", ".xml") else ".bpmn"
@@ -150,10 +158,13 @@ def _parse_and_fragment_bpmn_bytes(
         out_name = os.environ.get("FRAGMENT_EXPORT_FILENAME", _DEFAULT_FRAGMENTS_FILENAME)
         out_path = out_dir / out_name
         save_fragments_json(normalized, str(out_path))
+        enhanced_path = Path(companion_fragments_enhanced_path(str(out_path)))
+        save_fragments_enhanced_json(model, normalized, str(enhanced_path))
 
         return {
             "ok": True,
             "output_path": str(out_path.resolve()),
+            "enhanced_output_path": str(enhanced_path.resolve()),
             "fragment_count": len(normalized),
             "filename": out_name,
         }
@@ -194,7 +205,7 @@ def _process_scenario_upload_sync(
     llm_temperature: float,
     llm_seed: int,
 ) -> dict[str, Any]:
-    """Parse BPMN, fragmentation LLM, écrit ``scenarioN/`` avec bp_global.json, B2P.json, fragments.json."""
+    """Parse BPMN, fragmentation LLM, écrit ``scenarioN/`` avec bp_global.json, B2P.json, fragments.json, fragments_enhanced.json."""
     import tempfile
 
     _logger.info(
@@ -245,6 +256,11 @@ def _process_scenario_upload_sync(
             json.dump(policies, f, indent=2, ensure_ascii=False)
 
         save_fragments_json(fragments, str(scenario_dir / "fragments.json"))
+        save_fragments_enhanced_json(
+            model,
+            fragments,
+            str(scenario_dir / "fragments_enhanced.json"),
+        )
 
         _logger.info(
             "POST /scenario/process terminé — %s (%d fragments) → %s",
@@ -294,7 +310,6 @@ async def start_run(body: StartRunBody) -> dict[str, str]:
         try:
             await bridge.emit_log(f"Chargement du scénario « {body.scenario_id} »…")
             bp_model, fragments, b2p_policies = load_scenario(body.scenario_id, base_dir=base_dir)
-            os.environ["USE_ASYNC_PIPELINE"] = "true"
             await bridge.emit_log("Pipeline async démarré (HITL via API).")
 
             _logged_agent5 = False
@@ -403,6 +418,111 @@ async def list_scenarios() -> dict[str, Any]:
     return {"scenarios": out}
 
 
+def _scenario_id_ok(sid: str) -> bool:
+    return bool(re.fullmatch(r"scenario\d+", sid, re.IGNORECASE))
+
+
+def _odrl_output_root(scenario_id: str) -> Path:
+    """``output/{scenarioN}/odrl_fragment_policies/`` à la racine du projet (hors ``dataset``)."""
+    return (_ROOT / "output" / scenario_id / "odrl_fragment_policies").resolve()
+
+
+def _ui_category_from_stem(stem: str) -> str:
+    """
+    Catégorie affichage dérivée du préfixe du fichier exporté (voir ``PolicyProjectionAgent.export``).
+    Retourne : FPa | FPd-intra | FPd-inter | unsupported
+    """
+    s = stem.lower()
+    if s.startswith("fpa_"):
+        return "FPa"
+    if s.startswith("fpd_message_"):
+        return "FPd-inter"
+    if (
+        s.startswith("fpd_sequence_")
+        or s.startswith("fpd_xor_")
+        or s.startswith("fpd_and_")
+        or s.startswith("fpd_or_")
+    ):
+        return "FPd-intra"
+    if s.startswith("fpd_"):
+        return "unsupported"
+    return "unsupported"
+
+
+@app.get("/scenario/{scenario_id}/odrl-index")
+async def odrl_fragment_policies_index(scenario_id: str) -> dict[str, Any]:
+    """
+    Liste les exports JSON-LD par étape (``partial_template_only``, ``final_merged``),
+    par fragment, fichiers plats ; ``ui_category`` est déduit du nom de fichier.
+    """
+    if not _scenario_id_ok(scenario_id):
+        raise HTTPException(status_code=400, detail="Identifiant de scénario invalide.")
+    base = _odrl_output_root(scenario_id)
+    if not base.is_dir():
+        return {"scenario_id": scenario_id, "stages": []}
+    stages: list[dict[str, Any]] = []
+    for stage_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        frag_map: dict[str, Any] = {}
+        for frag in sorted(stage_dir.iterdir()):
+            if not frag.is_dir():
+                continue
+            fid = frag.name
+            files_meta: list[dict[str, str]] = []
+            for p in sorted(frag.glob("*.jsonld")):
+                rel = str(p.relative_to(stage_dir)).replace("\\", "/")
+                files_meta.append(
+                    {
+                        "relative": rel,
+                        "basename": p.name,
+                        "ui_category": _ui_category_from_stem(p.stem),
+                    }
+                )
+            if files_meta:
+                frag_map[fid] = files_meta
+        stages.append(
+            {
+                "name": stage_dir.name,
+                "path": str(stage_dir),
+                "fragments": frag_map,
+            }
+        )
+    return {"scenario_id": scenario_id, "stages": stages}
+
+
+@app.get("/scenario/{scenario_id}/odrl-file")
+async def odrl_fragment_policy_file(
+    scenario_id: str,
+    rel: str = Query(
+        ...,
+        description="Chemin relatif depuis odrl_fragment_policies/ (ex. final_merged/f1/FPa_0_act.jsonld).",
+    ),
+) -> dict[str, Any]:
+    if not _scenario_id_ok(scenario_id):
+        raise HTTPException(status_code=400, detail="Identifiant de scénario invalide.")
+    base = _odrl_output_root(scenario_id)
+    if not base.is_dir():
+        raise HTTPException(status_code=404, detail="Aucun export ODRL pour ce scénario.")
+    rp = Path(rel.strip())
+    if rp.is_absolute() or ".." in rp.parts:
+        raise HTTPException(status_code=400, detail="Chemin invalide.")
+    target = (base / rp).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail="Chemin hors du dossier autorisé.") from e
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Fichier introuvable.")
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=422, detail=f"JSON invalide : {e}") from e
+    return {
+        "path": str(target),
+        "relative": rel.replace("\\", "/"),
+        "data": data,
+    }
+
+
 @app.post("/scenario/process")
 async def scenario_process(
     bpmn: UploadFile = File(...),
@@ -412,7 +532,7 @@ async def scenario_process(
 ) -> dict[str, Any]:
     """
     BPMN + policies ODRL (JSON) : parsing, fragmentation LLM, création de ``src/dataset/scenarioN/``
-    avec ``bp_global.json``, ``B2P.json``, ``fragments.json``.
+    avec ``bp_global.json``, ``B2P.json``, ``fragments.json``, ``fragments_enhanced.json``.
     """
     _logger.info(
         "POST /scenario/process — fichiers reçus : bpmn=%r odrl=%r",
