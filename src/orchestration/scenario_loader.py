@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
 
@@ -44,3 +45,33 @@ def load_scenario(scenario_id: str, *, base_dir: str) -> Tuple[Dict[str, Any], L
         b2p_policies = json.load(f)
 
     return bp_model, fragments, b2p_policies
+
+
+def discover_scenarios(
+    base_dir: str,
+    *,
+    pattern: str = r"^scenario\d{3}$",
+) -> List[str]:
+    """
+    Liste les identifiants de scénarios présents sous ``src/dataset/`` dont le nom
+    correspond à l'expression régulière (par défaut ``scenario001`` … ``scenario999`` sur 3 chiffres).
+
+    Parameters
+    ----------
+    base_dir
+        Racine du projet (dossier contenant ``src/dataset``).
+    pattern
+        Regex appliquée au nom du dossier uniquement.
+    """
+    ds = os.path.join(base_dir, "src", "dataset")
+    if not os.path.isdir(ds):
+        return []
+    rx = re.compile(pattern)
+    out: List[str] = []
+    for name in sorted(os.listdir(ds)):
+        path = os.path.join(ds, name)
+        if not os.path.isdir(path):
+            continue
+        if rx.match(name):
+            out.append(name)
+    return out

@@ -8,11 +8,13 @@ pyshacl
 numpy
 lxml
 requests
+httpx
 beautifulsoup4
 networkx
 pytest
 tqdm
 seaborn
+bert-score
 fastapi
 python-multipart
 uvicorn[standard]

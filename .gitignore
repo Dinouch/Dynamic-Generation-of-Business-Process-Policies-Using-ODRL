@@ -38,6 +38,9 @@ ENV/
 # Exports ODRL générés par le pipeline (hors dataset/)
 output/
 
+# Évaluation du système (expérimentations locales, non versionnées)
+system_evaluation/
+
 # Dataset files 
 datasets/*/
 datasets/*
