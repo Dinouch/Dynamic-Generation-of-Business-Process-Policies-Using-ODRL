@@ -26,10 +26,10 @@ Sortie : EnrichedGraph contenant
       from .structural_analyzer import AgentMessage, MessageType
 
   Méthodes multi-agent de StructuralAnalyzer :
-      register_send_callback(fn)  — connecte Agent 1 → Agent 3
+      register_send_callback(fn)  — connecte la sortie (bus / Agent 3)
       send(msg)                   — émet un AgentMessage
       receive(msg)                — accepte ANALYZE_GRAPH_TASK (orchestrateur async)
-      analyze_and_send()          — analyze() + émet GRAPH_READY
+      analyze_and_send()          — analyze() + GRAPH_READY (agent3) + CFP (exception handling) si besoin
 
   Le graphe BPMN d'entrée n'est pas modifié en cours de pipeline : les problèmes
   structurels signalés par l'Agent 3 donnent lieu à un rejet / rapport, pas à une
@@ -73,17 +73,18 @@ class MessageType(Enum):
 
     Flux principal :
         Agent 1 ──GRAPH_READY──────────► Agent 3
-        Agent 3 ──GRAPH_READY──────────► Agent 2   (si patterns non couverts)
-        Agent 2 ──UNSUPPORTED_PROPOSALS──► Agent 3   (ACL PROPOSE)
-        Agent 2 ──REFORMULATED_PROPOSALS─► Agent 3   (ACL INFORM après REFORMULATE+agree)
-        Agent 3 ──REFORMULATE──────────► Agent 2   (boucle courte)
+        Agent 1 ──CFP_UNSUPPORTED──────► Exception handling agent   (si patterns non couverts, après GRAPH_READY)
+        Exception handling agent ──UNSUPPORTED_PROPOSALS──► Agent 3   (ACL PROPOSE)
+        Exception handling agent ──REFORMULATED_PROPOSALS─► Agent 3   (ACL INFORM après REFORMULATE+agree)
+        Agent 3 ──REFORMULATE──────────► Exception handling agent   (boucle courte)
         Agent 3 ──VALIDATION_DONE──────► Agent 4
-        Agent 4 ──POLICIES_READY───────► Agent 3   (validation sémantique)
+        Agent 4 ──SYNTAX_AUDIT_REQUEST──► Agent 5   (syntaxe + cohérence globale)
+        Agent 5 ──ODRL_SYNTAX_FAILURE──► Agent 4 → boucle corrections A4↔A5
+        Agent 5 ──ODRL_VALID (passe 1)──► Agent 4 → POLICIES_READY → Agent 3
         Agent 3 ──SEMANTIC_VALIDATION_FAILURE──► Agent 4  (ACL FAILURE, puis)
         Agent 3 ──SEMANTIC_CORRECTION──► Agent 4
-        Agent 3 ──SEMANTIC_VALIDATED───► Agent 4 → POLICIES_READY → Agent 5
-        Agent 5 ──SYNTAX_CORRECTION────► Agent 4   (boucle syntaxique)
-        Agent 5 ──ODRL_VALID / ODRL_SYNTAX_ERROR──► pipeline
+        Agent 3 ──SEMANTIC_VALIDATED───► Agent 4 → SYNTAX_AUDIT_REQUEST → Agent 5 (passe 2)
+        Agent 5 ──ODRL_VALID / ODRL_SYNTAX_ERROR──► Agent 4 → pipeline
     """
     GRAPH_READY        = "graph_ready"
     UNSUPPORTED_PROPOSALS = "unsupported_proposals"
@@ -115,7 +116,7 @@ class AgentMessage:
 
     Champs :
         sender    — AGENT_NAME de l'émetteur  (ex: "agent1")
-        recipient — AGENT_NAME du destinataire (ex: "agent2")
+        recipient — AGENT_NAME du destinataire (ex: "exception_handling_agent")
         msg_type  — type de message (MessageType)
         payload   — données spécifiques au message
         timestamp — ISO généré automatiquement à la création
@@ -167,7 +168,7 @@ class StructuralPattern:
 class UnsupportedPattern:
     """
     BPMN structural pattern not covered by deterministic Agent 4 templates.
-    Routed to Agent 2 for LLM formulation.
+    Routed to the exception handling agent for LLM formulation.
     """
 
     pattern_type: str
@@ -407,6 +408,38 @@ class StructuralAnalyzer:
                     ),
                     "utterance": "Structural analysis complete; enriched graph is ready.",
                 },
+                loop_turn=msg.loop_turn,
+            )
+        )
+        self._emit_cfp_if_unsupported(enriched_graph, loop_turn=msg.loop_turn)
+
+    def _emit_cfp_if_unsupported(self, enriched_graph: EnrichedGraph, *, loop_turn: int) -> None:
+        """
+        Appel d'offres (CFP) vers l'agent 2 si des patterns BPMN ne sont pas couverts par les templates.
+        Déterministe — aucun LLM : l'agent 1 a déjà rempli ``unsupported_patterns`` lors de l'analyse.
+        """
+        unsupported = list(getattr(enriched_graph, "unsupported_patterns", []) or [])
+        if not unsupported:
+            return
+        print(
+            f"[Agent 1] {len(unsupported)} pattern(s) non couvert(s) — CFP vers l'exception handling agent "
+            "(formulation unsupported)"
+        )
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="exception_handling_agent",
+                msg_type=MessageType.CFP_UNSUPPORTED,
+                payload={
+                    "enriched_graph": enriched_graph,
+                    "utterance": (
+                        "Call for proposals: the following structural patterns are not covered by "
+                        "deterministic templates — propose ODRL fragment-policy hints with "
+                        "conditions and justification."
+                    ),
+                    "unsupported_pattern_count": len(unsupported),
+                },
+                loop_turn=loop_turn,
             )
         )
 
@@ -433,6 +466,7 @@ class StructuralAnalyzer:
                 ),
             },
         ))
+        self._emit_cfp_if_unsupported(enriched_graph, loop_turn=0)
 
     # ─────────────────────────────────────────
     #  Point d'entrée principal
@@ -729,7 +763,7 @@ class StructuralAnalyzer:
     ) -> None:
         """
         Append a structural pattern and, if its type is not in COVERED_PATTERNS,
-        record an UnsupportedPattern for downstream Agent 2.
+        record an UnsupportedPattern for the exception handling agent downstream.
         """
         patterns.append(pattern)
         if pattern.pattern_type not in COVERED_PATTERNS:
@@ -781,7 +815,7 @@ class StructuralAnalyzer:
         patterns
             All detected StructuralPattern records.
         unsupported
-            Subset not covered by ``pipeline_registry.COVERED_PATTERNS`` (for Agent 2).
+            Subset not covered by ``pipeline_registry.COVERED_PATTERNS`` (for the exception handling agent).
         """
         patterns: list[StructuralPattern] = []
         unsupported: list[UnsupportedPattern] = []

@@ -173,6 +173,24 @@ def agent_message_to_acl(
     return ACLEnvelope(**env_kw)
 
 
+def _coerce_performative(raw: Any) -> ACLPerformative:
+    """
+    Garantit un ``ACLPerformative`` : Pydantic / JSON peut livrer des chaînes
+    (ex. ``\"agree\"``) et ``perf == ACLPerformative.AGREE`` serait faux sans ceci.
+    """
+    if isinstance(raw, ACLPerformative):
+        return raw
+    s = (str(raw) if raw is not None else "").strip().lower()
+    if s == "agree":
+        return ACLPerformative.AGREE
+    if s == "refuse":
+        return ACLPerformative.REFUSE
+    try:
+        return ACLPerformative(str(raw)) if raw is not None else ACLPerformative.INFORM
+    except (ValueError, TypeError):
+        return ACLPerformative.INFORM
+
+
 def acl_to_agent_message(env: ACLEnvelope) -> AgentMessage:
     """Map an ACL envelope to the legacy agent view (``AgentMessage``)."""
     payload = dict(env.content or {})
@@ -180,7 +198,7 @@ def acl_to_agent_message(env: ACLEnvelope) -> AgentMessage:
     msg_type_val = str(payload.pop("msg_type", "") or "")
     status = payload.pop("status", None)
 
-    perf = env.performative
+    perf = _coerce_performative(getattr(env, "performative", None))
     ont = env.ontology
 
     # REQUEST from pipeline → structural analysis task
@@ -254,6 +272,11 @@ def acl_to_agent_message(env: ACLEnvelope) -> AgentMessage:
             mtype = MessageType.ODRL_VALID
     elif perf == ACLPerformative.FAILURE and ont == "odrl-syntax-audit":
         mtype = MessageType.ODRL_SYNTAX_FAILURE
+    elif perf == ACLPerformative.AGREE:
+        # FIPA AGREE (réponse à REQUEST dont syntax_correction) — sinon repli fautif → graph_ready
+        mtype = MessageType.DELEGATION_AGREE
+    elif perf == ACLPerformative.REFUSE:
+        mtype = MessageType.DELEGATION_REFUSE
     elif msg_type_val:
         try:
             mtype = MessageType(msg_type_val)

@@ -2,8 +2,8 @@
   "activities": [
     {
       "name": "check-for-completeness",
-      "start": true,
-      "role": "staff"
+      "role": "staff",
+      "start": true
     },
     {
       "name": "ask-for-more-information",
@@ -27,7 +27,8 @@
     },
     {
       "name": "notify-rejection-by-email",
-      "role": "staff"
+      "role": "staff",
+      "end": true
     },
     {
       "name": "notify-acceptance-by-email",
@@ -43,8 +44,8 @@
     },
     {
       "name": "request-credit-card",
-      "end": true,
-      "role": "staff"
+      "role": "staff",
+      "end": true
     }
   ],
   "gateways": [
@@ -61,7 +62,7 @@
       "type": "XOR"
     },
     {
-      "name": "documentation-followup",
+      "name": "documentation-follow-up",
       "type": "EVENT_BASED_EXCLUSIVE"
     }
   ],
@@ -69,7 +70,8 @@
     {
       "from": "check-for-completeness",
       "to": "application-completeness",
-      "type": "sequence"
+      "type": "sequence",
+      "gateway": "application-completeness"
     },
     {
       "from": "application-completeness",
@@ -93,7 +95,8 @@
     {
       "from": "check-credit-amount",
       "to": "credit-amount",
-      "type": "sequence"
+      "type": "sequence",
+      "gateway": "credit-amount"
     },
     {
       "from": "credit-amount",
@@ -122,7 +125,8 @@
     {
       "from": "make-decision",
       "to": "decision-outcome",
-      "type": "sequence"
+      "type": "sequence",
+      "gateway": "decision-outcome"
     },
     {
       "from": "decision-outcome",
@@ -140,22 +144,9 @@
     },
     {
       "from": "notify-acceptance-by-email",
-      "to": "documentation-followup",
-      "type": "sequence"
-    },
-    {
-      "from": "documentation-followup",
-      "to": "receive-missing-documents",
+      "to": "documentation-follow-up",
       "type": "sequence",
-      "gateway": "documentation-followup",
-      "condition": "documents-received"
-    },
-    {
-      "from": "documentation-followup",
-      "to": "handle-documentation-deadline",
-      "type": "sequence",
-      "gateway": "documentation-followup",
-      "condition": "documentation-deadline"
+      "gateway": "documentation-follow-up"
     },
     {
       "from": "receive-missing-documents",
@@ -166,6 +157,21 @@
       "from": "handle-documentation-deadline",
       "to": "request-credit-card",
       "type": "sequence"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "handle-documentation-deadline",
+      "type": "sequence",
+      "gateway": "documentation-follow-up",
+      "condition": "deadline"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "receive-missing-documents",
+      "type": "sequence",
+      "gateway": "documentation-follow-up",
+      "condition": "documents-received"
     }
-  ]
+  ],
+  "source_file": "bench_bpmn_bl4al2ef.bpmn"
 }

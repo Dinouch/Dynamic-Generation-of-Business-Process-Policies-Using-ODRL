@@ -1,0 +1,216 @@
+[
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2001",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/assessProjectProfitabilityRule",
+        "target": "http://example.com/asset/assess-project-profitability",
+        "assigner": "http://example.com/MetalWorks:org:MW",
+        "assignee": "http://example.com/staff/MetalWorks:salesEngineer",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "@type": "odrl:LogicalConstraint",
+                "odrl:and": [
+                  {
+                    "leftOperand": "elapsedTime",
+                    "operator": "lteq",
+                    "rightOperand": {
+                      "@value": "PT2H",
+                      "@type": "xsd:duration"
+                    }
+                  },
+                  {
+                    "leftOperand": "spatial",
+                    "operator": "eq",
+                    "rightOperand": "http://example.com/location/metalworks-hq"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2002",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/prepareProductionPlanRule",
+        "target": "http://example.com/asset/prepare-production-plan",
+        "assigner": "http://example.com/MetalWorks:org:MW",
+        "assignee": "http://example.com/staff/MetalWorks:salesEngineer",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "@type": "odrl:LogicalConstraint",
+                "odrl:and": [
+                  {
+                    "leftOperand": "elapsedTime",
+                    "operator": "lteq",
+                    "rightOperand": {
+                      "@value": "PT3H",
+                      "@type": "xsd:duration"
+                    }
+                  },
+                  {
+                    "@type": "odrl:LogicalConstraint",
+                    "odrl:and": [
+                      {
+                        "leftOperand": "dateTime",
+                        "operator": "gteq",
+                        "rightOperand": {
+                          "@value": "T08:00:00",
+                          "@type": "xsd:time"
+                        }
+                      },
+                      {
+                        "leftOperand": "dateTime",
+                        "operator": "lteq",
+                        "rightOperand": {
+                          "@value": "T17:00:00",
+                          "@type": "xsd:time"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "leftOperand": "systemDevice",
+                    "operator": "eq",
+                    "rightOperand": "http://example.com/system/erp-metalworks"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2003",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/estimateMaterialCostsRule",
+        "target": "http://example.com/asset/estimate-material-costs",
+        "assigner": "http://example.com/MetalWorks:org:MW",
+        "assignee": "http://example.com/staff/MetalWorks:salesEngineer",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "@type": "odrl:LogicalConstraint",
+                "odrl:and": [
+                  {
+                    "leftOperand": "elapsedTime",
+                    "operator": "lteq",
+                    "rightOperand": {
+                      "@value": "PT2H",
+                      "@type": "xsd:duration"
+                    }
+                  },
+                  {
+                    "leftOperand": "systemDevice",
+                    "operator": "eq",
+                    "rightOperand": "http://example.com/system/erp-metalworks"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2004",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/estimateLaborCostsRule",
+        "target": "http://example.com/asset/estimate-labor-costs",
+        "assigner": "http://example.com/MetalWorks:org:MW",
+        "assignee": "http://example.com/staff/MetalWorks:productionEngineer",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "@type": "odrl:LogicalConstraint",
+                "odrl:and": [
+                  {
+                    "leftOperand": "elapsedTime",
+                    "operator": "lteq",
+                    "rightOperand": {
+                      "@value": "PT1H",
+                      "@type": "xsd:duration"
+                    }
+                  },
+                  {
+                    "leftOperand": "spatial",
+                    "operator": "eq",
+                    "rightOperand": "http://example.com/location/metalworks-production-floor"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2005",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/prepareAndSubmitQuoteRule",
+        "target": "http://example.com/asset/prepare-and-submit-quote",
+        "assigner": "http://example.com/MetalWorks:org:MW",
+        "assignee": "http://example.com/staff/MetalWorks:salesEngineer",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "@type": "odrl:LogicalConstraint",
+                "odrl:and": [
+                  {
+                    "leftOperand": "elapsedTime",
+                    "operator": "lteq",
+                    "rightOperand": {
+                      "@value": "PT1H",
+                      "@type": "xsd:duration"
+                    }
+                  },
+                  {
+                    "leftOperand": "systemDevice",
+                    "operator": "isAnyOf",
+                    "rightOperand": [
+                      "http://example.com/system/erp-metalworks",
+                      "http://example.com/system/crm-metalworks"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

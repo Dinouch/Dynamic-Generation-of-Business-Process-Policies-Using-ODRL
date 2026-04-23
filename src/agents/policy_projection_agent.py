@@ -12,14 +12,15 @@ Corrections v2 :
       et écrire un fichier .jsonld par policy
 
 Couche multi-agent :
-    - receive()  : accepte VALIDATION_DONE et SYNTAX_CORRECTION
-    - send()     : émet POLICIES_READY vers Agent 5
-    - Boucle syntaxique (max MAX_SYNTAX_LOOPS, géré avec Agent 5) :
-        ODRL_SYNTAX_FAILURE (A5) → REQUEST SYNTAX_CORRECTION (A4→A5) → AGREE (A5) →
-        corrections déterministes → POLICIES_READY ré-émis
+    - receive()  : accepte VALIDATION_DONE, SEMANTIC_*, ODRL_SYNTAX_FAILURE, ODRL_VALID
+    - Flux      : SYNTAX_AUDIT_REQUEST (A5) → ODRL_VALID → POLICIES_READY (A3, sémantique)
+                  → SEMANTIC_VALIDATED → SYNTAX_AUDIT_REQUEST (A5, passe finale)
+    - Boucle syntaxique (MAX_SYNTAX_LOOPS côté A5) : ODRL_SYNTAX_FAILURE → SYNTAX_CORRECTION
+      (A4→A5) → AGREE (A5) → corrections → POLICIES_READY vers A5
 """
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -38,7 +39,7 @@ from .structural_analyzer import (
     MessageType,
 )
 from .Agent_3.constraint_validator import ValidationReport
-from .unsupported_case_formulator import UnsupportedCaseProposal
+from .exception_handling_agent import UnsupportedCaseProposal
 
 
 # ─────────────────────────────────────────────
@@ -86,7 +87,7 @@ ODRL_ACTION_ENABLE: dict[str, str] = {"@id": "odrl:enable"}
 
 def _coerce_odrl_action_from_hint(action: object) -> object:
     """
-    Normalise le hint ``action`` d'Agent 2 vers une valeur compatible pyld/SHACL.
+    Normalise le hint ``action`` de l'exception handling agent vers une valeur compatible pyld/SHACL.
 
     Les sorties LLM du type ``odrl:trigger (re-trigger...)`` ne sont pas des IRIs ;
     on retombe sur ``odrl:enable``.
@@ -154,13 +155,14 @@ class PolicyProjectionAgent:
     Mode pipeline :
         Instancier avec enriched_graph=None, validation_report=None.
         Les données arrivent via receive(VALIDATION_DONE).
-        Enregistrer le callback vers Agent 5 avant le démarrage.
+        Enregistrer le callback bus (A3 / A5 / pipeline) avant le démarrage.
+
+    Enchaînement :
+        Après projection : audit syntaxe (A5), puis sémantique (A3), puis audit syntaxe final (A5).
 
     Boucle syntaxique :
-        Agent 5 peut renvoyer SYNTAX_CORRECTION.
-        Agent 4 applique des corrections déterministes (pas de LLM)
-        et ré-émet POLICIES_READY avec loop_turn+1.
-        Le compteur MAX_SYNTAX_LOOPS est géré par Agent 5.
+        Agent 5 émet ODRL_SYNTAX_FAILURE ; Agent 4 envoie SYNTAX_CORRECTION, applique des
+        patches déterministes, puis ré-émet POLICIES_READY vers A5. MAX_SYNTAX_LOOPS est géré par A5.
     """
 
     AGENT_NAME = "agent4"
@@ -169,7 +171,9 @@ class PolicyProjectionAgent:
 
     _UNSUPPORTED_SYSTEM = (
         "You are an ODRL 2.2 expert. You output only valid JSON (no markdown fences). "
-        "The JSON must include keys problem_interpretation, business_intent, odrl_policy."
+        "The JSON must include keys problem_interpretation, business_intent, odrl_policy. "
+        "Use strict ODRL vocabulary from https://www.w3.org/TR/odrl-vocab/ only. "
+        "Do not use profile extensions."
     )
 
     def __init__(
@@ -226,6 +230,10 @@ class PolicyProjectionAgent:
         self._semantic_agree_anchor: Optional[str] = None
         # After ODRL FAILURE from Agent 5: payload until Agent 5 AGREE on our SYNTAX_CORRECTION request.
         self._pending_syntax_correction: Optional[dict[str, Any]] = None
+        # "pre_semantic" | "post_semantic" — which syntax pass ODRL_VALID completes (None = terminal forward).
+        self._odrl_syntax_stage: Optional[str] = None
+        # Optional pipeline status (e.g. partial_template_only) threaded into A5 payloads.
+        self._pipeline_content_status: Optional[str] = None
 
     # ═════════════════════════════════════════
     #  COUCHE MULTI-AGENT
@@ -248,14 +256,34 @@ class PolicyProjectionAgent:
         Point d'entrée des messages entrants.
 
         Messages acceptés :
-          - VALIDATION_DONE     : rapport depuis Agent 3 → génère policies → POLICIES_READY vers Agent 3
+          - VALIDATION_DONE     : rapport Agent 3 → projection → SYNTAX_AUDIT_REQUEST vers Agent 5
           - SEMANTIC_CORRECTION : correctifs sémantiques depuis Agent 3
-          - SEMANTIC_VALIDATED  : policies validées sémantiquement → POLICIES_READY vers Agent 5
+          - SEMANTIC_VALIDATED  : après sémantique → SYNTAX_AUDIT_REQUEST vers Agent 5 (passe finale)
+          - ODRL_VALID / ODRL_SYNTAX_ERROR : depuis Agent 5 — routage sémantique ou fin pipeline
           - SYNTAX_CORRECTION   : corrections depuis Agent 5 (syntaxe)
 
         Tout autre type est ignoré avec un warning.
         """
         print(f"[Agent 4] ◄ RECEIVE {msg}")
+        if (
+            msg.sender == "agent5"
+            and msg.msg_type == MessageType.GRAPH_READY
+            and (msg.payload or {}).get("_acl_ontology") == "odrl-syntax-audit"
+        ):
+            # Si l'adaptateur ACL a encore mappé un FIPA « agree » en graph_ready, on rattrape.
+            print(
+                "[Agent 4][INFO] Rattrapage : graph_ready + odrl-syntax-audit depuis Agent 5 → DELEGATION_AGREE."
+            )
+            self.receive(
+                AgentMessage(
+                    sender=msg.sender,
+                    recipient=msg.recipient,
+                    msg_type=MessageType.DELEGATION_AGREE,
+                    payload=dict(msg.payload or {}),
+                    loop_turn=msg.loop_turn,
+                )
+            )
+            return
         if msg.msg_type == MessageType.DELEGATION_AGREE:
             if (
                 msg.sender == "agent5"
@@ -278,6 +306,7 @@ class PolicyProjectionAgent:
             validation_report = msg.payload["validation_report"]
             enriched_graph = msg.payload["enriched_graph"]
             self._last_enriched_graph = enriched_graph
+            self._pipeline_content_status = (msg.payload or {}).get("status")
             self._project_and_send(enriched_graph, validation_report, loop_turn=msg.loop_turn)
 
         elif msg.msg_type == MessageType.SEMANTIC_CORRECTION:
@@ -327,6 +356,16 @@ class PolicyProjectionAgent:
             )
 
         elif msg.msg_type in (MessageType.ODRL_VALID, MessageType.ODRL_SYNTAX_ERROR):
+            if self._odrl_syntax_stage == "pre_semantic":
+                if msg.msg_type == MessageType.ODRL_SYNTAX_ERROR:
+                    self._odrl_syntax_stage = None
+                    self._forward_final_audit_to_pipeline(msg)
+                    return
+                self._odrl_syntax_stage = None
+                self._send_policies_ready_for_semantic(loop_turn=msg.loop_turn)
+                return
+            if self._odrl_syntax_stage == "post_semantic":
+                self._odrl_syntax_stage = None
             self._forward_final_audit_to_pipeline(msg)
 
         elif msg.msg_type == MessageType.SEMANTIC_VALIDATION_FAILURE:
@@ -382,18 +421,44 @@ class PolicyProjectionAgent:
         loop_turn:         int,
     ) -> None:
         """
-        Appelle project() pour générer les Fragment Policies,
-        stocke le résultat et émet POLICIES_READY vers Agent 3 (validation sémantique).
+        Génère les Fragment Policies puis lance l'audit syntaxique (Agent 5) avant la sémantique.
         """
         fp_results = self.project(enriched_graph, validation_report)
         self._last_fp_results = fp_results
+        self._odrl_syntax_stage = "pre_semantic"
+        self._emit_syntax_audit_request(loop_turn)
 
+    def _emit_syntax_audit_request(self, loop_turn: int) -> None:
+        """Demande d'audit ODRL (syntaxe + cohérence globale) vers Agent 5."""
         pl: dict[str, Any] = {
-            "fp_results": fp_results,
-            "enriched_graph": enriched_graph,
+            "fp_results": self._last_fp_results,
+            "enriched_graph": self._last_enriched_graph,
+            "utterance": (
+                "Validate ODRL syntax and global coherence for these projected fragment policies."
+            ),
+        }
+        if self._pipeline_content_status:
+            pl["status"] = self._pipeline_content_status
+        self.send(
+            AgentMessage(
+                sender=self.AGENT_NAME,
+                recipient="agent5",
+                msg_type=MessageType.SYNTAX_AUDIT_REQUEST,
+                payload=pl,
+                loop_turn=loop_turn,
+            )
+        )
+
+    def _send_policies_ready_for_semantic(self, loop_turn: int) -> None:
+        """Après une première passe syntaxique OK — validation sémantique (Agent 3)."""
+        pl: dict[str, Any] = {
+            "fp_results": self._last_fp_results,
+            "enriched_graph": self._last_enriched_graph,
         }
         if self._semantic_agree_anchor:
             pl["acl_failure_reply_target"] = self._semantic_agree_anchor
+        if self._pipeline_content_status:
+            pl["status"] = self._pipeline_content_status
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
@@ -594,12 +659,8 @@ class PolicyProjectionAgent:
 
     def _handle_semantic_validated(self, msg: AgentMessage) -> None:
         """
-        Forward semantically validated policies to Agent 5.
-
-        Parameters
-        ----------
-        msg
-            Payload includes ``fp_results`` and ``enriched_graph``.
+        Après validation sémantique — repasse syntaxe / cohérence (Agent 5) pour prendre en
+        compte d'éventuelles modifications structurelles des correctifs sémantiques.
         """
         fp_results = msg.payload.get("fp_results")
         if fp_results is not None:
@@ -607,20 +668,12 @@ class PolicyProjectionAgent:
         eg = msg.payload.get("enriched_graph")
         if eg is not None:
             self._last_enriched_graph = eg
+        status = msg.payload.get("status")
+        if status:
+            self._pipeline_content_status = status
 
-        self.send(
-            AgentMessage(
-                sender=self.AGENT_NAME,
-                recipient="agent5",
-                msg_type=MessageType.SYNTAX_AUDIT_REQUEST,
-                payload={
-                    "fp_results": self._last_fp_results,
-                    "enriched_graph": self._last_enriched_graph,
-                    "utterance": "Validate ODRL syntax and global coherence for these projected fragment policies.",
-                },
-                loop_turn=msg.loop_turn,
-            )
-        )
+        self._odrl_syntax_stage = "post_semantic"
+        self._emit_syntax_audit_request(msg.loop_turn)
 
     def _find_policy_by_uid(self, policy_uid: str) -> Optional[dict]:
         """Locate a policy dict by its ``uid`` across all fragment results."""
@@ -757,7 +810,7 @@ class PolicyProjectionAgent:
         user_prompt = f"""You assist in BPMN-to-ODRL translation for a validated unsupported pattern.
 
 Work through these steps internally, then output JSON only:
-1) INTERPRET the structural problem (cycles, gateways, activities, fragments, hints from Agent 2).
+1) INTERPRET the structural problem (cycles, gateways, activities, fragments, hints from the exception handling agent).
 2) DEDUCE a clear business intent (one or two sentences) that a sensible ODRL policy should express.
 3) GENERATE one ODRL 2.2 JSON-LD policy object in field "odrl_policy".
 
@@ -769,8 +822,9 @@ Requirements for "odrl_policy":
 - "@type": "Set" or "Agreement"
 - "uid": a full IRI under {BASE_URI}/policy:...
 - Include exactly one of permission, prohibition, obligation matching requested_rule_type "{proposal.odrl_rule_type}"
-- Each rule: "uid" (IRI), "target" (IRI asset), "action" as {{"@id": "odrl:enable"}} or another valid odrl action IRI
+- Each rule: "uid" (IRI), "target" (IRI asset), "action" must be a strict ODRL vocabulary action (no custom action, no profile extension)
 - Prefer concrete assets derived from activity/gateway names; avoid nonsense policies — if the pattern is incoherent, still emit a minimal prohibition or obligation that documents "no valid operation" rather than fake permissions.
+- Never set "profile" in output policies.
 
 Respond with JSON only:
 {{
@@ -1088,16 +1142,20 @@ Respond with JSON only:
                 )
                 activity = (
                     policy.get("_activity")
-                    or "_".join(policy.get("_activities", [])[:1])
+                    or "_".join(policy.get("_activities", [])[:2])  # message flow: from+to
                     or policy.get("_gateway_name", "policy")
                 )
-                filename = f"{ptype}_{subtype}_{activity.replace('-', '_')}.jsonld"
+                uid = str(odrl.get("uid") or odrl.get("@id") or f"idx_{i}")
+                uid_short = hashlib.sha1(uid.encode("utf-8")).hexdigest()[:8]
+                filename = (
+                    f"{ptype}_{subtype}_{activity.replace('-', '_')}_{uid_short}.jsonld"
+                )
                 filepath = os.path.join(frag_dir, filename)
-
+                # Garder une sécurité en cas de collision cryptographique (très improbable).
                 counter = 1
                 base_path = filepath
                 while os.path.exists(filepath):
-                    filepath = base_path.replace(".jsonld", f"_{counter}.jsonld")
+                    filepath = base_path.replace(".jsonld", f"__{counter}.jsonld")
                     counter += 1
 
                 with open(filepath, "w", encoding="utf-8") as f:
@@ -1125,18 +1183,12 @@ Respond with JSON only:
 
             b2p = None
             if mapping.b2p_policy_ids:
-                b2p = next(
-                    (p for p in self.enriched_graph.raw_b2p
-                     if p.get("uid") in mapping.b2p_policy_ids), None
-                )
+                b2p = self._pick_best_b2p_for_activity(act, mapping.b2p_policy_ids)
 
             if b2p:
-                for rule_type in ("permission", "prohibition", "obligation"):
-                    rules = b2p.get(rule_type, [])
-                    if rules and rules[0].get("uid"):
-                        self._activity_rule_index[act]   = rules[0]["uid"]
-                        self._activity_policy_index[act] = b2p.get("uid", "")
-                        break
+                rid = self._pick_main_rule_id_for_activity(b2p, act)
+                self._activity_rule_index[act] = rid
+                self._activity_policy_index[act] = b2p.get("uid", "")
             else:
                 self._activity_rule_index[act]   = uri_rule(f"rule_{act.replace('-','_')}")
                 self._activity_policy_index[act] = uri_policy(f"FPa_{act.replace('-','_')}")
@@ -1153,10 +1205,7 @@ Respond with JSON only:
         policy_uid = uri_policy(f"FPa_{activity_name.replace('-','_')}_{new_uid()}")
 
         if mapping and mapping.b2p_policy_ids:
-            b2p = next(
-                (p for p in self.enriched_graph.raw_b2p
-                 if p.get("uid") in mapping.b2p_policy_ids), None
-            )
+            b2p = self._pick_best_b2p_for_activity(activity_name, mapping.b2p_policy_ids)
             if b2p:
                 fpa = {
                     "@context":     "http://www.w3.org/ns/odrl.jsonld",
@@ -1198,6 +1247,75 @@ Respond with JSON only:
             rules = fpa.get(rule_type, [])
             if rules and isinstance(rules, list) and rules[0].get("uid"):
                 return rules[0]["uid"]
+        return uri_rule(f"rule_{activity_name.replace('-','_')}")
+
+    def _pick_best_b2p_for_activity(
+        self,
+        activity_name: str,
+        candidate_policy_uids: list[str],
+    ) -> Optional[dict]:
+        """
+        Choisit la policy B2P la plus pertinente pour une activité.
+        Priorité:
+        1) une règle dont target contient explicitement l'activité (slug)
+        2) fallback: première policy candidate
+        """
+        if not candidate_policy_uids:
+            return None
+
+        candidates = [
+            p for p in self.enriched_graph.raw_b2p
+            if p.get("uid") in candidate_policy_uids
+        ]
+        if not candidates:
+            return None
+
+        act_slug = activity_name.replace("_", "-").lower()
+        for p in candidates:
+            if self._policy_targets_activity(p, act_slug):
+                return p
+        return candidates[0]
+
+    def _policy_targets_activity(self, b2p_policy: dict, act_slug: str) -> bool:
+        for rule_type in ("permission", "prohibition", "obligation"):
+            rules = b2p_policy.get(rule_type, [])
+            seq = rules if isinstance(rules, list) else [rules]
+            for r in seq:
+                if not isinstance(r, dict):
+                    continue
+                tgt = r.get("target")
+                if isinstance(tgt, str) and act_slug in tgt.lower().replace("_", "-"):
+                    return True
+                if isinstance(tgt, dict):
+                    tid = tgt.get("@id")
+                    if isinstance(tid, str) and act_slug in tid.lower().replace("_", "-"):
+                        return True
+        return False
+
+    def _pick_main_rule_id_for_activity(self, b2p_policy: dict, activity_name: str) -> str:
+        act_slug = activity_name.replace("_", "-").lower()
+        for rule_type in ("permission", "prohibition", "obligation"):
+            rules = b2p_policy.get(rule_type, [])
+            seq = rules if isinstance(rules, list) else [rules]
+            # D'abord règle ciblant explicitement l'activité
+            for r in seq:
+                if not isinstance(r, dict):
+                    continue
+                tgt = r.get("target")
+                uid = r.get("uid")
+                if not uid:
+                    continue
+                tgt_s = ""
+                if isinstance(tgt, str):
+                    tgt_s = tgt
+                elif isinstance(tgt, dict):
+                    tgt_s = str(tgt.get("@id") or "")
+                if act_slug and act_slug in tgt_s.lower().replace("_", "-"):
+                    return uid
+            # Fallback sur la première uid disponible
+            for r in seq:
+                if isinstance(r, dict) and r.get("uid"):
+                    return r["uid"]
         return uri_rule(f"rule_{activity_name.replace('-','_')}")
 
     # ─────────────────────────────────────────

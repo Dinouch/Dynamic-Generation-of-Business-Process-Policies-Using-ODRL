@@ -20,6 +20,70 @@ BASE_URI = "http://example.com"
 
 RULE_TYPES = ("permission", "prohibition", "obligation")
 
+# Strict ODRL vocabulary checks (W3C ODRL Vocabulary & Expression 2.2).
+# Intentionally disallow profile extensions in this project mode.
+_ODRL_ALLOWED_OPERATORS = {
+    "eq",
+    "neq",
+    "gt",
+    "gteq",
+    "lt",
+    "lteq",
+    "ispartof",
+    "haspart",
+    "isallof",
+    "isanyof",
+    "isnoneof",
+    "isA".lower(),
+}
+
+# Keep this list focused on standard ODRL actions commonly used in generated policies.
+# Non-standard actions (eg. enable, trigger, nextPolicy) should be rejected here.
+_ODRL_ALLOWED_ACTIONS = {
+    "use",
+    "transfer",
+    "read",
+    "play",
+    "display",
+    "execute",
+    "print",
+    "reproduce",
+    "distribute",
+    "stream",
+    "synchronize",
+    "attribute",
+    "compensate",
+    "sharealike",
+    "derive",
+    "modify",
+    "delete",
+    "copy",
+    "install",
+    "move",
+    "write",
+}
+
+_ODRL_ALLOWED_LEFT_OPERANDS = {
+    "event",
+    "dateTime".lower(),
+    "elapsedTime".lower(),
+    "count",
+    "purpose",
+    "recipient",
+    "spatial",
+    "industry",
+    "language",
+    "media",
+    "meteredTime".lower(),
+    "payAmount".lower(),
+    "percentage",
+    "product",
+    "timeInterval".lower(),
+    "unitOfCount".lower(),
+    "version",
+    "fileFormat".lower(),
+}
+
 
 def _uri_asset(activity_name: str) -> str:
     """Aligné sur policy_projection_agent.uri_asset (évite import circulaire)."""
@@ -36,6 +100,147 @@ def _norm_operator(op: Any) -> str:
             return v.split(":")[-1].strip().lower() if ":" in v else v.strip().lower()
         return str(v).strip().lower() if v is not None else ""
     return str(op).strip().lower()
+
+
+def _norm_vocab_token(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, dict):
+        raw = v.get("@id") or v.get("id") or v.get("value")
+        if isinstance(raw, str):
+            t = raw.strip()
+        else:
+            t = str(raw).strip() if raw is not None else ""
+    else:
+        t = str(v).strip()
+    if t.startswith("http://www.w3.org/ns/odrl/2/"):
+        t = t.rsplit("/", 1)[-1]
+    elif ":" in t:
+        t = t.split(":")[-1]
+    return t.strip().lower()
+
+
+def _iter_rule_entries_with_paths(pol: dict) -> list[tuple[str, int, dict]]:
+    out: list[tuple[str, int, dict]] = []
+    for rt in RULE_TYPES:
+        rules = pol.get(rt)
+        if not isinstance(rules, list):
+            continue
+        for i, rule in enumerate(rules):
+            if isinstance(rule, dict):
+                out.append((rt, i, rule))
+    return out
+
+
+def strict_odrl_vocabulary_checks(fp_results: dict) -> tuple[list[dict], list[str]]:
+    """
+    Deterministic strict checks against ODRL vocabulary terms.
+
+    Enforced policy for this project:
+    - No profile extension allowed.
+    - Only ODRL vocabulary terms accepted for actions/operators/leftOperand.
+    """
+    hints: list[dict] = []
+    warnings: list[str] = []
+
+    for frag_id, fps in fp_results.items():
+        for pol in fps.all_policies():
+            pol_uid = str(pol.get("uid", ""))
+            if not pol_uid:
+                continue
+
+            if pol.get("profile"):
+                hints.append(
+                    {
+                        "policy_uid": pol_uid,
+                        "field_path": "profile",
+                        "issue": "ODRL profile extensions are disabled in strict vocabulary mode.",
+                        "suggested_fix": "",
+                        "odrl_template_key": "constraint_right_operand",
+                        "confidence": 0.99,
+                    }
+                )
+
+            for rt, i, rule in _iter_rule_entries_with_paths(pol):
+                action = rule.get("action")
+                action_path = f"{rt}[{i}].action"
+
+                def _append_action_hint(raw_action: Any) -> None:
+                    tok = _norm_vocab_token(raw_action)
+                    if not tok:
+                        return
+                    if tok not in _ODRL_ALLOWED_ACTIONS:
+                        hints.append(
+                            {
+                                "policy_uid": pol_uid,
+                                "field_path": action_path,
+                                "issue": (
+                                    f"Action '{tok}' is outside strict ODRL vocabulary "
+                                    "(no profile extension allowed)."
+                                ),
+                                "suggested_fix": "use",
+                                "odrl_template_key": "action_id",
+                                "confidence": 0.98,
+                            }
+                        )
+
+                if isinstance(action, list):
+                    for a in action:
+                        if isinstance(a, dict) and "rdf:value" in a:
+                            _append_action_hint(a.get("rdf:value"))
+                        else:
+                            _append_action_hint(a)
+                elif isinstance(action, dict) and "rdf:value" in action:
+                    _append_action_hint(action.get("rdf:value"))
+                else:
+                    _append_action_hint(action)
+
+                constraints = rule.get("constraint")
+                if isinstance(constraints, dict):
+                    constraints = [constraints]
+                if isinstance(constraints, list):
+                    for ci, c in enumerate(constraints):
+                        if not isinstance(c, dict):
+                            continue
+                        op = _norm_vocab_token(c.get("operator"))
+                        if op and op not in _ODRL_ALLOWED_OPERATORS:
+                            hints.append(
+                                {
+                                    "policy_uid": pol_uid,
+                                    "field_path": f"{rt}[{i}].constraint[{ci}].operator",
+                                    "issue": (
+                                        f"Operator '{op}' is outside strict ODRL vocabulary."
+                                    ),
+                                    "suggested_fix": "eq",
+                                    "odrl_template_key": "constraint_operator",
+                                    "confidence": 0.97,
+                                }
+                            )
+
+                        lo = _norm_vocab_token(c.get("leftOperand"))
+                        if lo and lo not in _ODRL_ALLOWED_LEFT_OPERANDS:
+                            # Use "event" as a neutral fallback operand for process constraints.
+                            hints.append(
+                                {
+                                    "policy_uid": pol_uid,
+                                    "field_path": f"{rt}[{i}].constraint[{ci}].leftOperand",
+                                    "issue": (
+                                        f"leftOperand '{lo}' is outside strict ODRL vocabulary "
+                                        "(likely profile-specific/custom term)."
+                                    ),
+                                    "suggested_fix": "event",
+                                    "odrl_template_key": "constraint_left_operand",
+                                    "confidence": 0.96,
+                                }
+                            )
+
+            if any(str(k).startswith("bpmn:") for k in pol.keys()):
+                warnings.append(
+                    f"[{frag_id}] Policy '{pol_uid}' contains BPMN-prefixed fields at top level; "
+                    "strict ODRL vocabulary mode ignores non-ODRL terms."
+                )
+
+    return hints, warnings
 
 
 def _collect_constraint_like_entries(rule: dict) -> list[dict]:
@@ -398,6 +603,10 @@ def run_deterministic_semantic_validation(
     h2, w2 = batch_semantic_checks(fp_results, graph)
     all_hints.extend(h2)
     all_warnings.extend(w2)
+
+    h3, w3 = strict_odrl_vocabulary_checks(fp_results)
+    all_hints.extend(h3)
+    all_warnings.extend(w3)
 
     return all_hints, all_warnings
 

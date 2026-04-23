@@ -1,0 +1,52 @@
+[
+  {
+    "id": "f1",
+    "activities": [
+      "assess-project-profitability",
+      "prepare-production-plan"
+    ],
+    "gateways": [
+      {
+        "name": "accept-quote",
+        "type": "XOR"
+      },
+      {
+        "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+        "type": "AND"
+      }
+    ]
+  },
+  {
+    "id": "f2",
+    "activities": [
+      "estimate-material-costs"
+    ],
+    "gateways": [
+      {
+        "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+        "type": "AND"
+      },
+      {
+        "name": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+        "type": "AND"
+      }
+    ]
+  },
+  {
+    "id": "f3",
+    "activities": [
+      "estimate-labor-costs",
+      "prepare-and-submit-quote"
+    ],
+    "gateways": [
+      {
+        "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+        "type": "AND"
+      },
+      {
+        "name": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+        "type": "AND"
+      }
+    ]
+  }
+]

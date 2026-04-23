@@ -1,3 +1,6 @@
+# Notebook / Jupyter dans Cursor, VS Code (noyau du .venv)
+ipykernel
+
 matplotlib
 pandas
 python-dotenv

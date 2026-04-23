@@ -1,7 +1,7 @@
 """
 constraint_validator.py — Agent 3 : Constraint Validator
 
-Validates unsupported-case proposals from Agent 2, resolves B2P mapping ambiguity (LLM),
+Validates unsupported-case proposals from the exception handling agent, resolves B2P mapping ambiguity (LLM),
 runs semantic validation on policies from Agent 4, and routes messages in the pipeline.
 """
 
@@ -21,7 +21,7 @@ from ..structural_analyzer import (
     MessageType,
     SemanticHint,
 )
-from ..unsupported_case_formulator import UnsupportedCaseProposal
+from ..exception_handling_agent import UnsupportedCaseFormulator, UnsupportedCaseProposal
 from .semantic_deterministic_validation import (
     merge_semantic_hints,
     run_deterministic_semantic_validation,
@@ -90,7 +90,7 @@ class ValidationReport:
 class ConstraintValidator:
     """
     Agent 3 — B2P ambiguity resolution, unsupported proposal validation,
-    semantic validation of generated ODRL (Time 2).
+    semantic validation of generated ODRL (après la première passe syntaxique A5).
     """
 
     MODEL = "gpt-4o"
@@ -115,7 +115,7 @@ class ConstraintValidator:
         self._use_azure = False
         self._deployment: Optional[str] = None
 
-        self._on_send_agent2: Optional[Callable[[AgentMessage], None]] = None
+        self._on_send_exception_handling: Optional[Callable[[AgentMessage], None]] = None
         self._on_send_agent4: Optional[Callable[[AgentMessage], None]] = None
 
         self._last_enriched_graph: Optional[EnrichedGraph] = None
@@ -152,9 +152,9 @@ class ConstraintValidator:
                 )
             self.client = OpenAI(api_key=key)
 
-    def register_send_callback_agent2(self, fn: Callable[[AgentMessage], None]) -> None:
-        """Register Agent 2 for ``REFORMULATE`` and ``GRAPH_READY`` (unsupported path)."""
-        self._on_send_agent2 = fn
+    def register_send_callback_exception_handling(self, fn: Callable[[AgentMessage], None]) -> None:
+        """Register the exception handling agent for ``REFORMULATE`` (unsupported path)."""
+        self._on_send_exception_handling = fn
 
     def register_send_callback_agent4(self, fn: Callable[[AgentMessage], None]) -> None:
         """Register Agent 4 for ``VALIDATION_DONE``, ``SEMANTIC_CORRECTION``, ``SEMANTIC_VALIDATED``."""
@@ -164,7 +164,7 @@ class ConstraintValidator:
         """Route outbound messages by ``recipient``."""
         print(f"[Agent 3] ► SEND {msg}")
         routes = {
-            "agent2": self._on_send_agent2,
+            UnsupportedCaseFormulator.AGENT_NAME: self._on_send_exception_handling,
             "agent4": self._on_send_agent4,
         }
         fn = routes.get(msg.recipient)
@@ -200,12 +200,12 @@ class ConstraintValidator:
 
     def _emit_accept_proposal_batch(self, msg: AgentMessage, utterance: str) -> None:
         pid = msg.payload.get("proposal_message_id") or self._last_open_propose_id
-        if not pid or not self._on_send_agent2:
+        if not pid or not self._on_send_exception_handling:
             return
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
-                recipient="agent2",
+                recipient=UnsupportedCaseFormulator.AGENT_NAME,
                 msg_type=MessageType.ACCEPT_PROPOSAL_BATCH,
                 payload={"utterance": utterance, "acl_in_reply_to": pid},
                 loop_turn=msg.loop_turn,
@@ -214,12 +214,12 @@ class ConstraintValidator:
 
     def _emit_reject_proposal_batch(self, msg: AgentMessage, reason: str) -> None:
         pid = msg.payload.get("proposal_message_id") or self._last_open_propose_id
-        if not pid or not self._on_send_agent2:
+        if not pid or not self._on_send_exception_handling:
             return
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
-                recipient="agent2",
+                recipient=UnsupportedCaseFormulator.AGENT_NAME,
                 msg_type=MessageType.REJECT_PROPOSAL_BATCH,
                 payload={
                     "utterance": reason[:500],
@@ -233,34 +233,17 @@ class ConstraintValidator:
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
         """
-        Entry from Agent 1. Forwards to Agent 2 if there are unsupported patterns;
-        otherwise resolves B2P ambiguity and emits ``VALIDATION_DONE``.
+        Entry from Agent 1. Si des patterns non couverts existent, on attend les propositions
+        de l'exception handling agent (CFP émis par l'Agent 1). Sinon résolution B2P et ``VALIDATION_DONE``.
         """
         enriched: EnrichedGraph = msg.payload["enriched_graph"]
         self._last_enriched_graph = enriched
         unsupported = list(getattr(enriched, "unsupported_patterns", []) or [])
 
-        if unsupported and self._on_send_agent2:
+        if unsupported:
             print(
-                f"[Agent 3] {len(unsupported)} unsupported pattern(s) — CFP to Agent 2 "
-                "(unsupported formulation)"
-            )
-            self.send(
-                AgentMessage(
-                    sender=self.AGENT_NAME,
-                    recipient="agent2",
-                    msg_type=MessageType.CFP_UNSUPPORTED,
-                    payload={
-                        "enriched_graph": enriched,
-                        "utterance": (
-                            "Call for proposals: the following structural patterns are not covered by "
-                            "deterministic templates — propose ODRL fragment-policy hints with "
-                            "conditions and justification."
-                        ),
-                        "unsupported_pattern_count": len(unsupported),
-                    },
-                    loop_turn=msg.loop_turn,
-                )
+                f"[Agent 3] {len(unsupported)} unsupported pattern(s) — "
+                "attente des propositions de l'exception handling agent (CFP émis par l'Agent 1)."
             )
             return
 
@@ -285,7 +268,7 @@ class ConstraintValidator:
 
     def _handle_unsupported_proposals(self, msg: AgentMessage) -> None:
         """
-        Process proposals from Agent 2: B2P ambiguity (T1), validate proposals,
+        Process proposals from the exception handling agent: B2P ambiguity (T1), validate proposals,
         then emit ``VALIDATION_DONE`` or ``REFORMULATE`` (no graph mutation).
         """
         pid = (msg.payload or {}).get("proposal_message_id")
@@ -341,7 +324,7 @@ class ConstraintValidator:
             )
             self._emit_reject_proposal_batch(msg, rej_reason)
             print(
-                "[Agent 3] Erreur(s) structurelle(s) — reject-proposal vers Agent 2 ; "
+                "[Agent 3] Erreur(s) structurelle(s) — reject-proposal vers l'exception handling agent ; "
                 "graphe d'entrée inchangé."
             )
             return
@@ -357,13 +340,13 @@ class ConstraintValidator:
             if self._reformulate_sent_count.get(key, 0) >= self.MAX_REFORMULATE:
                 continue
             self._reformulate_sent_count[key] = self._reformulate_sent_count.get(key, 0) + 1
-            if vr.proposal and self._on_send_agent2:
+            if vr.proposal and self._on_send_exception_handling:
                 rreason = vr.reformulation_hint or vr.explanation or "Reformulation requested for unsupported proposals."
                 self._emit_reject_proposal_batch(msg, rreason)
                 self.send(
                     AgentMessage(
                         sender=self.AGENT_NAME,
-                        recipient="agent2",
+                        recipient=UnsupportedCaseFormulator.AGENT_NAME,
                         msg_type=MessageType.REFORMULATE,
                         payload={
                             "hint": vr.reformulation_hint or vr.explanation,
@@ -397,8 +380,8 @@ class ConstraintValidator:
 
     def _handle_policies_ready(self, msg: AgentMessage) -> None:
         """
-        Semantic validation (Time 2). On success, emit ``SEMANTIC_VALIDATED``;
-        on failure emit ``SEMANTIC_CORRECTION`` until ``MAX_SEMANTIC_LOOPS``.
+        Validation sémantique (policies déjà passées par l'audit syntaxique A5).
+        On success, emit ``SEMANTIC_VALIDATED`` ; sinon ``SEMANTIC_CORRECTION`` jusqu'à ``MAX_SEMANTIC_LOOPS``.
         """
         fp_results = msg.payload["fp_results"]
         enriched = msg.payload["enriched_graph"]
@@ -499,7 +482,7 @@ class ConstraintValidator:
         b2p_json = json.dumps(graph.raw_b2p, ensure_ascii=False)
         user_prompt = f"""You validate an ODRL fragment-policy hint against B2P context.
 
-Agent 2 self-reported confidence: {p.confidence} (reference threshold {self.min_confidence} — do not reject solely for low confidence if the structural case is real, e.g. BPMN loops).
+Exception handling agent self-reported confidence: {p.confidence} (reference threshold {self.min_confidence} — do not reject solely for low confidence if the structural case is real, e.g. BPMN loops).
 
 Proposal:
 {json.dumps(p.to_dict(), ensure_ascii=False, indent=2)}
@@ -717,6 +700,8 @@ Check specifically:
 3. Is the temporal constraint correctly expressed?
 4. Is the assigner/assignee preserved if present?
 5. Are there any hallucinated constraints not in the B2P source?
+6. STRICT ODRL vocabulary only (https://www.w3.org/TR/odrl-vocab/): reject non-ODRL actions/operands/operators.
+7. If policy uses profile extensions, mark invalid (this project forbids odrl:profile usage).
 
 For "suggested_fix": use ONLY the literal value to apply (e.g. gteq, eq, or a full http(s) IRI).
 Do not write sentences like "set uid to ..." — put the IRI alone when fixing uid or target.

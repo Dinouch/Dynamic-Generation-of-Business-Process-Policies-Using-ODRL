@@ -74,6 +74,15 @@ class WebHitlBridge:
     def submit(self, reply_with: str, decision: str, comment: str = "") -> bool:
         key = (reply_with or "").strip()
         fut = self._futures.pop(key, None)
+        if fut is None:
+            # Legacy frontend compatibility:
+            # some clients keep submitting the first `reply_with` even when the
+            # backend has already moved to the next unsupported proposal.
+            # In one-by-one HITL mode, there is at most one pending request, so
+            # we can safely route the answer to that sole pending future.
+            if len(self._futures) == 1:
+                only_key = next(iter(self._futures))
+                fut = self._futures.pop(only_key, None)
         if fut is None or fut.done():
             return False
         d = (decision or "").strip().lower()

@@ -4,7 +4,7 @@ pipeline_registry.py — Single source of truth for BPMN pattern coverage (Agent
 This module lists every structural pattern type that Agent 4 can translate using
 deterministic ODRL templates. When a new template is added to Agent 4, add the
 corresponding pattern_type string here so Agent 1 tags anything else as unsupported
-and routes it through Agent 2.
+and routes it through the exception handling agent.
 
 Agent 1 and Agent 4 both import this module; keep it synchronized with
 policy_projection_agent template logic.
@@ -29,7 +29,7 @@ COVERED_PATTERNS: FrozenSet[str] = frozenset(
 )
 
 # BPMN 2.0 semantics for unsupported pattern_type values (English, one sentence each).
-# Used verbatim in Agent 2 LLM prompts.
+# Used verbatim in exception handling agent LLM prompts.
 BPMN_SEMANTICS: dict[str, str] = {
     "fork_event_based_exclusive": (
         "An Event-Based Gateway (exclusive instantiation) waits for one of several "

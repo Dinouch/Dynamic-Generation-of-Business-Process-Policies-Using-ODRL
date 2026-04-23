@@ -143,7 +143,7 @@ def run_sequential_agents(
         cond = f" (cond: {conn.condition})" if conn.condition else ""
         print(f"  {conn.from_activity} → {conn.to_activity}  [{conn.connection_type.upper()}]{cond}{inter}")
 
-    # Agent 2 & 3 require an LLM
+    # Exception handling agent & Agent 3 require an LLM
     has_llm = bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_KEY"))
     validation_report = None
 
@@ -161,7 +161,7 @@ def run_sequential_agents(
             print(
                 f"\n  ValidationReport: accepted_unsupported="
                 f"{len(validation_report.accepted_unsupported_proposals)} "
-                f"(use full pipeline for Agent 2 LLM formulation)"
+                f"(use full pipeline for exception handling agent LLM formulation)"
             )
         except Exception as e:
             print(f"[ERROR Agent 3] {e}")

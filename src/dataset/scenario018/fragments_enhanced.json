@@ -24,15 +24,26 @@
       "activities": [
         "perform-checks-for-large-amount",
         "perform-checks-for-small-amount",
-        "make-decision",
-        "notify-rejection-by-email",
-        "notify-acceptance-by-email"
+        "make-decision"
       ],
       "gateways": [
         {
           "name": "credit-amount",
           "type": "XOR"
         },
+        {
+          "name": "decision-outcome",
+          "type": "XOR"
+        }
+      ]
+    },
+    {
+      "id": "f3",
+      "activities": [
+        "notify-rejection-by-email",
+        "notify-acceptance-by-email"
+      ],
+      "gateways": [
         {
           "name": "decision-outcome",
           "type": "XOR"
@@ -44,10 +55,10 @@
       ]
     },
     {
-      "id": "f3",
+      "id": "f4",
       "activities": [
-        "receive-missing-documents",
         "handle-documentation-deadline",
+        "receive-missing-documents",
         "request-credit-card"
       ],
       "gateways": [
@@ -62,7 +73,8 @@
     "fragment_ids_in_process_order": [
       "f1",
       "f2",
-      "f3"
+      "f3",
+      "f4"
     ],
     "global_activity_order": [
       "check-for-completeness",
@@ -73,8 +85,8 @@
       "make-decision",
       "notify-rejection-by-email",
       "notify-acceptance-by-email",
-      "receive-missing-documents",
       "handle-documentation-deadline",
+      "receive-missing-documents",
       "request-credit-card"
     ],
     "activity_order_per_fragment": {
@@ -86,13 +98,15 @@
       "f2": [
         "perform-checks-for-large-amount",
         "perform-checks-for-small-amount",
-        "make-decision",
+        "make-decision"
+      ],
+      "f3": [
         "notify-rejection-by-email",
         "notify-acceptance-by-email"
       ],
-      "f3": [
-        "receive-missing-documents",
+      "f4": [
         "handle-documentation-deadline",
+        "receive-missing-documents",
         "request-credit-card"
       ]
     }
@@ -256,7 +270,8 @@
         "f2"
       ],
       "to_fragment_ids": [
-        "f2"
+        "f2",
+        "f3"
       ],
       "from_primary_fragment_id": "f2",
       "to_primary_fragment_id": "f2",
@@ -266,16 +281,17 @@
       "from": "decision-outcome",
       "to": "notify-rejection-by-email",
       "type": "sequence",
-      "scope": "intra",
+      "scope": "inter",
       "scope_shared_fragment": "intra",
       "from_fragment_ids": [
-        "f2"
+        "f2",
+        "f3"
       ],
       "to_fragment_ids": [
-        "f2"
+        "f3"
       ],
       "from_primary_fragment_id": "f2",
-      "to_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f3",
       "gateway": "decision-outcome",
       "condition": "rejected"
     },
@@ -283,16 +299,17 @@
       "from": "decision-outcome",
       "to": "notify-acceptance-by-email",
       "type": "sequence",
-      "scope": "intra",
+      "scope": "inter",
       "scope_shared_fragment": "intra",
       "from_fragment_ids": [
-        "f2"
+        "f2",
+        "f3"
       ],
       "to_fragment_ids": [
-        "f2"
+        "f3"
       ],
       "from_primary_fragment_id": "f2",
-      "to_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f3",
       "gateway": "decision-outcome",
       "condition": "accepted"
     },
@@ -303,14 +320,14 @@
       "scope": "intra",
       "scope_shared_fragment": "intra",
       "from_fragment_ids": [
-        "f2"
-      ],
-      "to_fragment_ids": [
-        "f2",
         "f3"
       ],
-      "from_primary_fragment_id": "f2",
-      "to_primary_fragment_id": "f2",
+      "to_fragment_ids": [
+        "f3",
+        "f4"
+      ],
+      "from_primary_fragment_id": "f3",
+      "to_primary_fragment_id": "f3",
       "gateway": "documentation-follow-up"
     },
     {
@@ -320,13 +337,13 @@
       "scope": "intra",
       "scope_shared_fragment": "intra",
       "from_fragment_ids": [
-        "f3"
+        "f4"
       ],
       "to_fragment_ids": [
-        "f3"
+        "f4"
       ],
-      "from_primary_fragment_id": "f3",
-      "to_primary_fragment_id": "f3"
+      "from_primary_fragment_id": "f4",
+      "to_primary_fragment_id": "f4"
     },
     {
       "from": "handle-documentation-deadline",
@@ -335,31 +352,13 @@
       "scope": "intra",
       "scope_shared_fragment": "intra",
       "from_fragment_ids": [
-        "f3"
+        "f4"
       ],
       "to_fragment_ids": [
-        "f3"
+        "f4"
       ],
-      "from_primary_fragment_id": "f3",
-      "to_primary_fragment_id": "f3"
-    },
-    {
-      "from": "documentation-follow-up",
-      "to": "receive-missing-documents",
-      "type": "sequence",
-      "scope": "inter",
-      "scope_shared_fragment": "intra",
-      "from_fragment_ids": [
-        "f2",
-        "f3"
-      ],
-      "to_fragment_ids": [
-        "f3"
-      ],
-      "from_primary_fragment_id": "f2",
-      "to_primary_fragment_id": "f3",
-      "gateway": "documentation-follow-up",
-      "condition": "documents-received"
+      "from_primary_fragment_id": "f4",
+      "to_primary_fragment_id": "f4"
     },
     {
       "from": "documentation-follow-up",
@@ -368,16 +367,34 @@
       "scope": "inter",
       "scope_shared_fragment": "intra",
       "from_fragment_ids": [
-        "f2",
-        "f3"
+        "f3",
+        "f4"
       ],
       "to_fragment_ids": [
-        "f3"
+        "f4"
       ],
-      "from_primary_fragment_id": "f2",
-      "to_primary_fragment_id": "f3",
+      "from_primary_fragment_id": "f3",
+      "to_primary_fragment_id": "f4",
       "gateway": "documentation-follow-up",
       "condition": "deadline"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "receive-missing-documents",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f3",
+        "f4"
+      ],
+      "to_fragment_ids": [
+        "f4"
+      ],
+      "from_primary_fragment_id": "f3",
+      "to_primary_fragment_id": "f4",
+      "gateway": "documentation-follow-up",
+      "condition": "documents-received"
     }
   ],
   "activities": [
@@ -541,17 +558,17 @@
     },
     {
       "from": "documentation-follow-up",
-      "to": "receive-missing-documents",
-      "type": "sequence",
-      "gateway": "documentation-follow-up",
-      "condition": "documents-received"
-    },
-    {
-      "from": "documentation-follow-up",
       "to": "handle-documentation-deadline",
       "type": "sequence",
       "gateway": "documentation-follow-up",
       "condition": "deadline"
+    },
+    {
+      "from": "documentation-follow-up",
+      "to": "receive-missing-documents",
+      "type": "sequence",
+      "gateway": "documentation-follow-up",
+      "condition": "documents-received"
     }
   ]
 }

@@ -1,9 +1,9 @@
 """
-unsupported_case_formulator.py — Agent 2 : Unsupported Case Formulator
+exception_handling_agent.py — Exception handling agent
 
 Turns BPMN structural patterns that have no deterministic ODRL template into
 LLM-proposed ODRL hints for Agent 4. Replaces the former implicit dependency
-detector.
+detector (Unsupported Case Formulator).
 """
 
 from __future__ import annotations
@@ -83,16 +83,16 @@ class UnsupportedCaseProposal:
 
 class UnsupportedCaseFormulator:
     """
-    Agent 2 — formulates ODRL hints for unsupported BPMN patterns.
+    Exception handling agent — formulates ODRL hints for unsupported BPMN patterns.
 
-    Receives ``GRAPH_READY`` from Agent 3 (when ``unsupported_patterns`` is non-empty).
+    Receives ``CFP_UNSUPPORTED`` from Agent 1 (patterns non couverts) or legacy ``GRAPH_READY``.
     Emits ``UNSUPPORTED_PROPOSALS`` to Agent 3.
     """
 
     MODEL = "gpt-4o"
     TEMPERATURE = 0.2
 
-    AGENT_NAME = "agent2"
+    AGENT_NAME = "exception_handling_agent"
     MAX_REFORMULATE = 3
 
     _SYSTEM_PROMPT = (
@@ -166,11 +166,11 @@ class UnsupportedCaseFormulator:
 
     def send(self, msg: AgentMessage) -> None:
         """Emit a message via the registered callback."""
-        print(f"[Agent 2] ► SEND {msg}")
+        print(f"[Exception handling agent] ► SEND {msg}")
         if self._on_send:
             self._on_send(msg)
         else:
-            print(f"[Agent 2][WARN] No callback — message {msg.msg_type.value} not sent.")
+            print(f"[Exception handling agent][WARN] No callback — message {msg.msg_type.value} not sent.")
 
     def receive(self, msg: AgentMessage) -> None:
         """
@@ -179,17 +179,23 @@ class UnsupportedCaseFormulator:
         Parameters
         ----------
         msg
-            ``GRAPH_READY`` or ``REFORMULATE`` from Agent 3.
+            ``CFP_UNSUPPORTED`` from Agent 1, ``GRAPH_READY`` (legacy), ou ``REFORMULATE`` depuis Agent 3.
         """
-        print(f"[Agent 2] ◄ RECEIVE {msg}")
+        print(f"[Exception handling agent] ◄ RECEIVE {msg}")
         if msg.msg_type in (MessageType.GRAPH_READY, MessageType.CFP_UNSUPPORTED):
             self._handle_graph_ready(msg)
         elif msg.msg_type == MessageType.REFORMULATE:
             self._handle_reformulate(msg)
+        elif msg.msg_type in (MessageType.ACCEPT_PROPOSAL_BATCH, MessageType.REJECT_PROPOSAL_BATCH):
+            # Final negotiation outcome from Agent 3 (informational in current flow).
+            print(
+                "[Exception handling agent] Proposal batch decision received "
+                f"({msg.msg_type.value}) — no further action required."
+            )
         elif msg.msg_type == MessageType.DELEGATION_AGREE:
-            print("[Agent 2] Received delegation AGREE (informational).")
+            print("[Exception handling agent] Received delegation AGREE (informational).")
         else:
-            print(f"[Agent 2][WARN] Unknown message type '{msg.msg_type.value}'.")
+            print(f"[Exception handling agent][WARN] Unknown message type '{msg.msg_type.value}'.")
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
         """Process ``CFP_UNSUPPORTED`` / ``GRAPH_READY`` and emit ``UNSUPPORTED_PROPOSALS`` (ACL PROPOSE)."""
@@ -294,7 +300,7 @@ class UnsupportedCaseFormulator:
         """
         if self._reformulate_count >= self.MAX_REFORMULATE:
             print(
-                f"[Agent 2][WARN] MAX_REFORMULATE ({self.MAX_REFORMULATE}) reached — "
+                f"[Exception handling agent][WARN] MAX_REFORMULATE ({self.MAX_REFORMULATE}) reached — "
                 "re-sending last proposals."
             )
             if self._last_graph:
@@ -328,7 +334,7 @@ class UnsupportedCaseFormulator:
         fid = str(msg.payload.get("fragment_id", ""))
 
         if not self._last_graph:
-            print("[Agent 2][WARN] REFORMULATE without stored graph — ignored.")
+            print("[Exception handling agent][WARN] REFORMULATE without stored graph — ignored.")
             return
 
         b2p_json = json.dumps(self._last_graph.raw_b2p, ensure_ascii=False)
@@ -418,11 +424,11 @@ Respond ONLY with this JSON:
             raw = self._call_llm(user_prompt)
             data = json.loads(raw)
         except Exception as e:
-            print(f"[Agent 2][WARN] LLM/formulation failed for {u.pattern_type}: {e}")
+            print(f"[Exception handling agent][WARN] LLM/formulation failed for {u.pattern_type}: {e}")
             fb = self._fallback_proposal(u)
             if fb:
                 print(
-                    f"[Agent 2] Deterministic fallback proposal for "
+                    f"[Exception handling agent] Deterministic fallback proposal for "
                     f"'{u.pattern_type}' (no successful LLM call)."
                 )
             return [fb] if fb else []

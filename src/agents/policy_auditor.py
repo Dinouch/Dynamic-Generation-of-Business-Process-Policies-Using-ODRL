@@ -51,9 +51,8 @@ Sorties :
     AuditReport         : rapport complet — is_valid si aucun CRITICAL
 
 Couche multi-agent :
-    - receive()  : accepte POLICIES_READY depuis Agent 4
-    - send()     : émet SYNTAX_CORRECTION vers Agent 4,
-                   ou ODRL_VALID / ODRL_SYNTAX_ERROR vers le pipeline
+    - receive()  : accepte SYNTAX_AUDIT_REQUEST ou POLICIES_READY depuis Agent 4 (ré-audit)
+    - send()     : émet ODRL_SYNTAX_FAILURE / ODRL_VALID / ODRL_SYNTAX_ERROR vers Agent 4
     - Boucle syntaxique (max MAX_SYNTAX_LOOPS tours) :
         issues CRITICAL SYNTAX → SYNTAX_CORRECTION → Agent 4 → POLICIES_READY
 """
@@ -505,6 +504,8 @@ class PolicyAuditor:
 
     def _handle_syntax_audit_request(self, msg: AgentMessage) -> None:
         """FIPA: AGREE to Agent 4's REQUEST, then run the first audit round."""
+        # New syntax delegation (pre- or post-semantic) — fresh correction budget.
+        self._syntax_loop_count = 0
         req_id = msg.payload.get("syntax_audit_request_id")
         agree_rw = uuid.uuid4().hex
         self._pending_syntax_agree_id = agree_rw

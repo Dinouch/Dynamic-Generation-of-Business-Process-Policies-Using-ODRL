@@ -1,0 +1,211 @@
+[
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2101",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/sendAutomaticReplyRule",
+        "target": "http://example.com/asset/send-automatic-reply-to-customer",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": "http://example.com/system/AutoReplySystem",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "leftOperand": "elapsedTime",
+                "operator": "lteq",
+                "rightOperand": {
+                  "@value": "PT1H",
+                  "@type": "xsd:duration"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2102",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/discussSolutionRule",
+        "target": "http://example.com/asset/discuss-solution",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": "http://example.com/staff/Organization:agent",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "leftOperand": "systemDevice",
+                "operator": "isAnyOf",
+                "rightOperand": [
+                  "http://example.com/channel/certified-phone",
+                  "http://example.com/channel/official-email",
+                  "http://example.com/channel/crm-portal"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2103",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/sendApologyRule",
+        "target": "http://example.com/asset/send-apology",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": {
+          "@id": "http://example.com/staff/Organization:agent",
+          "refinement": [
+            {
+              "leftOperand": "role",
+              "operator": "isNoneOf",
+              "rightOperand": [
+                "intern",
+                "junior-agent"
+              ]
+            }
+          ]
+        },
+        "action": [
+          {
+            "rdf:value": "execute"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2104",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/proposeSolutionRule",
+        "target": "http://example.com/asset/propose-solution",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": "http://example.com/staff/Organization:agent",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "@type": "odrl:LogicalConstraint",
+                "odrl:and": [
+                  {
+                    "leftOperand": "dateTime",
+                    "operator": "gteq",
+                    "rightOperand": {
+                      "@value": "T08:00:00",
+                      "@type": "xsd:time"
+                    }
+                  },
+                  {
+                    "leftOperand": "dateTime",
+                    "operator": "lteq",
+                    "rightOperand": {
+                      "@value": "T18:00:00",
+                      "@type": "xsd:time"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2105",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/executeSolutionRule",
+        "target": "http://example.com/asset/execute-solution",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": "http://example.com/staff/Organization:agent",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "leftOperand": "spatial",
+                "operator": "eq",
+                "rightOperand": "http://example.com/location/organization-hq"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2106",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/evaluateAcceptableAlternativeRule",
+        "target": "http://example.com/asset/evaluate-acceptable-alternative",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": {
+          "@id": "http://example.com/staff/Organization:agent",
+          "refinement": [
+            {
+              "leftOperand": "role",
+              "operator": "isAnyOf",
+              "rightOperand": [
+                "senior-agent",
+                "supervisor",
+                "manager"
+              ]
+            }
+          ]
+        },
+        "action": [
+          {
+            "rdf:value": "execute"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "@context": "http://www.w3.org/ns/odrl.jsonld",
+    "uid": "http://example.com/policy:2107",
+    "@type": "Agreement",
+    "permission": [
+      {
+        "uid": "http://example.com/rules/goToCourtRule",
+        "target": "http://example.com/asset/go-to-court",
+        "assigner": "http://example.com/Organization:org",
+        "assignee": "http://example.com/staff/Organization:legalTeam",
+        "action": [
+          {
+            "rdf:value": "execute",
+            "refinement": [
+              {
+                "leftOperand": "spatial",
+                "operator": "eq",
+                "rightOperand": "http://example.com/location/court"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

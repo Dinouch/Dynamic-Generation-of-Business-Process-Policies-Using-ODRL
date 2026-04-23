@@ -4,13 +4,14 @@ import asyncio
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from agents.pipeline_registry import COVERED_PATTERNS
 from agents.structural_analyzer import StructuralAnalyzer, AgentMessage, MessageType
-from agents.unsupported_case_formulator import UnsupportedCaseFormulator
+from agents.exception_handling_agent import UnsupportedCaseFormulator
 from agents.Agent_3.constraint_validator import ConstraintValidator, ValidationReport
 from agents.policy_projection_agent import PolicyProjectionAgent
 from agents.policy_auditor import PolicyAuditor, AuditReport
@@ -127,7 +128,7 @@ class AsyncPipelineOrchestrator:
             azure_api_version=azure_version,
             azure_deployment=azure_deploy,
         )
-        agent2 = UnsupportedCaseFormulator(
+        exception_handling_agent = UnsupportedCaseFormulator(
             covered_patterns=COVERED_PATTERNS,
             api_key=api_key,
             azure_endpoint=azure_endpoint,
@@ -156,7 +157,7 @@ class AsyncPipelineOrchestrator:
 
         # Register bus handlers (receiver = agent name)
         self.bus.register("agent1", lambda env: self._deliver_to_legacy(agent1, env))
-        self.bus.register("agent2", lambda env: self._deliver_to_legacy(agent2, env))
+        self.bus.register("exception_handling_agent", lambda env: self._deliver_to_legacy(exception_handling_agent, env))
         self.bus.register("agent4", lambda env: self._deliver_to_legacy(agent4, env))
         self.bus.register("agent5", lambda env: self._deliver_to_legacy(agent5, env))
 
@@ -172,8 +173,8 @@ class AsyncPipelineOrchestrator:
                 loop.call_soon_threadsafe(asyncio.create_task, self._publish_legacy(m, status=status))
 
             agent1.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
-            agent2.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
-            agent3.register_send_callback_agent2(lambda m: _threadsafe_publish(m, status=None))
+            exception_handling_agent.register_send_callback(lambda m: _threadsafe_publish(m, status=None))
+            agent3.register_send_callback_exception_handling(lambda m: _threadsafe_publish(m, status=None))
 
             # Route Agent 3 -> Agent 4/1/2 through bus
             agent3.register_send_callback_agent4(lambda m: _threadsafe_publish(m, status=None))
@@ -243,6 +244,8 @@ class AsyncPipelineOrchestrator:
             self._partial_fp_results = env.content.get("fp_results")
             try:
                 out_dir = _scenario_odrl_stage_dir(self._scenario_id, "partial_template_only")
+                if out_dir.is_dir():
+                    shutil.rmtree(out_dir, ignore_errors=True)
                 exporter = PolicyProjectionAgent(enriched_graph=self._enriched_graph, validation_report=None)
                 exporter.export(self._partial_fp_results, output_dir=str(out_dir))
                 self._odrl_export_paths["partial_template_only"] = str(out_dir)
@@ -345,6 +348,8 @@ class AsyncPipelineOrchestrator:
         try:
             if self._partial_fp_results is not None:
                 out_dir = _scenario_odrl_stage_dir(self._scenario_id, "partial_template_only")
+                if out_dir.is_dir():
+                    shutil.rmtree(out_dir, ignore_errors=True)
                 exporter = PolicyProjectionAgent(enriched_graph=enriched, validation_report=None)
                 exporter.export(self._partial_fp_results, output_dir=str(out_dir))
                 self._odrl_export_paths["partial_template_only"] = str(out_dir)
@@ -423,6 +428,10 @@ class AsyncPipelineOrchestrator:
                 )
                 return
 
+            print(
+                f"[AsyncPipeline] Fin pipeline (Agent 4 → pipeline) : msg_type={msg_type!r}, "
+                f"is_valid={is_valid}, status={status!r} — reprise de l'orchestrateur."
+            )
             self._final_result = out
             return
 
@@ -459,6 +468,10 @@ class AsyncPipelineOrchestrator:
                 )
                 return
 
+            print(
+                f"[AsyncPipeline] Fin pipeline (Agent 5 direct) : msg_type={msg_type!r}, "
+                f"is_valid={is_valid}, status={status!r} — reprise de l'orchestrateur."
+            )
             self._final_result = out
 
     async def on_human_reply_to_agent3(self, env: ACLEnvelope) -> None:
@@ -500,7 +513,7 @@ class AsyncPipelineOrchestrator:
             loop_t = int(self._pending_unsupported_env.content.get("loop_turn", 0) or 0)
             rej = AgentMessage(
                 sender="agent3",
-                recipient="agent2",
+                recipient="exception_handling_agent",
                 msg_type=MessageType.REJECT_PROPOSAL_BATCH,
                 payload={
                     "utterance": "Human operator rejected all proposed unsupported rules.",
@@ -523,7 +536,7 @@ class AsyncPipelineOrchestrator:
         loop_t = int(self._pending_unsupported_env.content.get("loop_turn", 0) or 0)
         acc = AgentMessage(
             sender="agent3",
-            recipient="agent2",
+            recipient="exception_handling_agent",
             msg_type=MessageType.ACCEPT_PROPOSAL_BATCH,
             payload={
                 "utterance": (
@@ -562,37 +575,30 @@ class AsyncPipelineOrchestrator:
         # Export final merged bundle (separate folder)
         try:
             out_dir = _scenario_odrl_stage_dir(self._scenario_id, "final_merged")
+            if out_dir.is_dir():
+                shutil.rmtree(out_dir, ignore_errors=True)
             exporter = PolicyProjectionAgent(enriched_graph=enriched, validation_report=None)
             exporter.export(merged, output_dir=str(out_dir))
             self._odrl_export_paths["final_merged"] = str(out_dir)
         except Exception as e:
             print(f"[AsyncPipeline][WARN] Export final merged impossible : {e}")
 
-        # Ask Agent 5 to audit merged and emit final
-        from communication.legacy_adapter import agent_message_to_acl
+        # Route merged policies through Agent 4 semantic-validated path so the
+        # final syntax audit keeps a valid REQUEST->AGREE->FAILURE/INFORM ACL chain.
         msg = AgentMessage(
-            sender="pipeline",
-            recipient="agent5",
-            msg_type=MessageType.POLICIES_READY,
+            sender="agent3",
+            recipient="agent4",
+            msg_type=MessageType.SEMANTIC_VALIDATED,
             payload={
                 "fp_results": merged,
                 "enriched_graph": enriched,
+                "semantic_warnings": [],
                 "manifest": manifest,
                 "status": "final_merged",
             },
             loop_turn=int(self._pending_unsupported_env.content.get("loop_turn", 0) or 0),
         )
-        env2 = agent_message_to_acl(msg, conversation_id=self._conversation_id, status="final_merged")
-        env2 = ACLEnvelope(
-            performative=env2.performative,
-            sender=env2.sender,
-            receiver=env2.receiver,
-            ontology=env2.ontology,
-            content=dict(env2.content, manifest=manifest, status="final_merged"),
-            conversation_id=self._conversation_id,
-            in_reply_to=env.reply_with,
-        )
-        await self.bus.publish(env2)
+        await self._publish_legacy(msg, status="final_merged")
 
         self._pending_unsupported_env = None
         self._unsupported_queue = []

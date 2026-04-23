@@ -1,7 +1,7 @@
 """
 main.py
 ═══════════════════════════════════════════════════════════════════════════════
-Pipeline complet — Agent 1 → Agent 2 <→ Agent 3 → Agent 4 <→ Agent 5
+Pipeline complet — Agent 1 → Exception handling agent <→ Agent 3 → Agent 4 <→ Agent 5
 Scénario: src/dataset/scenario1 (fragments BP + B2P).
 
 Mode standalone (sans LLM) 

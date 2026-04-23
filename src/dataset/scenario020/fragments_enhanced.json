@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "fragments": [
+    {
+      "id": "f1",
+      "activities": [
+        "assess-project-profitability",
+        "prepare-production-plan"
+      ],
+      "gateways": [
+        {
+          "name": "accept-quote",
+          "type": "XOR"
+        },
+        {
+          "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+          "type": "AND"
+        }
+      ]
+    },
+    {
+      "id": "f2",
+      "activities": [
+        "estimate-material-costs"
+      ],
+      "gateways": [
+        {
+          "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+          "type": "AND"
+        },
+        {
+          "name": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+          "type": "AND"
+        }
+      ]
+    },
+    {
+      "id": "f3",
+      "activities": [
+        "estimate-labor-costs",
+        "prepare-and-submit-quote"
+      ],
+      "gateways": [
+        {
+          "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+          "type": "AND"
+        },
+        {
+          "name": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+          "type": "AND"
+        }
+      ]
+    }
+  ],
+  "ordering": {
+    "fragment_ids_in_process_order": [
+      "f1",
+      "f2",
+      "f3"
+    ],
+    "global_activity_order": [
+      "assess-project-profitability",
+      "prepare-production-plan",
+      "estimate-material-costs",
+      "estimate-labor-costs",
+      "prepare-and-submit-quote"
+    ],
+    "activity_order_per_fragment": {
+      "f1": [
+        "assess-project-profitability",
+        "prepare-production-plan"
+      ],
+      "f2": [
+        "estimate-material-costs"
+      ],
+      "f3": [
+        "estimate-labor-costs",
+        "prepare-and-submit-quote"
+      ]
+    }
+  },
+  "connections": [
+    {
+      "from": "assess-project-profitability",
+      "to": "accept-quote",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "accept-quote"
+    },
+    {
+      "from": "prepare-production-plan",
+      "to": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1",
+        "f2",
+        "f3"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5"
+    },
+    {
+      "from": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "to": "estimate-material-costs",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1",
+        "f2",
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f2"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f2",
+      "gateway": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5"
+    },
+    {
+      "from": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "to": "estimate-labor-costs",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1",
+        "f2",
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f3"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f3",
+      "gateway": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5"
+    },
+    {
+      "from": "estimate-material-costs",
+      "to": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2"
+      ],
+      "to_fragment_ids": [
+        "f2",
+        "f3"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f2",
+      "gateway": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103"
+    },
+    {
+      "from": "estimate-labor-costs",
+      "to": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f2",
+        "f3"
+      ],
+      "from_primary_fragment_id": "f3",
+      "to_primary_fragment_id": "f2",
+      "gateway": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103"
+    },
+    {
+      "from": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "to": "prepare-and-submit-quote",
+      "type": "sequence",
+      "scope": "inter",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f2",
+        "f3"
+      ],
+      "to_fragment_ids": [
+        "f3"
+      ],
+      "from_primary_fragment_id": "f2",
+      "to_primary_fragment_id": "f3",
+      "gateway": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103"
+    },
+    {
+      "from": "accept-quote",
+      "to": "prepare-production-plan",
+      "type": "sequence",
+      "scope": "intra",
+      "scope_shared_fragment": "intra",
+      "from_fragment_ids": [
+        "f1"
+      ],
+      "to_fragment_ids": [
+        "f1"
+      ],
+      "from_primary_fragment_id": "f1",
+      "to_primary_fragment_id": "f1",
+      "gateway": "accept-quote",
+      "condition": "yes-90"
+    }
+  ],
+  "activities": [
+    {
+      "name": "estimate-labor-costs"
+    },
+    {
+      "name": "assess-project-profitability",
+      "start": true,
+      "end": true
+    },
+    {
+      "name": "prepare-production-plan"
+    },
+    {
+      "name": "estimate-material-costs"
+    },
+    {
+      "name": "prepare-and-submit-quote",
+      "end": true
+    }
+  ],
+  "gateways": [
+    {
+      "name": "accept-quote",
+      "type": "XOR"
+    },
+    {
+      "name": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "type": "AND"
+    },
+    {
+      "name": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "type": "AND"
+    }
+  ],
+  "flows": [
+    {
+      "from": "assess-project-profitability",
+      "to": "accept-quote",
+      "type": "sequence",
+      "gateway": "accept-quote"
+    },
+    {
+      "from": "prepare-production-plan",
+      "to": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "type": "sequence",
+      "gateway": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5"
+    },
+    {
+      "from": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "to": "estimate-material-costs",
+      "type": "sequence",
+      "gateway": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5"
+    },
+    {
+      "from": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5",
+      "to": "estimate-labor-costs",
+      "type": "sequence",
+      "gateway": "and-sid-8d05909a-6dc6-4d5c-9c71-840fab0959f5"
+    },
+    {
+      "from": "estimate-material-costs",
+      "to": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "type": "sequence",
+      "gateway": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103"
+    },
+    {
+      "from": "estimate-labor-costs",
+      "to": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "type": "sequence",
+      "gateway": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103"
+    },
+    {
+      "from": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103",
+      "to": "prepare-and-submit-quote",
+      "type": "sequence",
+      "gateway": "and-sid-672fe03e-18e8-4704-b2d7-7b59b3df9103"
+    },
+    {
+      "from": "accept-quote",
+      "to": "prepare-production-plan",
+      "type": "sequence",
+      "gateway": "accept-quote",
+      "condition": "yes-90"
+    }
+  ]
+}
