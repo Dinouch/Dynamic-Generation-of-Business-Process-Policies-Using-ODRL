@@ -9,19 +9,19 @@ def _first_existing(*paths: str) -> str:
         if os.path.isfile(p):
             return p
     raise FileNotFoundError(
-        "Aucun fichier trouvé parmi : " + ", ".join(os.path.basename(x) for x in paths)
+        "No file found among: " + ", ".join(os.path.basename(x) for x in paths)
     )
 
 
 def load_scenario(scenario_id: str, *, base_dir: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Charge un scénario depuis le dossier dataset.
+    Load a scenario from the dataset folder.
 
-    Structure attendue sous ``{base_dir}/src/dataset/{scenario_id}/`` :
+    Expected structure under ``{base_dir}/src/dataset/{scenario_id}/``:
 
-    - Modèle BP : ``bp_global.json`` (priorité) ou ``bp_model.json``
-    - Fragments : ``fragments.json``
-    - Policies ODRL : ``B2P.json`` (priorité) ou ``b2p_policies.json``
+    - BP model: ``bp_global.json`` (preferred) or ``bp_model.json``
+    - Fragments: ``fragments.json``
+    - ODRL policies: ``B2P.json`` (preferred) or ``b2p_policies.json``
     """
     scenario_dir = os.path.join(base_dir, "src", "dataset", scenario_id)
 
@@ -53,15 +53,15 @@ def discover_scenarios(
     pattern: str = r"^scenario\d{3}$",
 ) -> List[str]:
     """
-    Liste les identifiants de scénarios présents sous ``src/dataset/`` dont le nom
-    correspond à l'expression régulière (par défaut ``scenario001`` … ``scenario999`` sur 3 chiffres).
+    List scenario identifiers under ``src/dataset/`` whose folder name
+    matches the regular expression (default ``scenario001`` … ``scenario999`` with 3 digits).
 
     Parameters
     ----------
     base_dir
-        Racine du projet (dossier contenant ``src/dataset``).
+        Project root (folder containing ``src/dataset``).
     pattern
-        Regex appliquée au nom du dossier uniquement.
+        Regex applied to the folder name only.
     """
     ds = os.path.join(base_dir, "src", "dataset")
     if not os.path.isdir(ds):

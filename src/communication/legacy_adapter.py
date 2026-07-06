@@ -96,19 +96,19 @@ def agent_message_to_acl(
 
     if msg.msg_type == MessageType.GRAPH_READY:
         perf, ont = ACLPerformative.INFORM, "graph-structural"
-    elif msg.msg_type == MessageType.CFP_UNSUPPORTED:
-        perf, ont = ACLPerformative.CFP, "unsupported-formulation"
-    elif msg.msg_type == MessageType.UNSUPPORTED_PROPOSALS:
-        perf, ont = ACLPerformative.PROPOSE, "unsupported-formulation"
+    elif msg.msg_type == MessageType.CFP_UNMAPPED:
+        perf, ont = ACLPerformative.CFP, "unmapped-formulation"
+    elif msg.msg_type == MessageType.UNMAPPED_PROPOSALS:
+        perf, ont = ACLPerformative.PROPOSE, "unmapped-formulation"
     elif msg.msg_type == MessageType.REFORMULATED_PROPOSALS:
-        perf, ont = ACLPerformative.INFORM, "unsupported-formulation"
+        perf, ont = ACLPerformative.INFORM, "unmapped-formulation"
     elif msg.msg_type == MessageType.REFORMULATE:
-        perf, ont = ACLPerformative.REQUEST, "unsupported-formulation"
+        perf, ont = ACLPerformative.REQUEST, "unmapped-formulation"
         extra_content[FIPA_EXPECTS_AGREE_KEY] = True
     elif msg.msg_type == MessageType.ACCEPT_PROPOSAL_BATCH:
-        perf, ont = ACLPerformative.ACCEPT_PROPOSAL, "unsupported-formulation"
+        perf, ont = ACLPerformative.ACCEPT_PROPOSAL, "unmapped-formulation"
     elif msg.msg_type == MessageType.REJECT_PROPOSAL_BATCH:
-        perf, ont = ACLPerformative.REJECT_PROPOSAL, "unsupported-formulation"
+        perf, ont = ACLPerformative.REJECT_PROPOSAL, "unmapped-formulation"
     elif msg.msg_type == MessageType.VALIDATION_DONE:
         perf, ont = ACLPerformative.REQUEST, "semantic-audit"
         extra_content[FIPA_EXPECTS_AGREE_KEY] = True
@@ -118,6 +118,12 @@ def agent_message_to_acl(
         )
     elif msg.msg_type == MessageType.POLICIES_READY:
         perf, ont = ACLPerformative.INFORM, "policy-projection"
+    elif msg.msg_type == MessageType.FP_BUNDLE_READY:
+        perf, ont = ACLPerformative.INFORM, "policy-projection"
+        extra_content.setdefault(
+            "utterance",
+            "Merged fragment policy bundle is ready for syntax and semantic audit.",
+        )
     elif msg.msg_type == MessageType.SEMANTIC_CORRECTION:
         perf, ont = ACLPerformative.REQUEST, "semantic-audit"
         extra_content[FIPA_EXPECTS_AGREE_KEY] = True
@@ -224,19 +230,19 @@ def acl_to_agent_message(env: ACLEnvelope) -> AgentMessage:
             loop_turn=loop_turn,
         )
 
-    if perf == ACLPerformative.CFP and ont == "unsupported-formulation":
+    if perf == ACLPerformative.CFP and ont == "unmapped-formulation":
         payload["cfp_call_id"] = env.reply_with
-        mtype = MessageType.CFP_UNSUPPORTED
-    elif perf == ACLPerformative.REQUEST and ont == "unsupported-formulation":
+        mtype = MessageType.CFP_UNMAPPED
+    elif perf == ACLPerformative.REQUEST and ont == "unmapped-formulation":
         payload["reformulate_request_id"] = env.reply_with
         mtype = MessageType.REFORMULATE
-    elif perf == ACLPerformative.PROPOSE and ont == "unsupported-formulation":
+    elif perf == ACLPerformative.PROPOSE and ont == "unmapped-formulation":
         payload["proposal_message_id"] = env.reply_with
         try:
-            mtype = MessageType(msg_type_val) if msg_type_val else MessageType.UNSUPPORTED_PROPOSALS
+            mtype = MessageType(msg_type_val) if msg_type_val else MessageType.UNMAPPED_PROPOSALS
         except ValueError:
-            mtype = MessageType.UNSUPPORTED_PROPOSALS
-    elif perf == ACLPerformative.INFORM and ont == "unsupported-formulation":
+            mtype = MessageType.UNMAPPED_PROPOSALS
+    elif perf == ACLPerformative.INFORM and ont == "unmapped-formulation":
         if msg_type_val == MessageType.REFORMULATED_PROPOSALS.value:
             mtype = MessageType.REFORMULATED_PROPOSALS
         else:
@@ -275,8 +281,13 @@ def acl_to_agent_message(env: ACLEnvelope) -> AgentMessage:
     elif perf == ACLPerformative.AGREE:
         # FIPA AGREE (réponse à REQUEST dont syntax_correction) — sinon repli fautif → graph_ready
         mtype = MessageType.DELEGATION_AGREE
+        # Conserver l'ontologie pour Agent 4 (réparation syntaxe après ODRL_SYNTAX_FAILURE).
+        if ont and str(ont) != "legacy":
+            payload["_acl_ontology"] = ont
     elif perf == ACLPerformative.REFUSE:
         mtype = MessageType.DELEGATION_REFUSE
+        if ont and str(ont) != "legacy":
+            payload["_acl_ontology"] = ont
     elif msg_type_val:
         try:
             mtype = MessageType(msg_type_val)

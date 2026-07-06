@@ -6,9 +6,11 @@ pandas
 python-dotenv
 openai
 rdflib
+owlrl
 pyld
 pyshacl
 numpy
+scikit-learn
 lxml
 requests
 httpx

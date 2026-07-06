@@ -1,5 +1,5 @@
 """
-Pont HITL pour l'API web : les décisions humaines arrivent via HTTP au lieu du terminal.
+HITL bridge for the web API: human decisions arrive via HTTP instead of the terminal.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from communication.acl import ACLEnvelope
 
 
 def _safe_json_content(content: dict[str, Any]) -> dict[str, Any]:
-    """Sérialise le contenu ACL pour le frontend (objets non JSON -> str)."""
+    """Serialize ACL content for the frontend (non-JSON objects -> str)."""
     try:
         return json.loads(json.dumps(content or {}, default=str))
     except Exception:
@@ -23,7 +23,7 @@ def _safe_json_content(content: dict[str, Any]) -> dict[str, Any]:
 
 
 def envelope_to_wire_dict(env: ACLEnvelope) -> dict[str, Any]:
-    """Représentation JSON d'une enveloppe FIPA-ACL pour le SSE."""
+    """JSON representation of a FIPA-ACL envelope for SSE."""
     perf = env.performative.value if hasattr(env.performative, "value") else str(env.performative)
     return {
         "performative": perf,
@@ -41,8 +41,8 @@ def envelope_to_wire_dict(env: ACLEnvelope) -> dict[str, Any]:
 
 class WebHitlBridge:
     """
-    - ``wait_for_decision`` : appelé par ``HumanAgent`` ; notifie le SSE et attend POST /hitl.
-    - ``submit`` : résout la future quand l'utilisateur répond depuis le frontend.
+    - ``wait_for_decision`` : called by ``HumanAgent``; notifies SSE and waits for POST /hitl.
+    - ``submit`` : resolves the future when the user responds from the frontend.
     """
 
     def __init__(self) -> None:
@@ -50,7 +50,7 @@ class WebHitlBridge:
         self._futures: dict[str, asyncio.Future[HumanDecision]] = {}
 
     def pending_hitl_keys(self) -> list[str]:
-        """Pour logs API (diagnostic POST /hitl refusé)."""
+        """For API logs (diagnostic when POST /hitl is rejected)."""
         return list(self._futures.keys())
 
     async def wait_for_decision(self, env: ACLEnvelope) -> HumanDecision:
@@ -77,7 +77,7 @@ class WebHitlBridge:
         if fut is None:
             # Legacy frontend compatibility:
             # some clients keep submitting the first `reply_with` even when the
-            # backend has already moved to the next unsupported proposal.
+            # backend has already moved to the next unmapped proposal.
             # In one-by-one HITL mode, there is at most one pending request, so
             # we can safely route the answer to that sole pending future.
             if len(self._futures) == 1:
@@ -98,14 +98,14 @@ class WebHitlBridge:
         await self._event_queue.put({"type": "log", "message": message})
 
     async def emit_acl(self, env: ACLEnvelope) -> None:
-        """Trace chaque message publié sur le bus (démo FIPA)."""
+        """Trace each message published on the bus (FIPA demo)."""
         await self._event_queue.put({"type": "acl", "envelope": envelope_to_wire_dict(env)})
 
     async def emit_error(self, message: str) -> None:
         await self._event_queue.put({"type": "error", "message": message})
 
     async def iter_events(self) -> AsyncIterator[dict[str, Any]]:
-        """Consomme la file jusqu'à un événement ``done`` ou ``error``."""
+        """Consume the queue until a ``done`` or ``error`` event."""
         while True:
             item = await self._event_queue.get()
             yield item
@@ -113,7 +113,7 @@ class WebHitlBridge:
                 break
 
     async def pull_event_or_timeout(self, timeout_s: float) -> dict[str, Any] | None:
-        """Pour SSE : ``None`` si timeout (envoyer un commentaire keep-alive)."""
+        """For SSE: ``None`` on timeout (send a keep-alive comment)."""
         try:
             return await asyncio.wait_for(self._event_queue.get(), timeout=timeout_s)
         except asyncio.TimeoutError:

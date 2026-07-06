@@ -1,43 +1,43 @@
 """
-structural_analyzer.py — Agent 1 : Structural Analyzer
+structural_analyzer.py — Agent 1: Structural Analyzer
 
-Responsabilité unique :
-    Lire le BPMN brut → construire le graphe formel G_exp → détecter les patterns structurels.
+Single responsibility:
+    Read raw BPMN → build formal graph G_exp → detect structural patterns.
 
-Cet agent NE génère PAS de policies.
-Il prépare la vérité structurelle pour tous les agents suivants.
+This agent does NOT generate policies.
+It prepares the structural truth for all downstream agents.
 
-Sortie : EnrichedGraph contenant
-    - Le graphe formel G (BPMNGraph)
-    - Les patterns détectés (forks, joins, loops, sync points)
-    - Le mapping B2P → activités
-    - Les connexions typées entre activités
-    - Le contexte global CG et local CL pour chaque fragment
+Output: EnrichedGraph containing
+    - The formal graph G (BPMNGraph)
+    - Detected patterns (forks, joins, loops, sync points)
+    - B2P → activity mapping
+    - Typed connections between activities
+    - Global CG and local CL context for each fragment
 
 ─────────────────────────────────────────────────────────────────
-  COUCHE MULTI-AGENT
+  MULTI-AGENT LAYER
 ─────────────────────────────────────────────────────────────────
-  Cet agent expose également l'infrastructure de messagerie
-  partagée par tous les agents du pipeline :
+  This agent also exposes the messaging infrastructure
+  shared by all pipeline agents:
 
       MessageType, AgentMessage
 
-  Ces classes sont importées par tous les autres agents :
+  These classes are imported by all other agents:
       from .structural_analyzer import AgentMessage, MessageType
 
-  Méthodes multi-agent de StructuralAnalyzer :
-      register_send_callback(fn)  — connecte la sortie (bus / Agent 3)
-      send(msg)                   — émet un AgentMessage
-      receive(msg)                — accepte ANALYZE_GRAPH_TASK (orchestrateur async)
-      analyze_and_send()          — analyze() + GRAPH_READY (agent3) + CFP (exception handling) si besoin
+  StructuralAnalyzer multi-agent methods:
+      register_send_callback(fn)  — connect output (bus / Agent 3)
+      send(msg)                   — emit an AgentMessage
+      receive(msg)                — accept ANALYZE_GRAPH_TASK (async orchestrator)
+      analyze_and_send()          — analyze() + GRAPH_READY (agent3) + CFP (exception handling) if needed
 
-  Le graphe BPMN d'entrée n'est pas modifié en cours de pipeline : les problèmes
-  structurels signalés par l'Agent 3 donnent lieu à un rejet / rapport, pas à une
-  mutation du modèle analysé.
+  The input BPMN graph is not modified during the pipeline: structural issues
+  reported by Agent 3 result in rejection / report, not mutation of the analyzed model.
 """
 
 import datetime
 import re
+import uuid
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from enum import Enum
@@ -45,8 +45,8 @@ from typing import Callable, Optional
 
 from .pipeline_registry import BPMN_SEMANTICS, COVERED_PATTERNS
 
-# Import fragmentation à la demande dans analyze() pour éviter dépendance circulaire
-# et garder l'agent utilisable si fragments est fourni en entrée.
+# Lazy fragmentation import in analyze() to avoid circular dependency
+# and keep the agent usable when fragments are supplied as input.
 
 from orchestration.graph import (
     BPMNGraph,
@@ -63,31 +63,31 @@ from baseline.semantic_fragmenter import normalize_fragment_slug
 
 
 # ─────────────────────────────────────────────
-#  Infrastructure de messagerie multi-agent
-#  (importée par tous les agents du pipeline)
+#  Multi-agent messaging infrastructure
+#  (imported by all pipeline agents)
 # ─────────────────────────────────────────────
 
 class MessageType(Enum):
     """
-    Types de messages échangés entre agents.
+    Message types exchanged between agents.
 
-    Flux principal :
+    Main flow:
         Agent 1 ──GRAPH_READY──────────► Agent 3
-        Agent 1 ──CFP_UNSUPPORTED──────► Exception handling agent   (si patterns non couverts, après GRAPH_READY)
-        Exception handling agent ──UNSUPPORTED_PROPOSALS──► Agent 3   (ACL PROPOSE)
-        Exception handling agent ──REFORMULATED_PROPOSALS─► Agent 3   (ACL INFORM après REFORMULATE+agree)
-        Agent 3 ──REFORMULATE──────────► Exception handling agent   (boucle courte)
+        Agent 1 ──CFP_UNMAPPED──────► Exception handling agent   (if uncovered patterns, after GRAPH_READY)
+        Exception handling agent ──UNMAPPED_PROPOSALS──► Agent 3   (ACL PROPOSE)
+        Exception handling agent ──REFORMULATED_PROPOSALS─► Agent 3   (ACL INFORM after REFORMULATE+agree)
+        Agent 3 ──REFORMULATE──────────► Exception handling agent   (short loop)
         Agent 3 ──VALIDATION_DONE──────► Agent 4
-        Agent 4 ──SYNTAX_AUDIT_REQUEST──► Agent 5   (syntaxe + cohérence globale)
-        Agent 5 ──ODRL_SYNTAX_FAILURE──► Agent 4 → boucle corrections A4↔A5
-        Agent 5 ──ODRL_VALID (passe 1)──► Agent 4 → POLICIES_READY → Agent 3
-        Agent 3 ──SEMANTIC_VALIDATION_FAILURE──► Agent 4  (ACL FAILURE, puis)
+        Agent 4 ──SYNTAX_AUDIT_REQUEST──► Agent 5   (syntax + global coherence)
+        Agent 5 ──ODRL_SYNTAX_FAILURE──► Agent 4 → correction loop A4↔A5
+        Agent 5 ──ODRL_VALID (pass 1)──► Agent 4 → POLICIES_READY → Agent 3
+        Agent 3 ──SEMANTIC_VALIDATION_FAILURE──► Agent 4  (ACL FAILURE, then)
         Agent 3 ──SEMANTIC_CORRECTION──► Agent 4
-        Agent 3 ──SEMANTIC_VALIDATED───► Agent 4 → SYNTAX_AUDIT_REQUEST → Agent 5 (passe 2)
+        Agent 3 ──SEMANTIC_VALIDATED───► Agent 4 → SYNTAX_AUDIT_REQUEST → Agent 5 (pass 2)
         Agent 5 ──ODRL_VALID / ODRL_SYNTAX_ERROR──► Agent 4 → pipeline
     """
     GRAPH_READY        = "graph_ready"
-    UNSUPPORTED_PROPOSALS = "unsupported_proposals"
+    UNMAPPED_PROPOSALS = "unmapped_proposals"
     REFORMULATED_PROPOSALS = "reformulated_proposals"
     REFORMULATE        = "reformulate"
     VALIDATION_DONE    = "validation_done"
@@ -100,29 +100,31 @@ class MessageType(Enum):
     ODRL_SYNTAX_ERROR  = "odrl_syntax_error"
     # FIPA-style extensions (ACL performatives mapped in ``legacy_adapter``)
     ANALYZE_GRAPH_TASK = "analyze_graph_task"
-    CFP_UNSUPPORTED = "cfp_unsupported"
+    CFP_UNMAPPED = "cfp_unmapped"
     ACCEPT_PROPOSAL_BATCH = "accept_proposal_batch"
     REJECT_PROPOSAL_BATCH = "reject_proposal_batch"
     DELEGATION_AGREE = "delegation_agree"
     DELEGATION_REFUSE = "delegation_refuse"
     SYNTAX_AUDIT_REQUEST = "syntax_audit_request"
     ODRL_SYNTAX_FAILURE = "odrl_syntax_failure"
+    # FP batch already projected (merge templates + unmapped) — syntax/semantic audit without regeneration
+    FP_BUNDLE_READY = "fp_bundle_ready"
 
 
 @dataclass
 class AgentMessage:
     """
-    Message échangé entre deux agents du pipeline.
+    Message exchanged between two pipeline agents.
 
-    Champs :
-        sender    — AGENT_NAME de l'émetteur  (ex: "agent1")
-        recipient — AGENT_NAME du destinataire (ex: "exception_handling_agent")
-        msg_type  — type de message (MessageType)
-        payload   — données spécifiques au message
-        timestamp — ISO généré automatiquement à la création
-        loop_turn — tour de boucle courant :
-                      · 0 pour le premier message d'un cycle
-                      · incrémenté par l'agent qui répond dans une boucle
+    Fields:
+        sender    — AGENT_NAME of sender  (e.g. "agent1")
+        recipient — AGENT_NAME of recipient (e.g. "exception_handling_agent")
+        msg_type  — message type (MessageType)
+        payload   — message-specific data
+        timestamp — ISO generated automatically at creation
+        loop_turn — current loop turn:
+                      · 0 for the first message in a cycle
+                      · incremented by the agent responding in a loop
     """
     sender:    str
     recipient: str
@@ -142,30 +144,30 @@ class AgentMessage:
 
 
 # ─────────────────────────────────────────────
-#  Structures de sortie de l'agent
+#  Agent output structures
 # ─────────────────────────────────────────────
 
 
 @dataclass
 class StructuralPattern:
     """
-    Un pattern structurel détecté dans le graphe.
+    A structural pattern detected in the graph.
 
-    Exemples : fork-XOR, join-AND, synchronization point, loop.
+    Examples: fork-XOR, join-AND, synchronization point, loop.
     """
 
     pattern_type: str  # "fork_xor" | "fork_and" | "fork_or" | "join_and" | "join_xor" | "sync" | "loop"
-    gateway_id: str  # ID de la gateway concernée
+    gateway_id: str  # ID of the gateway involved
     gateway_name: str
-    involved_nodes: list[str]  # IDs des nœuds impliqués
-    fragment_id: Optional[str]  # Fragment concerné (None si inter-fragment)
-    description: str  # Explication humaine du pattern
+    involved_nodes: list[str]  # IDs of involved nodes
+    fragment_id: Optional[str]  # Fragment involved (None if inter-fragment)
+    description: str  # Human-readable pattern explanation
     involved_fragment_ids: list[str] = field(default_factory=list)
     involved_activity_names: list[str] = field(default_factory=list)
 
 
 @dataclass
-class UnsupportedPattern:
+class UnmappedPattern:
     """
     BPMN structural pattern not covered by deterministic Agent 4 templates.
     Routed to the exception handling agent for LLM formulation.
@@ -198,27 +200,27 @@ class SemanticHint:
 @dataclass
 class ActivityB2PMapping:
     """
-    Mapping entre une activité et ses B2P policies applicables.
+    Mapping between an activity and its applicable B2P policies.
     """
 
     activity_id: str
     activity_name: str
     fragment_id: str
-    b2p_policy_ids: list[str]  # UIDs des policies B2P qui ciblent cette activité
+    b2p_policy_ids: list[str]  # UIDs of B2P policies targeting this activity
     rule_types: list[str]  # ["permission", "prohibition", "obligation"]
 
 
 @dataclass
 class ConnectionInfo:
     """
-    Information structurée sur une connexion entre deux activités.
+    Structured information about a connection between two activities.
     """
 
-    from_activity: str  # Nom de l'activité source
-    to_activity: str  # Nom de l'activité cible
+    from_activity: str  # Source activity name
+    to_activity: str  # Target activity name
     connection_type: str  # "sequence" | "xor" | "and" | "or" | "message"
-    gateway_name: Optional[str]  # Nom de la gateway si présente
-    condition: Optional[str]  # Condition de branche
+    gateway_name: Optional[str]  # Gateway name if present
+    condition: Optional[str]  # Branch condition
     is_inter: bool  # Inter-fragment ?
     from_fragment: str
     to_fragment: str
@@ -227,22 +229,22 @@ class ConnectionInfo:
 @dataclass
 class FragmentContext:
     """
-    Contexte d'un fragment — utilisé par les agents suivants.
+    Fragment context — used by downstream agents.
 
-    Deux variantes :
-        Global (CG) : vue complète du processus
-        Local  (CL) : vue limitée au voisinage immédiat
+    Two variants:
+        Global (CG): full process view
+        Local  (CL): view limited to immediate neighborhood
     """
 
     fragment_id: str
-    activities: list[str]  # Slugs d activités (cf. fragments.json)
-    gateways: list[str]  # Noms de gateways (slugs si issus du fragmenteur)
+    activities: list[str]  # Activity slugs (see fragments.json)
+    gateways: list[str]  # Gateway names (slugs if from fragmenter)
     b2p_mappings: list[ActivityB2PMapping]
-    connections: list[ConnectionInfo]  # Connexions internes
-    upstream_deps: list[ConnectionInfo]  # Dépendances entrantes (inter)
-    downstream_deps: list[ConnectionInfo]  # Dépendances sortantes (inter)
+    connections: list[ConnectionInfo]  # Internal connections
+    upstream_deps: list[ConnectionInfo]  # Incoming dependencies (inter)
+    downstream_deps: list[ConnectionInfo]  # Outgoing dependencies (inter)
 
-    # Contexte global (CG) — rempli si global_context=True
+    # Global context (CG) — filled if global_context=True
     global_graph_summary: Optional[dict] = None
     all_inter_edges: Optional[list[ConnectionInfo]] = None
 
@@ -254,21 +256,21 @@ class FragmentContext:
 @dataclass
 class EnrichedGraph:
     """
-    Sortie finale de l'Agent 1.
+    Final output of Agent 1.
 
-    C'est ce que les agents suivants consomment.
-    Contient le graphe formel + toutes les analyses structurelles.
+    This is what downstream agents consume.
+    Contains the formal graph + all structural analyses.
     """
 
     graph: BPMNGraph
     patterns: list[StructuralPattern]
     b2p_mappings: dict[str, ActivityB2PMapping]  # activity_id → mapping
     connections: list[ConnectionInfo]
-    fragment_contexts: dict[str, FragmentContext]  # fragment_id → contexte local
-    global_contexts: dict[str, FragmentContext]  # fragment_id → contexte global
-    raw_bpmn: dict  # BPMN original (référence)
-    raw_b2p: list[dict]  # B2P policies originales
-    unsupported_patterns: list[UnsupportedPattern] = field(default_factory=list)
+    fragment_contexts: dict[str, FragmentContext]  # fragment_id → local context
+    global_contexts: dict[str, FragmentContext]  # fragment_id → global context
+    raw_bpmn: dict  # Original BPMN (reference)
+    raw_b2p: list[dict]  # Original B2P policies
+    unmapped_patterns: list[UnmappedPattern] = field(default_factory=list)
     # Reserved — B2P ambiguity LLM moved to Agent 3; always None.
     structural_llm_report: Optional[dict] = None
 
@@ -280,29 +282,29 @@ class EnrichedGraph:
 
 class StructuralAnalyzer:
     """
-    Agent 1 du pipeline multi-agent.
+    Agent 1 of the multi-agent pipeline.
 
-    Reçoit :
-        - bp_model   : dict BPMN (activities, gateways, flows)
-        - fragments  : list de fragments (même format que ``fragments.json``), ou None pour les calculer
-        - b2p_policies : list de policies ODRL du BP global
-        - fragmentation_strategy : conservé pour compatibilité d'API ; la fragmentation auto est pilotée par LLM
+    Receives:
+        - bp_model   : BPMN dict (activities, gateways, flows)
+        - fragments  : fragment list (same format as ``fragments.json``), or None to compute them
+        - b2p_policies : list of ODRL policies from the global BP
+        - fragmentation_strategy : kept for API compatibility; auto fragmentation is LLM-driven
 
-    Si fragments est None, l'agent utilise la fragmentation LLM (baseline) pour les fragments
-    à partir du bp_model. Les ids sont normalisés en "f1", "f2", ... pour cohérence.
+    If fragments is None, the agent uses LLM fragmentation (baseline) for fragments
+    from bp_model. IDs are normalized to "f1", "f2", ... for consistency.
 
-    Produit :
-        - EnrichedGraph : graphe formel enrichi, prêt pour les agents suivants
+    Produces:
+        - EnrichedGraph: enriched formal graph, ready for downstream agents
 
-    Analyse entièrement DÉTERMINISTE (graphe, patterns, connexions, mapping B2P heuristique).
+    Fully DETERMINISTIC analysis (graph, patterns, connections, heuristic B2P mapping).
 
-    ── Couche multi-agent ──────────────────────────────────────────────
-    En mode connecté (pipeline complet) :
+    ── Multi-agent layer ──────────────────────────────────────────────
+    In connected mode (full pipeline):
         analyzer.register_send_callback(agent3.receive)
-        analyzer.analyze_and_send()   # démarre le pipeline
+        analyzer.analyze_and_send()   # starts the pipeline
 
-    En mode standalone (tests unitaires) :
-        enriched_graph = analyzer.analyze()   # aucun callback nécessaire
+    In standalone mode (unit tests):
+        enriched_graph = analyzer.analyze()   # no callback required
     """
 
     AGENT_NAME = "agent1"
@@ -334,44 +336,44 @@ class StructuralAnalyzer:
         self.fragmentation_strategy = fragmentation_strategy
         self.graph = BPMNGraph()
 
-        # Index interne : nom → id (pour la résolution des flows)
+        # Internal index: name → id (for flow resolution)
         self._name_to_id: dict[str, str] = {}
-        self._fragment_of: dict[str, str] = {}  # slug activité (cf. fragments.json) → fragment_id
+        self._fragment_of: dict[str, str] = {}  # activity slug (see fragments.json) → fragment_id
 
-        # ── Attributs multi-agent ──────────────────────────────────
+        # ── Multi-agent attributes ──────────────────────────────────
         self._on_send: Optional[Callable[[AgentMessage], None]] = None
         self._last_enriched_graph: Optional[EnrichedGraph] = None
 
     # ─────────────────────────────────────────
-    #  Couche multi-agent
+    #  Multi-agent layer
     # ─────────────────────────────────────────
 
     def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
         """
-        Enregistre le callback vers Agent 3.
-        En mode pipeline : analyzer.register_send_callback(agent3.receive)
+        Register callback to Agent 3.
+        In pipeline mode: analyzer.register_send_callback(agent3.receive)
         """
         self._on_send = fn
-        print(f"[Agent 1] Callback send enregistré → {fn}")
+        print(f"[Agent 1] Send callback registered → {fn}")
 
     def send(self, msg: AgentMessage) -> None:
-        """Émet un AgentMessage vers le destinataire enregistré."""
+        """Emit an AgentMessage to the registered recipient."""
         print(f"[Agent 1] ► SEND {msg}")
         if self._on_send:
             self._on_send(msg)
         else:
-            print(f"[Agent 1][WARN] Aucun callback — message '{msg.msg_type.value}' non transmis.")
+            print(f"[Agent 1][WARN] No callback — message '{msg.msg_type.value}' not sent.")
 
     def receive(self, msg: AgentMessage) -> None:
         """
-        Point d'entrée pour les messages entrants (orchestrateur async).
-        Accepte ``ANALYZE_GRAPH_TASK`` ; ignore le reste avec avertissement.
+        Entry point for incoming messages (async orchestrator).
+        Accepts ``ANALYZE_GRAPH_TASK``; ignores the rest with a warning.
         """
         print(f"[Agent 1] ◄ RECEIVE {msg}")
         if msg.msg_type == MessageType.ANALYZE_GRAPH_TASK:
             self._handle_analyze_graph_task(msg)
         else:
-            print(f"[Agent 1][WARN] Message '{msg.msg_type.value}' non géré — ignoré.")
+            print(f"[Agent 1][WARN] Message '{msg.msg_type.value}' not handled — ignored.")
 
     def _handle_analyze_graph_task(self, msg: AgentMessage) -> None:
         """
@@ -411,25 +413,26 @@ class StructuralAnalyzer:
                 loop_turn=msg.loop_turn,
             )
         )
-        self._emit_cfp_if_unsupported(enriched_graph, loop_turn=msg.loop_turn)
+        self._emit_cfp_if_unmapped(enriched_graph, loop_turn=msg.loop_turn)
 
-    def _emit_cfp_if_unsupported(self, enriched_graph: EnrichedGraph, *, loop_turn: int) -> None:
+    def _emit_cfp_if_unmapped(self, enriched_graph: EnrichedGraph, *, loop_turn: int) -> None:
         """
-        Appel d'offres (CFP) vers l'agent 2 si des patterns BPMN ne sont pas couverts par les templates.
-        Déterministe — aucun LLM : l'agent 1 a déjà rempli ``unsupported_patterns`` lors de l'analyse.
+        Call for proposals (CFP) to the exception handling agent if BPMN patterns are not covered by templates.
+        Deterministic — no LLM: agent 1 already filled ``unmapped_patterns`` during analysis.
         """
-        unsupported = list(getattr(enriched_graph, "unsupported_patterns", []) or [])
-        if not unsupported:
+        unmapped = list(getattr(enriched_graph, "unmapped_patterns", []) or [])
+        if not unmapped:
             return
         print(
-            f"[Agent 1] {len(unsupported)} pattern(s) non couvert(s) — CFP vers l'exception handling agent "
-            "(formulation unsupported)"
+            f"[Agent 1] {len(unmapped)} uncovered pattern(s) — CFP to exception handling agent "
+            "(formulation unmapped)"
         )
+        cfp_call_id = uuid.uuid4().hex
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
                 recipient="exception_handling_agent",
-                msg_type=MessageType.CFP_UNSUPPORTED,
+                msg_type=MessageType.CFP_UNMAPPED,
                 payload={
                     "enriched_graph": enriched_graph,
                     "utterance": (
@@ -437,7 +440,9 @@ class StructuralAnalyzer:
                         "deterministic templates — propose ODRL fragment-policy hints with "
                         "conditions and justification."
                     ),
-                    "unsupported_pattern_count": len(unsupported),
+                    "unmapped_pattern_count": len(unmapped),
+                    "cfp_call_id": cfp_call_id,
+                    "_acl_reply_with": cfp_call_id,
                 },
                 loop_turn=loop_turn,
             )
@@ -445,10 +450,10 @@ class StructuralAnalyzer:
 
     def analyze_and_send(self) -> None:
         """
-        Version connectée de analyze() pour le mode pipeline.
-        Lance l'analyse complète puis émet GRAPH_READY vers Agent 3.
+        Connected version of analyze() for pipeline mode.
+        Runs full analysis then emits GRAPH_READY to Agent 3.
 
-        En mode standalone (tests), utiliser analyze() directement.
+        In standalone mode (tests), use analyze() directly.
         """
         enriched_graph = self.analyze()
         self._last_enriched_graph = enriched_graph
@@ -466,54 +471,54 @@ class StructuralAnalyzer:
                 ),
             },
         ))
-        self._emit_cfp_if_unsupported(enriched_graph, loop_turn=0)
+        self._emit_cfp_if_unmapped(enriched_graph, loop_turn=0)
 
     # ─────────────────────────────────────────
-    #  Point d'entrée principal
+    #  Main entry point
     # ─────────────────────────────────────────
 
     def analyze(self) -> EnrichedGraph:
         """
-        Lance l'analyse complète.
+        Run full analysis.
 
-        Étapes :
-            0. Si fragments non fourni : calcul via fragmentation LLM
-            1. Construire le graphe formel G depuis le BPMN
-            2. Mapper les B2P policies aux activités
-            3. Détecter les patterns structurels
-            4. Construire les ConnectionInfo
-            5. Construire les contextes locaux CL et globaux CG
+        Steps:
+            0. If fragments not supplied: compute via LLM fragmentation
+            1. Build formal graph G from BPMN
+            2. Map B2P policies to activities
+            3. Detect structural patterns
+            4. Build ConnectionInfo
+            5. Build local CL and global CG contexts
         """
-        print("[Agent 1] Structural Analyzer — démarrage de l'analyse")
+        print("[Agent 1] Structural Analyzer — starting analysis")
 
-        # Étape 0 — Calcul des fragments si non fournis
+        # Step 0 — Compute fragments if not supplied
         if self.fragments is None:
             self.fragments = self._compute_fragments()
-            print(f"[Agent 1] Fragments calculés (LLM) : {len(self.fragments)}")
+            print(f"[Agent 1] Fragments computed (LLM): {len(self.fragments)}")
 
-        # Étape 1 — Construction du graphe formel
+        # Step 1 — Build formal graph
         self._build_graph()
-        print(f"[Agent 1] Graphe construit : {self.graph}")
+        print(f"[Agent 1] Graph built: {self.graph}")
 
-        # Étape 2 — Mapping B2P → activités
+        # Step 2 — B2P → activity mapping
         b2p_mappings = self._map_b2p_to_activities()
-        print(f"[Agent 1] B2P mappings : {len(b2p_mappings)} activités mappées")
+        print(f"[Agent 1] B2P mappings: {len(b2p_mappings)} activities mapped")
 
-        # Étape 3 — Détection des patterns (+ unsupported vs pipeline_registry)
-        patterns, unsupported_patterns = self._detect_patterns()
-        print(f"[Agent 1] Patterns détectés : {len(patterns)}")
+        # Step 3 — Pattern detection (+ unmapped vs pipeline_registry)
+        patterns, unmapped_patterns = self._detect_patterns()
+        print(f"[Agent 1] Patterns detected: {len(patterns)}")
         for p in patterns:
             print(f"    -> [{p.pattern_type}] {p.gateway_name} : {p.description}")
-        print(f"[Agent 1] Patterns non couverts (unsupported) : {len(unsupported_patterns)}")
+        print(f"[Agent 1] Uncovered patterns (unmapped): {len(unmapped_patterns)}")
 
-        # Étape 4 — Construction des ConnectionInfo
+        # Step 4 — Build ConnectionInfo
         connections = self._build_connections()
-        print(f"[Agent 1] Connexions analysées : {len(connections)}")
+        print(f"[Agent 1] Connections analyzed: {len(connections)}")
 
-        # Étape 5 — Contextes locaux et globaux par fragment
+        # Step 5 — Local and global contexts per fragment
         local_contexts = self._build_local_contexts(b2p_mappings, connections)
         global_contexts = self._build_global_contexts(b2p_mappings, connections)
-        print(f"[Agent 1] Contextes construits pour {len(local_contexts)} fragments")
+        print(f"[Agent 1] Contexts built for {len(local_contexts)} fragments")
 
         return EnrichedGraph(
             graph=self.graph,
@@ -524,20 +529,20 @@ class StructuralAnalyzer:
             global_contexts=global_contexts,
             raw_bpmn=self.bp_model,
             raw_b2p=self.b2p_policies,
-            unsupported_patterns=unsupported_patterns,
+            unmapped_patterns=unmapped_patterns,
             structural_llm_report=None,
         )
 
     def _compute_fragments(self) -> list[dict]:
         """
-        Calcule les fragments via ``SemanticFragmenter`` (LLM + gateways BPMN).
-        Normalise les ids en "f1", "f2", ... pour cohérence avec les tests.
+        Compute fragments via ``SemanticFragmenter`` (LLM + BPMN gateways).
+        Normalize ids to "f1", "f2", ... for test consistency.
         """
         from baseline.semantic_fragmenter import SemanticFragmenter
 
         fragmenter = SemanticFragmenter(self.bp_model)
         raw_fragments = fragmenter.fragment_process(strategy=self.fragmentation_strategy)
-        # Normaliser les ids (SemanticFragmenter.fragment_process renvoie 0, 1, 2...)
+        # Normalize ids (SemanticFragmenter.fragment_process returns 0, 1, 2...)
         normalized = []
         for i, frag in enumerate(raw_fragments):
             f = dict(frag)
@@ -546,20 +551,20 @@ class StructuralAnalyzer:
         return normalized
 
     # ─────────────────────────────────────────
-    #  Étape 1 — Construction du graphe formel
+    #  Step 1 — Build formal graph
     # ─────────────────────────────────────────
 
     def _build_graph(self) -> None:
-        """Transforme le BPMN brut en graphe formel G = (V, E)."""
+        """Transform raw BPMN into formal graph G = (V, E)."""
 
-        # Construire le mapping nom → fragment_id
+        # Build name → fragment_id mapping
         for i, frag in enumerate(self.fragments):
             frag_id = frag.get("id", f"f{i}")
             frag["id"] = frag_id
             for act_name in frag.get("activities", []):
                 self._fragment_of[normalize_fragment_slug(act_name)] = frag_id
 
-        # ── Nœuds Activity ──
+        # ── Activity nodes ──
         for act in self.bp_model.get("activities", []):
             node_id = f"act_{act['name'].replace(' ', '_')}"
             frag_id = self._fragment_of.get(normalize_fragment_slug(act["name"]))
@@ -577,7 +582,7 @@ class StructuralAnalyzer:
             self.graph.add_node(node)
             self._name_to_id[act["name"]] = node_id
 
-        # ── Nœuds Gateway ──
+        # ── Gateway nodes ──
         gw_type_map = {
             "XOR": GatewayType.XOR,
             "AND": GatewayType.AND,
@@ -602,7 +607,7 @@ class StructuralAnalyzer:
             self.graph.add_node(node)
             self._name_to_id[gw["name"]] = node_id
 
-        # ── Arêtes (flows) ──
+        # ── Edges (flows) ──
         for i, flow in enumerate(self.bp_model.get("flows", [])):
             from_name = flow["from"]
             to_name = flow["to"]
@@ -612,18 +617,18 @@ class StructuralAnalyzer:
             to_id = self._name_to_id.get(to_name)
 
             if not from_id or not to_id:
-                print(f"[Agent 1][WARN] Flow ignoré : '{from_name}' → '{to_name}' (nœud introuvable)")
+                print(f"[Agent 1][WARN] Flow ignored: '{from_name}' → '{to_name}' (node not found)")
                 continue
 
-            # Type d'arête
+            # Edge type
             edge_type = EdgeType.MESSAGE if flow_type == "message" else EdgeType.SEQUENCE
 
-            # Type de dépendance selon la gateway
+            # Dependency type based on gateway
             dep_type = DependencyType.CONTROL
             if flow_type == "message":
                 dep_type = DependencyType.MESSAGE
 
-            # Gateway associée
+            # Associated gateway
             gw_id = None
             gw_name = flow.get("gateway")
             if gw_name and gw_name in self._name_to_id:
@@ -648,13 +653,13 @@ class StructuralAnalyzer:
             )
             self.graph.add_edge(edge)
 
-        # Assigner les gateways aux fragments selon leurs activités voisines
+        # Assign gateways to fragments based on neighboring activities
         self._assign_gateways_to_fragments()
 
     def _assign_gateways_to_fragments(self) -> None:
         """
-        Assigne chaque gateway au fragment de son activité source majoritaire.
-        Une gateway sans fragment assigné est considérée comme inter-fragment.
+        Assign each gateway to the fragment of its majority source activity.
+        A gateway without an assigned fragment is considered inter-fragment.
         """
         for node in self.graph.all_nodes():
             if not isinstance(node, GatewayNode):
@@ -662,22 +667,22 @@ class StructuralAnalyzer:
             if node.fragment_id:
                 continue
 
-            # Chercher le fragment des prédécesseurs
+            # Find predecessor fragment
             pred_fragments = [p.fragment_id for p in self.graph.predecessors(node.id) if p.fragment_id]
             if pred_fragments:
                 node.fragment_id = pred_fragments[0]
 
     # ─────────────────────────────────────────
-    #  Étape 2 — Mapping B2P → activités
+    #  Step 2 — B2P → activity mapping
     # ─────────────────────────────────────────
 
     def _map_b2p_to_activities(self) -> dict[str, ActivityB2PMapping]:
         """
-        Pour chaque activité, trouve les B2P policies qui la ciblent.
+        For each activity, find B2P policies that target it.
 
-        Stratégie de matching :
-            - Exact match sur le nom de l'activité dans l'URI target
-            - Partial match (nom normalisé)
+        Matching strategy:
+            - Exact match on activity name in target URI
+            - Partial match (normalized name)
         """
         mappings: dict[str, ActivityB2PMapping] = {}
 
@@ -694,7 +699,7 @@ class StructuralAnalyzer:
                 for rule_type in ("permission", "prohibition", "obligation"):
                     for rule in policy.get(rule_type, []):
                         target = rule.get("target", "")
-                        # Matching : le nom de l'activité apparaît dans l'URI target
+                        # Matching: activity name appears in target URI
                         if self._name_matches_target(node.name, target):
                             if policy_uid not in matched_policy_ids:
                                 matched_policy_ids.append(policy_uid)
@@ -713,25 +718,25 @@ class StructuralAnalyzer:
 
     def _name_matches_target(self, activity_name: str, target_uri: str) -> bool:
         """
-        Vérifie si l'activité est ciblée par l'URI ODRL (heuristique).
+        Check whether the activity is targeted by the ODRL URI (heuristic).
 
-        - Cas historique : le nom d'activité normalisé apparaît dans l'URI normalisée
-          (adapté quand l'URI est longue ou reprend le libellé complet).
-        - Souvent l'URI est plus courte (slug) : on teste si le dernier segment de
-          chemin est contenu **dans** le nom d'activité (libellé BPMN plus long).
-        - Plusieurs mots dans le BPMN : si au moins la moitié des tokens significatifs
-          (longueur ≥ 3) apparaissent dans la cible, on accepte (URI compacte avec
-          quelques mots-clés communs).
+        - Historical case: normalized activity name appears in normalized URI
+          (suited when URI is long or repeats the full label).
+        - Often the URI is shorter (slug): test whether the last path segment is
+          contained **in** the activity name (longer BPMN label).
+        - Multiple BPMN words: if at least half of significant tokens
+          (length ≥ 3) appear in the target, accept (compact URI with
+          a few common keywords).
 
-        Les **synonymes** purs (autre vocabulaire sans morceau de texte commun) ne
-        sont pas détectés ici ; ils restent du ressort du LLM (cibles orphelines).
+        Pure **synonyms** (different vocabulary with no shared text) are not
+        detected here; they remain for the LLM (orphan targets).
         """
         normalized_name = activity_name.lower().replace(" ", "_").replace("-", "_")
         normalized_target = target_uri.lower().replace("-", "_").replace("/", "_")
         if normalized_name in normalized_target:
             return True
 
-        # Dernier segment de chemin (souvent un slug court) ⊂ nom d'activité long
+        # Last path segment (often short slug) ⊂ long activity name
         try:
             path = (urlparse(target_uri).path or "").rstrip("/")
             if path:
@@ -741,7 +746,7 @@ class StructuralAnalyzer:
         except Exception:
             pass
 
-        # Plusieurs mots dans le BPMN ; l'URI ne contient qu'une partie des mots
+        # Multiple BPMN words; URI contains only part of the words
         tokens = re.split(r"[\s_\-]+", activity_name.lower())
         tokens = [t for t in tokens if len(t) >= 3]
         if len(tokens) >= 2:
@@ -752,18 +757,18 @@ class StructuralAnalyzer:
         return False
 
     # ─────────────────────────────────────────
-    #  Étape 3 — Détection des patterns
+    #  Step 3 — Pattern detection
     # ─────────────────────────────────────────
 
     def _append_pattern_with_registry(
         self,
         patterns: list[StructuralPattern],
-        unsupported: list[UnsupportedPattern],
+        unmapped: list[UnmappedPattern],
         pattern: StructuralPattern,
     ) -> None:
         """
         Append a structural pattern and, if its type is not in COVERED_PATTERNS,
-        record an UnsupportedPattern for the exception handling agent downstream.
+        record an UnmappedPattern for the exception handling agent downstream.
         """
         patterns.append(pattern)
         if pattern.pattern_type not in COVERED_PATTERNS:
@@ -771,8 +776,8 @@ class StructuralAnalyzer:
                 pattern.pattern_type,
                 "BPMN structural pattern without deterministic ODRL template coverage.",
             )
-            unsupported.append(
-                UnsupportedPattern(
+            unmapped.append(
+                UnmappedPattern(
                     pattern_type=pattern.pattern_type,
                     gateway_id=pattern.gateway_id,
                     gateway_name=pattern.gateway_name,
@@ -806,7 +811,7 @@ class StructuralAnalyzer:
             return f"join_{gt.value.lower()}"
         return "join_unknown"
 
-    def _detect_patterns(self) -> tuple[list[StructuralPattern], list[UnsupportedPattern]]:
+    def _detect_patterns(self) -> tuple[list[StructuralPattern], list[UnmappedPattern]]:
         """
         Detect BPMN structural patterns on the formal graph and raw BPMN hints.
 
@@ -814,11 +819,11 @@ class StructuralAnalyzer:
         -------
         patterns
             All detected StructuralPattern records.
-        unsupported
+        unmapped
             Subset not covered by ``pipeline_registry.COVERED_PATTERNS`` (for the exception handling agent).
         """
         patterns: list[StructuralPattern] = []
-        unsupported: list[UnsupportedPattern] = []
+        unmapped: list[UnmappedPattern] = []
 
         for node in self.graph.all_nodes():
             if not isinstance(node, GatewayNode):
@@ -834,7 +839,7 @@ class StructuralAnalyzer:
                 description = self._describe_fork(gw_type, node.name, involved)
                 self._append_pattern_with_registry(
                     patterns,
-                    unsupported,
+                    unmapped,
                     StructuralPattern(
                         pattern_type=pattern_type,
                         gateway_id=node.id,
@@ -851,7 +856,7 @@ class StructuralAnalyzer:
                 description = self._describe_join(gw_type, node.name, involved)
                 self._append_pattern_with_registry(
                     patterns,
-                    unsupported,
+                    unmapped,
                     StructuralPattern(
                         pattern_type=pattern_type,
                         gateway_id=node.id,
@@ -865,7 +870,7 @@ class StructuralAnalyzer:
                 if gw_type == GatewayType.AND:
                     self._append_pattern_with_registry(
                         patterns,
-                        unsupported,
+                        unmapped,
                         StructuralPattern(
                             pattern_type="sync",
                             gateway_id=node.id,
@@ -873,9 +878,9 @@ class StructuralAnalyzer:
                             involved_nodes=involved + [node.id],
                             fragment_id=node.fragment_id,
                             description=(
-                                f"Point de synchronisation obligatoire en '{node.name}'. "
-                                f"Toutes les branches parallèles doivent se terminer "
-                                f"avant de continuer."
+                                f"Mandatory synchronization point at '{node.name}'. "
+                                f"All parallel branches must complete "
+                                f"before continuing."
                             ),
                         ),
                     )
@@ -892,15 +897,15 @@ class StructuralAnalyzer:
                 )
             cacts = self.graph.cycle_involved_activity_names()
             primary = cfids[0] if cfids else None
-            loop_desc = "Un cycle a été détecté dans le graphe. Vérifier les boucles BPMN."
+            loop_desc = "A cycle was detected in the graph. Check BPMN loops."
             if cacts:
                 loop_desc = (
-                    f"Cycle de contrôle sur les activités : {', '.join(cacts)}. "
+                    f"Control cycle on activities: {', '.join(cacts)}. "
                     + loop_desc
                 )
             self._append_pattern_with_registry(
                 patterns,
-                unsupported,
+                unmapped,
                 StructuralPattern(
                     pattern_type="loop",
                     gateway_id="",
@@ -913,22 +918,22 @@ class StructuralAnalyzer:
                 ),
             )
 
-        self._detect_flow_edge_patterns(patterns, unsupported)
-        self._detect_activity_shape_patterns(patterns, unsupported)
+        self._detect_flow_edge_patterns(patterns, unmapped)
+        self._detect_activity_shape_patterns(patterns, unmapped)
 
-        return patterns, unsupported
+        return patterns, unmapped
 
     def _detect_flow_edge_patterns(
         self,
         patterns: list[StructuralPattern],
-        unsupported: list[UnsupportedPattern],
+        unmapped: list[UnmappedPattern],
     ) -> None:
         """
         Detect default and conditional sequence flows from edge metadata and topology.
 
         Inputs
         ------
-        patterns, unsupported
+        patterns, unmapped
             Lists updated in place.
         """
         for edge in self.graph.all_edges():
@@ -940,7 +945,7 @@ class StructuralAnalyzer:
             if edge.metadata.get("is_default"):
                 self._append_pattern_with_registry(
                     patterns,
-                    unsupported,
+                    unmapped,
                     StructuralPattern(
                         pattern_type="default_flow",
                         gateway_id=edge.id,
@@ -960,7 +965,7 @@ class StructuralAnalyzer:
             ):
                 self._append_pattern_with_registry(
                     patterns,
-                    unsupported,
+                    unmapped,
                     StructuralPattern(
                         pattern_type="conditional_flow",
                         gateway_id=edge.id,
@@ -977,14 +982,14 @@ class StructuralAnalyzer:
     def _detect_activity_shape_patterns(
         self,
         patterns: list[StructuralPattern],
-        unsupported: list[UnsupportedPattern],
+        unmapped: list[UnmappedPattern],
     ) -> None:
         """
         Detect advanced activity / subprocess constructs from the raw BPMN dict.
 
         Inputs
         ------
-        patterns, unsupported
+        patterns, unmapped
             Lists updated in place.
         """
         for act in self.bp_model.get("activities", []):
@@ -998,7 +1003,7 @@ class StructuralAnalyzer:
             def _add(ptype: str, desc: str) -> None:
                 self._append_pattern_with_registry(
                     patterns,
-                    unsupported,
+                    unmapped,
                     StructuralPattern(
                         pattern_type=ptype,
                         gateway_id=node_id,
@@ -1054,61 +1059,61 @@ class StructuralAnalyzer:
     def _describe_fork(self, gw_type: Optional[GatewayType], gw_name: str, targets: list[str]) -> str:
         if gw_type == GatewayType.XOR:
             return (
-                f"Fork exclusif en '{gw_name}' : une seule branche sera activée parmi {len(targets)}. "
-                f"Les policies doivent implémenter enable(ruleA XOR ruleB)."
+                f"Exclusive fork at '{gw_name}': only one branch will activate among {len(targets)}. "
+                f"Policies must implement enable(ruleA XOR ruleB)."
             )
         if gw_type == GatewayType.AND:
             return (
-                f"Fork parallèle en '{gw_name}' : toutes les {len(targets)} branches s'activent simultanément. "
-                f"Les policies doivent implémenter enable(ruleA AND ruleB)."
+                f"Parallel fork at '{gw_name}': all {len(targets)} branches activate simultaneously. "
+                f"Policies must implement enable(ruleA AND ruleB)."
             )
         if gw_type == GatewayType.OR:
             return (
-                f"Fork inclusif en '{gw_name}' : une ou plusieurs branches parmi {len(targets)}. "
-                f"Les policies doivent implémenter enable(ruleA OR ruleB)."
+                f"Inclusive fork at '{gw_name}': one or more branches among {len(targets)}. "
+                f"Policies must implement enable(ruleA OR ruleB)."
             )
         if gw_type == GatewayType.EVENT_BASED_EXCLUSIVE:
-            return f"Fork event-based exclusif en '{gw_name}' : premier événement reçu."
+            return f"Event-based exclusive fork at '{gw_name}': first event received."
         if gw_type == GatewayType.EVENT_BASED_PARALLEL:
-            return f"Fork event-based parallèle en '{gw_name}' : tous les événements attendus."
+            return f"Event-based parallel fork at '{gw_name}': all expected events."
         if gw_type == GatewayType.COMPLEX:
-            return f"Fork complexe en '{gw_name}' : condition d'activation personnalisée."
-        return f"Fork inconnu en '{gw_name}'."
+            return f"Complex fork at '{gw_name}': custom activation condition."
+        return f"Unknown fork at '{gw_name}'."
 
     def _describe_join(self, gw_type: Optional[GatewayType], gw_name: str, sources: list[str]) -> str:
         if gw_type == GatewayType.AND:
             return (
-                f"Join synchronisant en '{gw_name}' : attend la complétion de toutes les {len(sources)} branches. "
-                f"Risque de deadlock si une policy bloque une branche."
+                f"Synchronizing join at '{gw_name}': waits for completion of all {len(sources)} branches. "
+                f"Deadlock risk if a policy blocks a branch."
             )
         if gw_type == GatewayType.XOR:
             return (
-                f"Join alternatif en '{gw_name}' : la première branche complétée continue. "
-                f"Les autres branches sont ignorées."
+                f"Alternative join at '{gw_name}': first completed branch continues. "
+                f"Other branches are ignored."
             )
         if gw_type == GatewayType.OR:
             return (
-                f"Join inclusif en '{gw_name}' : fusion des branches OR entrantes."
+                f"Inclusive join at '{gw_name}': merge of incoming OR branches."
             )
-        return f"Join inconnu en '{gw_name}'."
+        return f"Unknown join at '{gw_name}'."
 
     # ─────────────────────────────────────────
-    #  Étape 4 — ConnectionInfo
+    #  Step 4 — ConnectionInfo
     # ─────────────────────────────────────────
 
     def _build_connections(self) -> list[ConnectionInfo]:
         """
-        Construit la liste de toutes les connexions typées entre activités.
+        Build the list of all typed connections between activities.
 
-        - Connexions directes : arêtes activity → activity.
-        - Connexions via gateway : chemins activity → gateway → activity
-          (pour capturer les dépendances inter-fragments quand la gateway
-          est entre deux fragments, ex. f1 --[GW]--> f2).
+        - Direct connections: activity → activity edges.
+        - Gateway connections: activity → gateway → activity paths
+          (to capture inter-fragment dependencies when the gateway
+          is between two fragments, e.g. f1 --[GW]--> f2).
         """
         connections: list[ConnectionInfo] = []
-        seen: set[tuple[str, str]] = set()  # (from_activity, to_activity) pour déduplication
+        seen: set[tuple[str, str]] = set()  # (from_activity, to_activity) for deduplication
 
-        # 1) Arêtes directes activity → activity
+        # 1) Direct activity → activity edges
         for edge in self.graph.all_edges():
             src_node = self.graph.get_node(edge.source)
             tgt_node = self.graph.get_node(edge.target)
@@ -1143,7 +1148,7 @@ class StructuralAnalyzer:
                 )
             )
 
-        # 2) Connexions activity → gateway → activity (dépendances inter-fragments)
+        # 2) activity → gateway → activity connections (inter-fragment dependencies)
         for node in self.graph.all_nodes():
             if not isinstance(node, GatewayNode):
                 continue
@@ -1190,7 +1195,7 @@ class StructuralAnalyzer:
         return connections
 
     def _resolve_connection_type(self, edge: Edge) -> str:
-        """Détermine le type de connexion sémantique depuis une arête."""
+        """Determine semantic connection type from an edge."""
         if edge.edge_type == EdgeType.MESSAGE:
             return "message"
 
@@ -1202,7 +1207,7 @@ class StructuralAnalyzer:
         return "sequence"
 
     # ─────────────────────────────────────────
-    #  Étape 5 — Contextes CL et CG
+    #  Step 5 — CL and CG contexts
     # ─────────────────────────────────────────
 
     def _build_local_contexts(
@@ -1211,13 +1216,13 @@ class StructuralAnalyzer:
         all_connections: list[ConnectionInfo],
     ) -> dict[str, FragmentContext]:
         """
-        Construit le contexte LOCAL CL(Fi) pour chaque fragment.
+        Build LOCAL context CL(Fi) for each fragment.
 
         CL(Fi) =
-            - activités et gateways de Fi
-            - B2P mappings des activités de Fi
-            - connexions internes à Fi
-            - dépendances avec les fragments voisins immédiats uniquement
+            - activities and gateways of Fi
+            - B2P mappings of Fi activities
+            - internal connections within Fi
+            - dependencies with immediate neighbor fragments only
         """
         contexts: dict[str, FragmentContext] = {}
 
@@ -1228,26 +1233,26 @@ class StructuralAnalyzer:
             gateways = []
             gw_field = frag.get("gateways", [])
             if gw_field:
-                # Peut être une liste de noms ou d'objets gateway
+                # May be a list of names or gateway objects
                 if isinstance(gw_field[0], str):
                     gateways = list(gw_field)
                 else:
                     gateways = [gw.get("name", "") for gw in gw_field]
 
-            # B2P mappings des activités de ce fragment
+            # B2P mappings of this fragment's activities
             frag_mappings = [
                 m for m in b2p_mappings.values() if m.fragment_id == frag_id
             ]
 
-            # Connexions internes
+            # Internal connections
             internal_conns = [
                 c for c in all_connections if c.from_fragment == frag_id and c.to_fragment == frag_id
             ]
 
-            # Dépendances entrantes (upstream)
+            # Incoming dependencies (upstream)
             upstream = [c for c in all_connections if c.to_fragment == frag_id and c.is_inter]
 
-            # Dépendances sortantes (downstream)
+            # Outgoing dependencies (downstream)
             downstream = [c for c in all_connections if c.from_fragment == frag_id and c.is_inter]
 
             contexts[frag_id] = FragmentContext(
@@ -1258,7 +1263,7 @@ class StructuralAnalyzer:
                 connections=internal_conns,
                 upstream_deps=upstream,
                 downstream_deps=downstream,
-                global_graph_summary=None,  # Local → pas de vue globale
+                global_graph_summary=None,  # Local → no global view
                 all_inter_edges=None,
             )
 
@@ -1270,12 +1275,12 @@ class StructuralAnalyzer:
         all_connections: list[ConnectionInfo],
     ) -> dict[str, FragmentContext]:
         """
-        Construit le contexte GLOBAL CG(Fi) pour chaque fragment.
+        Build GLOBAL context CG(Fi) for each fragment.
 
-        CG(Fi) = tout ce que CL(Fi) contient +
-            - résumé complet du graphe global
-            - toutes les arêtes inter-fragments
-            - ordering global
+        CG(Fi) = everything CL(Fi) contains +
+            - full global graph summary
+            - all inter-fragment edges
+            - global ordering
         """
         local_contexts = self._build_local_contexts(b2p_mappings, all_connections)
         global_summary = self.graph.summary()
@@ -1291,8 +1296,8 @@ class StructuralAnalyzer:
                 connections=local_ctx.connections,
                 upstream_deps=local_ctx.upstream_deps,
                 downstream_deps=local_ctx.downstream_deps,
-                global_graph_summary=global_summary,  # Vue globale
-                all_inter_edges=all_inter,  # Toutes les dépendances inter
+                global_graph_summary=global_summary,  # Global view
+                all_inter_edges=all_inter,  # All inter dependencies
             )
 
         return global_contexts

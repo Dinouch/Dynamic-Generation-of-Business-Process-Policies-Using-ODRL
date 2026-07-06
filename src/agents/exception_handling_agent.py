@@ -3,13 +3,14 @@ exception_handling_agent.py — Exception handling agent
 
 Turns BPMN structural patterns that have no deterministic ODRL template into
 LLM-proposed ODRL hints for Agent 4. Replaces the former implicit dependency
-detector (Unsupported Case Formulator).
+detector (Unmapped Case Formulator).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import traceback
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
@@ -19,19 +20,19 @@ from .structural_analyzer import (
     AgentMessage,
     EnrichedGraph,
     MessageType,
-    UnsupportedPattern,
+    UnmappedPattern,
 )
 
 
 @dataclass
-class UnsupportedCaseProposal:
+class UnmappedCaseProposal:
     """
-    One LLM-generated proposal for an unsupported BPMN pattern.
+    One LLM-generated proposal for an unmapped BPMN pattern.
 
     Attributes
     ----------
     pattern_type
-        Same identifier as ``UnsupportedPattern.pattern_type``.
+        Same identifier as ``UnmappedPattern.pattern_type``.
     gateway_name, fragment_id
         Context from structural analysis.
     odrl_rule_type
@@ -62,12 +63,12 @@ class UnsupportedCaseProposal:
         return asdict(self)
 
     @staticmethod
-    def from_dict(d: dict) -> "UnsupportedCaseProposal":
+    def from_dict(d: dict) -> "UnmappedCaseProposal":
         """Deserialize from a message payload dict."""
         rt = str(d.get("odrl_rule_type", "permission")).strip().lower()
         if rt not in ("permission", "prohibition", "obligation"):
             rt = "permission"
-        return UnsupportedCaseProposal(
+        return UnmappedCaseProposal(
             pattern_type=d.get("pattern_type", ""),
             gateway_name=d.get("gateway_name", ""),
             fragment_id=d.get("fragment_id", ""),
@@ -81,12 +82,12 @@ class UnsupportedCaseProposal:
         )
 
 
-class UnsupportedCaseFormulator:
+class UnmappedCaseFormulator:
     """
-    Exception handling agent — formulates ODRL hints for unsupported BPMN patterns.
+    Exception handling agent — formulates ODRL hints for unmapped BPMN patterns.
 
-    Receives ``CFP_UNSUPPORTED`` from Agent 1 (patterns non couverts) or legacy ``GRAPH_READY``.
-    Emits ``UNSUPPORTED_PROPOSALS`` to Agent 3.
+    Receives ``CFP_UNMAPPED`` from Agent 1 (uncovered patterns) or legacy ``GRAPH_READY``.
+    Emits ``UNMAPPED_PROPOSALS`` to Agent 3.
     """
 
     MODEL = "gpt-4o"
@@ -94,6 +95,7 @@ class UnsupportedCaseFormulator:
 
     AGENT_NAME = "exception_handling_agent"
     MAX_REFORMULATE = 3
+    LLM_TIMEOUT_S = 180.0
 
     _SYSTEM_PROMPT = (
         "You are a senior ODRL policy architect with deep expertise in BPMN process "
@@ -130,7 +132,7 @@ class UnsupportedCaseFormulator:
         self._on_send: Optional[Callable[[AgentMessage], None]] = None
         self._reformulate_count = 0
         self._last_graph: Optional[EnrichedGraph] = None
-        self._last_proposals: list[UnsupportedCaseProposal] = []
+        self._last_proposals: list[UnmappedCaseProposal] = []
 
         key_azure = api_key or os.environ.get("AZURE_OPENAI_KEY") or os.environ.get(
             "AZURE_OPENAI_API_KEY"
@@ -151,6 +153,7 @@ class UnsupportedCaseFormulator:
                 api_key=key_azure,
                 api_version=api_ver,
                 azure_endpoint=endpoint,
+                timeout=self.LLM_TIMEOUT_S,
             )
         else:
             key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -158,7 +161,7 @@ class UnsupportedCaseFormulator:
                 raise ValueError(
                     "Missing API key. Set OPENAI_API_KEY or Azure OpenAI env vars."
                 )
-            self.client = OpenAI(api_key=key)
+            self.client = OpenAI(api_key=key, timeout=self.LLM_TIMEOUT_S)
 
     def register_send_callback(self, fn: Callable[[AgentMessage], None]) -> None:
         """Register callback for outbound messages (typically Agent 3)."""
@@ -179,11 +182,29 @@ class UnsupportedCaseFormulator:
         Parameters
         ----------
         msg
-            ``CFP_UNSUPPORTED`` from Agent 1, ``GRAPH_READY`` (legacy), ou ``REFORMULATE`` depuis Agent 3.
+            ``CFP_UNMAPPED`` from Agent 1, ``GRAPH_READY`` (legacy), or ``REFORMULATE`` from Agent 3.
         """
         print(f"[Exception handling agent] ◄ RECEIVE {msg}")
-        if msg.msg_type in (MessageType.GRAPH_READY, MessageType.CFP_UNSUPPORTED):
-            self._handle_graph_ready(msg)
+        if msg.msg_type in (MessageType.GRAPH_READY, MessageType.CFP_UNMAPPED):
+            try:
+                self._handle_graph_ready(msg)
+            except Exception:
+                print(
+                    "[Exception handling agent][ERROR] Unmapped formulation failed:"
+                )
+                traceback.print_exc()
+                eg = self._last_graph or msg.payload.get("enriched_graph")
+                if eg is not None:
+                    print(
+                        "[Exception handling agent] Emitting empty proposals "
+                        "(pipeline unblock)."
+                    )
+                    self._emit_unmapped_proposals(
+                        eg,
+                        [],
+                        msg.loop_turn,
+                        proposal_anchor_id=msg.payload.get("cfp_call_id"),
+                    )
         elif msg.msg_type == MessageType.REFORMULATE:
             self._handle_reformulate(msg)
         elif msg.msg_type in (MessageType.ACCEPT_PROPOSAL_BATCH, MessageType.REJECT_PROPOSAL_BATCH):
@@ -198,50 +219,74 @@ class UnsupportedCaseFormulator:
             print(f"[Exception handling agent][WARN] Unknown message type '{msg.msg_type.value}'.")
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
-        """Process ``CFP_UNSUPPORTED`` / ``GRAPH_READY`` and emit ``UNSUPPORTED_PROPOSALS`` (ACL PROPOSE)."""
+        """Process ``CFP_UNMAPPED`` / ``GRAPH_READY`` and emit ``UNMAPPED_PROPOSALS`` (ACL PROPOSE)."""
         enriched_graph: EnrichedGraph = msg.payload["enriched_graph"]
         self._last_graph = enriched_graph
         self._reformulate_count = 0
 
         proposer_reply_anchor: Optional[str] = None
-        if msg.msg_type == MessageType.CFP_UNSUPPORTED:
+        if msg.msg_type == MessageType.CFP_UNMAPPED:
             proposer_reply_anchor = msg.payload.get("cfp_call_id")
+            if not proposer_reply_anchor:
+                print(
+                    "[Exception handling agent][WARN] CFP without cfp_call_id — "
+                    "PROPOSE publication to Agent 3 may fail (ACL)."
+                )
 
-        unsupported = list(getattr(enriched_graph, "unsupported_patterns", []) or [])
-        proposals: list[UnsupportedCaseProposal] = []
+        unmapped = list(getattr(enriched_graph, "unmapped_patterns", []) or [])
+        proposals: list[UnmappedCaseProposal] = []
 
-        if not unsupported:
-            self._emit_unsupported_proposals(
+        if not unmapped:
+            self._emit_unmapped_proposals(
                 enriched_graph, proposals, msg.loop_turn, proposal_anchor_id=proposer_reply_anchor
             )
             return
 
+        print(
+            f"[Exception handling agent] LLM formulation for {len(unmapped)} unmapped pattern(s) "
+            f"(timeout {self.LLM_TIMEOUT_S:.0f}s per call)…"
+        )
         b2p_json = json.dumps(enriched_graph.raw_b2p, ensure_ascii=False)
 
-        for u in unsupported:
+        for i, u in enumerate(unmapped, start=1):
+            print(
+                f"[Exception handling agent]  ({i}/{len(unmapped)}) "
+                f"{u.pattern_type} @ {u.gateway_name} (fragment {u.fragment_id})…"
+            )
             props = self._formulate_one(u, b2p_json)
             if props:
                 proposals.extend(props)
+                print(
+                    f"[Exception handling agent]  → {len(props)} proposal(s) for {u.pattern_type}"
+                )
+            else:
+                print(
+                    f"[Exception handling agent][WARN] No proposal for {u.pattern_type}"
+                )
 
         self._last_proposals = proposals
-        self._emit_unsupported_proposals(
+        print(
+            f"[Exception handling agent] Total: {len(proposals)} proposal(s) — "
+            "sending UNMAPPED_PROPOSALS → Agent 3"
+        )
+        self._emit_unmapped_proposals(
             enriched_graph, proposals, msg.loop_turn, proposal_anchor_id=proposer_reply_anchor
         )
 
-    def _emit_unsupported_proposals(
+    def _emit_unmapped_proposals(
         self,
         enriched_graph: EnrichedGraph,
-        proposals: list[UnsupportedCaseProposal],
+        proposals: list[UnmappedCaseProposal],
         loop_turn: int,
         *,
         proposal_anchor_id: Optional[str] = None,
     ) -> None:
-        """Send ``UNSUPPORTED_PROPOSALS`` (ACL PROPOSE) to Agent 3."""
+        """Send ``UNMAPPED_PROPOSALS`` (ACL PROPOSE) to Agent 3."""
         pl: dict = {
             "enriched_graph": enriched_graph,
-            "unsupported_proposals": [p.to_dict() for p in proposals],
+            "unmapped_proposals": [p.to_dict() for p in proposals],
             "utterance": (
-                "Here are proposed fragment-policy hints for the unsupported structural patterns."
+                "Here are proposed fragment-policy hints for the unmapped structural patterns."
             ),
         }
         if proposal_anchor_id:
@@ -250,7 +295,7 @@ class UnsupportedCaseFormulator:
             AgentMessage(
                 sender=self.AGENT_NAME,
                 recipient="agent3",
-                msg_type=MessageType.UNSUPPORTED_PROPOSALS,
+                msg_type=MessageType.UNMAPPED_PROPOSALS,
                 payload=pl,
                 loop_turn=loop_turn,
             )
@@ -259,7 +304,7 @@ class UnsupportedCaseFormulator:
     def _emit_reformulated_inform(
         self,
         enriched_graph: EnrichedGraph,
-        proposals: list[UnsupportedCaseProposal],
+        proposals: list[UnmappedCaseProposal],
         loop_turn: int,
         *,
         reformulate_request_id: Optional[str] = None,
@@ -270,9 +315,9 @@ class UnsupportedCaseFormulator:
         """
         pl: dict = {
             "enriched_graph": enriched_graph,
-            "unsupported_proposals": [p.to_dict() for p in proposals],
+            "unmapped_proposals": [p.to_dict() for p in proposals],
             "utterance": (
-                "Reformulated fragment-policy hints for the unsupported structural patterns "
+                "Reformulated fragment-policy hints for the unmapped structural patterns "
                 "(inform following your reformulation request)."
             ),
         }
@@ -321,8 +366,8 @@ class UnsupportedCaseFormulator:
                     recipient="agent3",
                     msg_type=MessageType.DELEGATION_AGREE,
                     payload={
-                        "utterance": "I will reformulate the unsupported-case proposals using your hint.",
-                        "_acl_ontology": "unsupported-formulation",
+                        "utterance": "I will reformulate the unmapped-case proposals using your hint.",
+                        "_acl_ontology": "unmapped-formulation",
                         "acl_in_reply_to": rid,
                     },
                     loop_turn=msg.loop_turn,
@@ -339,9 +384,9 @@ class UnsupportedCaseFormulator:
 
         b2p_json = json.dumps(self._last_graph.raw_b2p, ensure_ascii=False)
 
-        for u in self._last_graph.unsupported_patterns:
+        for u in self._last_graph.unmapped_patterns:
             if u.pattern_type == pt and u.gateway_name == gw and u.fragment_id == fid:
-                up = UnsupportedPattern(
+                up = UnmappedPattern(
                     pattern_type=u.pattern_type,
                     gateway_id=u.gateway_id,
                     gateway_name=u.gateway_name,
@@ -374,28 +419,28 @@ class UnsupportedCaseFormulator:
             reformulate_request_id=rid,
         )
 
-    def _formulate_one(self, u, b2p_json: str) -> list[UnsupportedCaseProposal]:
+    def _formulate_one(self, u, b2p_json: str) -> list[UnmappedCaseProposal]:
         """
-        Call the LLM once for a single ``UnsupportedPattern``.
+        Call the LLM once for a single ``UnmappedPattern``.
 
         Parameters
         ----------
         u
-            ``UnsupportedPattern`` instance from Agent 1.
+            ``UnmappedPattern`` instance from Agent 1.
         b2p_json
             JSON string of B2P policies.
 
         Returns
         -------
-        Zero or more ``UnsupportedCaseProposal`` instances (one per policy in the
+        Zero or more ``UnmappedCaseProposal`` instances (one per policy in the
         LLM response). Empty when formulation fails and no fallback applies.
         """
-        user_prompt = f"""Formalise the following BPMN pattern as one or more ODRL Fragment Policies.
+        user_prompt = f"""Formalize the following BPMN pattern as one or more ODRL Fragment Policies.
 
 Pattern type: {u.pattern_type}
 Gateway / element name: {u.gateway_name}
-Principal fragment: {u.fragment_id}
-Involved fragments: {', '.join(u.involved_fragment_ids) or 'same as principal'}
+Primary fragment: {u.fragment_id}
+Involved fragments: {', '.join(u.involved_fragment_ids) or 'same as primary'}
 Activities involved: {', '.join(u.involved_activity_names) or 'see description'}
 BPMN semantic: {u.bpmn_semantic}
 Structural description: {u.description}
@@ -441,7 +486,7 @@ Respond ONLY with this JSON:
         if not isinstance(policies_data, list):
             policies_data = []
 
-        out: list[UnsupportedCaseProposal] = []
+        out: list[UnmappedCaseProposal] = []
         for item in policies_data:
             if not isinstance(item, dict):
                 continue
@@ -454,7 +499,7 @@ Respond ONLY with this JSON:
                 conf = 0.0
             conf = max(0.0, min(1.0, conf))
             out.append(
-                UnsupportedCaseProposal(
+                UnmappedCaseProposal(
                     pattern_type=u.pattern_type,
                     gateway_name=u.gateway_name,
                     fragment_id=u.fragment_id,
@@ -473,20 +518,51 @@ Respond ONLY with this JSON:
             return [fb] if fb else []
         return out
 
-    def _fallback_proposal(self, u: UnsupportedPattern) -> Optional[UnsupportedCaseProposal]:
+    def _fallback_proposal(self, u: UnmappedPattern) -> Optional[UnmappedCaseProposal]:
         """
         When the LLM is unavailable (timeout, quota, network), emit a minimal
         proposal for supported patterns (e.g. ``loop``) so Agents 3/4 can still
         produce a fragment policy.
         """
+        ids = list(u.involved_fragment_ids or [])
+        if u.pattern_type == "fork_event_based_exclusive":
+            if not ids and u.fragment_id and u.fragment_id != "unknown":
+                ids = [u.fragment_id]
+            acts = list(u.involved_activity_names or [])
+            target_act = acts[0] if acts else (u.gateway_name or "activity")
+            return UnmappedCaseProposal(
+                pattern_type=u.pattern_type,
+                gateway_name=u.gateway_name,
+                fragment_id=u.fragment_id,
+                odrl_rule_type="obligation",
+                hint_text=(
+                    "Fallback for event-based exclusive fork: govern branch outcomes "
+                    "with distinct operational conditions per path (LLM unavailable)."
+                ),
+                odrl_structure_hint={
+                    "action": "execute",
+                    "target_activity": target_act,
+                    "constraints": [
+                        {
+                            "leftOperand": "event",
+                            "operator": "eq",
+                            "rightOperand": "branch-condition",
+                        }
+                    ],
+                },
+                confidence=0.75,
+                justification="Deterministic fallback — fork_event_based_exclusive.",
+                involved_fragment_ids=ids,
+                involved_activity_names=list(u.involved_activity_names or []),
+            )
+
         if u.pattern_type != "loop":
             return None
-        ids = list(u.involved_fragment_ids or [])
         if not ids and u.fragment_id and u.fragment_id != "unknown":
             ids = [u.fragment_id]
         if not ids:
             return None
-        return UnsupportedCaseProposal(
+        return UnmappedCaseProposal(
             pattern_type=u.pattern_type,
             gateway_name=u.gateway_name,
             fragment_id=u.fragment_id,

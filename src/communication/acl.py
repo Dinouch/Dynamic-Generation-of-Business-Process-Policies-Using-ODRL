@@ -17,7 +17,7 @@ class ACLPerformative(str, Enum):
     """
     FIPA ACL–oriented performatives used on the async bus.
 
-    Negotiation (unsupported formulation): CFP → PROPOSE → accept-proposal | reject-proposal.
+    Negotiation (unmapped formulation): CFP → PROPOSE → accept-proposal | reject-proposal.
     Delegation (graph analysis, semantic audit, syntax audit): REQUEST with fipa_expects_agree → AGREE → …
     Human gate: REQUEST (human-gate) → AGREE | REFUSE (unchanged).
     """
@@ -107,7 +107,7 @@ class ACLSemanticRegistry:
             # Reformulate round: treat the REQUEST id as the anchor for the next PROPOSE
             # (same slot as a CFP for negotiation tracking).
             c = env.content or {}
-            if env.ontology == "unsupported-formulation" and c.get("msg_type") == "reformulate":
+            if env.ontology == "unmapped-formulation" and c.get("msg_type") == "reformulate":
                 self._open_cfp.add(rw)
             return
 

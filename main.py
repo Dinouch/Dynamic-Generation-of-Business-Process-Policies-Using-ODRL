@@ -1,14 +1,14 @@
 """
 main.py
 ═══════════════════════════════════════════════════════════════════════════════
-Pipeline complet — Agent 1 → Exception handling agent <→ Agent 3 → Agent 4 <→ Agent 5
-Scénario: src/dataset/scenario1 (fragments BP + B2P).
+Full pipeline — Agent 1 → Exception handling agent <→ Agent 3 → Agent 4 <→ Agent 5
+Scenario: src/dataset/scenario1 (BP fragments + B2P).
 
-Mode standalone (sans LLM) 
+Standalone mode (without LLM)
 
-Mode complet (avec LLM) 
+Full mode (with LLM)
 
-Mode pipeline : orchestration asynchrone (bus ACL), via ``run_looped_orchestration``.
+Pipeline mode: async orchestration (ACL bus), via ``run_looped_orchestration``.
 
 """
 
@@ -18,7 +18,7 @@ import sys
 
 
 def _configure_windows_console_stdio() -> None:
-    """Évite UnicodeEncodeError sous Windows (cp1252) lors des print Unicode (═, etc.)."""
+    """Avoid UnicodeEncodeError on Windows (cp1252) when printing Unicode (═, etc.)."""
     if sys.platform != "win32":
         return
     try:
@@ -74,11 +74,11 @@ from orchestration.runners import (
     run_sequential_agents,
 )
 
-# Scénario par défaut
+# Default scenario
 _SCENARIO = "scenario1"
 
-# Mode d'exécution : True = pipeline async (bus + ACL), False = démo séquentielle locale
-# -> il suffit de modifier cette constante.
+# Execution mode: True = async pipeline (bus + ACL), False = local sequential demo
+# -> just change this constant.
 USE_PIPELINE_MODE = True
 
 

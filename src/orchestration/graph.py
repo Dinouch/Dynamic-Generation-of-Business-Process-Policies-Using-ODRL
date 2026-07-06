@@ -1,19 +1,19 @@
 """
-graph.py — Couche 0 : Représentation formelle centrale
+graph.py — Layer 0: Central formal representation
 
-C'est la vérité du système. Tous les agents manipulent
-des objets de ce module, jamais du texte brut.
+This is the system's source of truth. All agents manipulate
+objects from this module, never raw text.
 
-Structure :
+Structure:
     G = (V, E)
-    - V : nœuds typés (Activity, Gateway, Event)
-    - E : arêtes typées (sequence, message, control)
+    - V: typed nodes (Activity, Gateway, Event)
+    - E: typed edges (sequence, message, control)
 
-Chaque arête porte un type de dépendance :
-    - CONTROL   : séquencement de contrôle (XOR, AND, OR)
-    - MESSAGE   : communication inter-fragments
-    - RESOURCE  : partage de ressource
-    - TEMPORAL  : contrainte temporelle
+Each edge carries a dependency type:
+    - CONTROL   : control sequencing (XOR, AND, OR)
+    - MESSAGE   : inter-fragment communication
+    - RESOURCE  : resource sharing
+    - TEMPORAL  : time constraint
 """
 
 from dataclasses import dataclass, field
@@ -22,7 +22,7 @@ from typing import Optional
 
 
 # ─────────────────────────────────────────────
-#  Enums — Vocabulaire formel du système
+#  Enums — Formal system vocabulary
 # ─────────────────────────────────────────────
 
 
@@ -33,9 +33,9 @@ class NodeType(Enum):
 
 
 class GatewayType(Enum):
-    XOR = "XOR"  # Exclusif  → une seule branche
-    AND = "AND"  # Parallèle → toutes les branches
-    OR = "OR"    # Inclusif  → une ou plusieurs branches
+    XOR = "XOR"  # Exclusive → single branch
+    AND = "AND"  # Parallel → all branches
+    OR = "OR"    # Inclusive → one or more branches
     EVENT_BASED_EXCLUSIVE = "EVENT_BASED_EXCLUSIVE"  # Event-based gateway (exclusive)
     EVENT_BASED_PARALLEL = "EVENT_BASED_PARALLEL"    # Event-based gateway (parallel)
     COMPLEX = "COMPLEX"                              # Complex gateway
@@ -44,33 +44,33 @@ class GatewayType(Enum):
 
 
 class EdgeType(Enum):
-    SEQUENCE = "sequence"   # Flux de contrôle séquentiel
-    MESSAGE = "message"     # Communication inter-fragments
-    RESOURCE = "resource"   # Partage de ressource
-    TEMPORAL = "temporal"   # Contrainte temporelle
+    SEQUENCE = "sequence"   # Sequential control flow
+    MESSAGE = "message"     # Inter-fragment communication
+    RESOURCE = "resource"   # Resource sharing
+    TEMPORAL = "temporal"   # Time constraint
 
 
 class DependencyType(Enum):
-    """Type de dépendance sémantique sur une arête."""
-    CONTROL = "control"     # Contrôle de flux (gateway)
-    DATA = "data"           # Flux de données
-    MESSAGE = "message"     # Message inter-fragments
-    RESOURCE = "resource"   # Ressource partagée
-    TEMPORAL = "temporal"   # Contrainte de temps
+    """Semantic dependency type on an edge."""
+    CONTROL = "control"     # Flow control (gateway)
+    DATA = "data"           # Data flow
+    MESSAGE = "message"     # Inter-fragment message
+    RESOURCE = "resource"   # Shared resource
+    TEMPORAL = "temporal"   # Time constraint
 
 
 # ─────────────────────────────────────────────
-#  Nœuds du graphe
+#  Graph nodes
 # ─────────────────────────────────────────────
 
 
 @dataclass
 class Node:
-    """Nœud générique du graphe BPMN formel."""
+    """Generic node in the formal BPMN graph."""
     id: str
     name: str
     node_type: NodeType
-    fragment_id: Optional[str] = None          # Fragment auquel appartient ce nœud
+    fragment_id: Optional[str] = None          # Fragment this node belongs to
     metadata: dict = field(default_factory=dict)
 
     def __hash__(self):
@@ -85,8 +85,8 @@ class Node:
 
 @dataclass
 class ActivityNode(Node):
-    """Nœud de type Activity — correspond à un asset ODRL."""
-    role: Optional[str] = None   # Rôle/lane BPMN
+    """Activity node — corresponds to an ODRL asset."""
+    role: Optional[str] = None   # BPMN role/lane
     is_start: bool = False
     is_end: bool = False
 
@@ -96,7 +96,7 @@ class ActivityNode(Node):
 
 @dataclass
 class GatewayNode(Node):
-    """Nœud de type Gateway — détermine le type de dépendance."""
+    """Gateway node — determines the dependency type."""
     gateway_type: Optional[GatewayType] = None
 
     def __post_init__(self):
@@ -105,7 +105,7 @@ class GatewayNode(Node):
 
 @dataclass
 class EventNode(Node):
-    """Nœud de type Event (start, end, intermediate)."""
+    """Event node (start, end, intermediate)."""
     event_kind: str = "intermediate"   # start | end | intermediate
 
     def __post_init__(self):
@@ -113,30 +113,30 @@ class EventNode(Node):
 
 
 # ─────────────────────────────────────────────
-#  Arêtes du graphe
+#  Graph edges
 # ─────────────────────────────────────────────
 
 
 @dataclass
 class Edge:
     """
-    Arête typée entre deux nœuds.
+    Typed edge between two nodes.
 
-    Porte :
-        - edge_type       : nature du flux (sequence, message…)
-        - dependency_type : sémantique de la dépendance (control, data…)
-        - gateway         : gateway associée si présente
-        - condition       : condition sur une branche XOR/OR
-        - is_inter        : True si l'arête traverse deux fragments différents
+    Carries:
+        - edge_type       : flow nature (sequence, message…)
+        - dependency_type : dependency semantics (control, data…)
+        - gateway         : associated gateway if present
+        - condition       : branch condition (XOR/OR)
+        - is_inter        : True if the edge crosses two different fragments
     """
     id: str
-    source: str                        # id du nœud source
-    target: str                        # id du nœud cible
+    source: str                        # source node id
+    target: str                        # target node id
     edge_type: EdgeType = EdgeType.SEQUENCE
     dependency_type: DependencyType = DependencyType.CONTROL
-    gateway_id: Optional[str] = None      # Gateway qui génère cette arête
-    condition: Optional[str] = None       # Condition de branche (XOR/OR)
-    is_inter: bool = False                # Inter-fragment ?
+    gateway_id: Optional[str] = None      # Gateway that generates this edge
+    condition: Optional[str] = None       # Branch condition (XOR/OR)
+    is_inter: bool = False                # Inter-fragment?
     metadata: dict = field(default_factory=dict)
 
     def __hash__(self):
@@ -149,18 +149,18 @@ class Edge:
 
 
 # ─────────────────────────────────────────────
-#  Graphe formel central  G = (V, E)
+#  Central formal graph  G = (V, E)
 # ─────────────────────────────────────────────
 
 
 class BPMNGraph:
     """
-    Graphe formel central du système.
+    Central formal graph of the system.
 
-    C'est la seule source de vérité.
-    Les agents lisent ce graphe — ils ne lisent jamais le BPMN brut.
+    This is the single source of truth.
+    Agents read this graph — they never read raw BPMN.
 
-    Usage :
+    Usage:
         g = BPMNGraph()
         g.add_node(ActivityNode(id="a1", name="Check completeness", ...))
         g.add_edge(Edge(id="e1", source="a1", target="a2", ...))
@@ -174,11 +174,11 @@ class BPMNGraph:
         self._nodes: dict[str, Node] = {}
         self._edges: dict[str, Edge] = {}
 
-        # Index d'adjacence pour les lookups rapides
+        # Adjacency index for fast lookups
         self._out_edges: dict[str, list[str]] = {}   # node_id → [edge_id]
         self._in_edges: dict[str, list[str]] = {}    # node_id → [edge_id]
 
-    # ── Ajout de nœuds / arêtes ──────────────────
+    # ── Add nodes / edges ──────────────────
 
     def add_node(self, node: Node) -> None:
         if node.id in self._nodes:
@@ -195,7 +195,7 @@ class BPMNGraph:
         if edge.id in self._edges:
             raise ValueError(f"Edge '{edge.id}' already exists.")
 
-        # Marquer automatiquement comme inter-fragment si fragments différents
+        # Automatically mark as inter-fragment when fragments differ
         src_frag = self._nodes[edge.source].fragment_id
         tgt_frag = self._nodes[edge.target].fragment_id
         if src_frag and tgt_frag and src_frag != tgt_frag:
@@ -205,7 +205,7 @@ class BPMNGraph:
         self._out_edges[edge.source].append(edge.id)
         self._in_edges[edge.target].append(edge.id)
 
-    # ── Requêtes sur le graphe ────────────────────
+    # ── Graph queries ────────────────────
 
     def get_node(self, node_id: str) -> Optional[Node]:
         return self._nodes.get(node_id)
@@ -216,48 +216,48 @@ class BPMNGraph:
 
 
     def successors(self, node_id: str) -> list[Node]:
-        """Retourne les nœuds successeurs directs."""
+        """Return direct successor nodes."""
         return [
             self._nodes[self._edges[eid].target]
             for eid in self._out_edges.get(node_id, [])
         ]
 
     def predecessors(self, node_id: str) -> list[Node]:
-        """Retourne les nœuds prédécesseurs directs."""
+        """Return direct predecessor nodes."""
         return [
             self._nodes[self._edges[eid].source]
             for eid in self._in_edges.get(node_id, [])
         ]
 
     def out_edges(self, node_id: str) -> list[Edge]:
-        """Retourne les arêtes sortantes d'un nœud."""
+        """Return outgoing edges from a node."""
         return [self._edges[eid] for eid in self._out_edges.get(node_id, [])]
 
     def in_edges(self, node_id: str) -> list[Edge]:
-        """Retourne les arêtes entrantes d'un nœud."""
+        """Return incoming edges to a node."""
         return [self._edges[eid] for eid in self._in_edges.get(node_id, [])]
 
     def subgraph(self, fragment_id: str) -> "BPMNGraph":
         """
-        Retourne le sous-graphe induit par un fragment donné.
-        Inclut aussi les arêtes inter-fragment (is_inter=True)
-        dont la source appartient à ce fragment.
+        Return the subgraph induced by a given fragment.
+        Also includes inter-fragment edges (is_inter=True)
+        whose source belongs to this fragment.
         """
         sub = BPMNGraph()
 
-        # Nœuds du fragment
+        # Fragment nodes
         for node in self._nodes.values():
             if node.fragment_id == fragment_id:
                 sub.add_node(node)
 
-        # Arêtes internes + arêtes inter sortantes
+        # Internal edges + outgoing inter edges
         sub_node_ids = set(sub._nodes.keys())
         for edge in self._edges.values():
             if edge.source in sub_node_ids:
-                # Arête interne
+                # Internal edge
                 if edge.target in sub_node_ids:
                     sub.add_edge(edge)
-                # Arête inter-fragment sortante : on l'inclut sans le nœud cible
+                # Outgoing inter-fragment edge: include without target node
                 elif edge.is_inter:
                     sub._edges[edge.id] = edge
                     sub._out_edges[edge.source].append(edge.id)
@@ -265,11 +265,11 @@ class BPMNGraph:
         return sub
 
     def inter_edges(self) -> list[Edge]:
-        """Retourne toutes les arêtes inter-fragments."""
+        """Return all inter-fragment edges."""
         return [e for e in self._edges.values() if e.is_inter]
 
     def nodes_of_fragment(self, fragment_id: str) -> list[Node]:
-        """Retourne tous les nœuds appartenant à un fragment."""
+        """Return all nodes belonging to a fragment."""
         return [n for n in self._nodes.values() if n.fragment_id == fragment_id]
 
     def all_nodes(self) -> list[Node]:
@@ -278,12 +278,12 @@ class BPMNGraph:
     def all_edges(self) -> list[Edge]:
         return list(self._edges.values())
 
-    # ── Détection de patterns structurels ────────
+    # ── Structural pattern detection ────────
 
     def detect_fork(self, node_id: str) -> Optional[GatewayType]:
         """
-        Si node_id est une gateway avec plusieurs arêtes sortantes,
-        retourne son type (fork AND/OR/XOR). Sinon None.
+        If node_id is a gateway with multiple outgoing edges,
+        return its type (fork AND/OR/XOR). Otherwise None.
         """
         node = self._nodes.get(node_id)
         if node and isinstance(node, GatewayNode):
@@ -293,8 +293,8 @@ class BPMNGraph:
 
     def detect_join(self, node_id: str) -> Optional[GatewayType]:
         """
-        Si node_id est une gateway avec plusieurs arêtes entrantes,
-        retourne son type (join AND/OR/XOR). Sinon None.
+        If node_id is a gateway with multiple incoming edges,
+        return its type (join AND/OR/XOR). Otherwise None.
         """
         node = self._nodes.get(node_id)
         if node and isinstance(node, GatewayNode):
@@ -303,7 +303,7 @@ class BPMNGraph:
         return None
 
     def has_cycle(self) -> bool:
-        """Détecte la présence d'un cycle dans le graphe (DFS)."""
+        """Detect a cycle in the graph (DFS)."""
         visited = set()
         rec_stack = set()
 
@@ -326,7 +326,7 @@ class BPMNGraph:
         return False
 
     def _cycle_involved_node_ids(self) -> set[str]:
-        """Nœuds du graphe situés sur au moins un cycle orienté (arêtes de retour)."""
+        """Graph nodes on at least one directed cycle (back edges)."""
         if not self.has_cycle():
             return set()
         WHITE, GRAY, BLACK = 0, 1, 2
@@ -357,11 +357,11 @@ class BPMNGraph:
 
     def cycle_involved_fragment_ids(self) -> list[str]:
         """
-        Retourne les identifiants de fragments distincts dont au moins un nœud
-        appartient à un cycle orienté.
+        Return distinct fragment identifiers where at least one node
+        belongs to a directed cycle.
 
-        Utilisé pour le pattern ``loop`` (hors COVERED_PATTERNS) : une FPd
-        unsupported est dupliquée dans ``fps.fpd_policies`` de chaque fragment listé.
+        Used for the ``loop`` pattern (outside COVERED_PATTERNS): an unmapped FPd
+        is duplicated in ``fps.fpd_policies`` of each listed fragment.
         """
         involved_nodes = self._cycle_involved_node_ids()
         frags: set[str] = set()
@@ -373,8 +373,8 @@ class BPMNGraph:
 
     def cycle_involved_activity_names(self) -> list[str]:
         """
-        Noms des activités (``ActivityNode``) dont le nœud appartient à un cycle.
-        Utilisé pour documenter la FPd ``loop`` (cible / libellé lisibles).
+        Activity names (``ActivityNode``) whose node belongs to a cycle.
+        Used to document the ``loop`` FPd (readable target / label).
         """
         names: set[str] = set()
         for nid in self._cycle_involved_node_ids():
@@ -383,10 +383,10 @@ class BPMNGraph:
                 names.add(n.name)
         return sorted(names, key=lambda s: s.lower())
 
-    # ── Représentation ────────────────────────────
+    # ── Representation ────────────────────────────
 
     def summary(self) -> dict:
-        """Résumé structurel du graphe."""
+        """Structural graph summary."""
         activities = [n for n in self._nodes.values() if isinstance(n, ActivityNode)]
         gateways = [n for n in self._nodes.values() if isinstance(n, GatewayNode)]
         events = [n for n in self._nodes.values() if isinstance(n, EventNode)]
@@ -417,15 +417,15 @@ class BPMNGraph:
 
 
 # ─────────────────────────────────────────────
-#  Construction à partir du modèle interne JSON
+#  Build from internal JSON model
 # ─────────────────────────────────────────────
 
 def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
     """
-    Construit un BPMNGraph à partir du modèle interne JSON
-    produit par BPMNParser (activities / gateways / flows).
+    Build a BPMNGraph from the internal JSON model
+    produced by BPMNParser (activities / gateways / flows).
 
-    Le modèle attendu ressemble à :
+    The expected model looks like:
         {
           "activities": [
              {"id": "...", "name": "...", "type": "task" | "event", "start": bool?, "end": bool?},
@@ -436,27 +436,27 @@ def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
              ...
           ],
           "flows": [
-             {"id": "...", "from": <id ou name>, "to": <id ou name>, "type": "sequence" | "message", "gateway": <name?>},
+             {"id": "...", "from": <id or name>, "to": <id or name>, "type": "sequence" | "message", "gateway": <name?>},
              ...
           ]
         }
 
-    La fonction est robuste au fait que les flows référencent
-    soit les IDs BPMN, soit les noms (après convert_ids_to_names).
+    The function is robust to flows referencing
+    either BPMN IDs or names (after convert_ids_to_names).
     """
     graph = BPMNGraph()
 
     id_to_node_id: dict[str, str] = {}
     name_to_node_id: dict[str, str] = {}
 
-    # 1) Création des nœuds d'activités / événements
+    # 1) Create activity / event nodes
     for act in bp_model.get("activities", []):
         act_id = act.get("id") or act.get("name")
         act_name = act.get("name") or act_id
         act_type = (act.get("type") or "").lower()
 
         if act_type == "event":
-            # On distingue start / end / intermediate
+            # Distinguish start / end / intermediate
             if act.get("start"):
                 event_kind = "start"
             elif act.get("end"):
@@ -471,7 +471,7 @@ def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
                 event_kind=event_kind,
             )
         else:
-            # Par défaut, on considère que c'est une activité (task)
+            # By default, treat as an activity (task)
             node = ActivityNode(
                 id=act_id,
                 name=act_name,
@@ -485,7 +485,7 @@ def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
         id_to_node_id[act_id] = act_id
         name_to_node_id[act_name] = act_id
 
-    # 2) Création des nœuds de gateways
+    # 2) Create gateway nodes
     gw_type_map = {
         "XOR": GatewayType.XOR,
         "AND": GatewayType.AND,
@@ -511,9 +511,9 @@ def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
         id_to_node_id[gw_id] = gw_id
         name_to_node_id[gw_name] = gw_id
 
-    # 3) Création des arêtes à partir des flows
+    # 3) Create edges from flows
     def resolve_node_id(ref: str) -> Optional[str]:
-        # ref peut être un id BPMN ou un name (après convert_ids_to_names)
+        # ref may be a BPMN id or name (after convert_ids_to_names)
         if ref in id_to_node_id:
             return id_to_node_id[ref]
         if ref in name_to_node_id:
@@ -526,7 +526,7 @@ def build_graph_from_bp_model(bp_model: dict) -> BPMNGraph:
         src_id = resolve_node_id(raw_from) if raw_from is not None else None
         tgt_id = resolve_node_id(raw_to) if raw_to is not None else None
 
-        # Si on ne peut pas résoudre les extrémités, on ignore cette arête
+        # If endpoints cannot be resolved, skip this edge
         if not src_id or not tgt_id:
             continue
 

@@ -1,7 +1,7 @@
 """
-constraint_validator.py — Agent 3 : Constraint Validator
+constraint_validator.py — Agent 3: Constraint Validator
 
-Validates unsupported-case proposals from the exception handling agent, resolves B2P mapping ambiguity (LLM),
+Validates unmapped-case proposals from the exception handling agent, resolves B2P mapping ambiguity (LLM),
 runs semantic validation on policies from Agent 4, and routes messages in the pipeline.
 """
 
@@ -11,7 +11,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from openai import AzureOpenAI, OpenAI
 
@@ -21,11 +21,71 @@ from ..structural_analyzer import (
     MessageType,
     SemanticHint,
 )
-from ..exception_handling_agent import UnsupportedCaseFormulator, UnsupportedCaseProposal
+from ..exception_handling_agent import UnmappedCaseFormulator, UnmappedCaseProposal
 from .semantic_deterministic_validation import (
     merge_semantic_hints,
     run_deterministic_semantic_validation,
 )
+from .semantic_llm_validation import run_business_semantic_llm_validation
+
+
+def _build_semantic_correction_payload(
+    hints: list[SemanticHint],
+    warnings: list[str],
+    validation_reports: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """
+    Structured report for Agent 4: business errors, ODRL paths, per-policy reports.
+    """
+    lines = [
+        "=== Agent 3 report — business semantic validation (excluding JSON-LD syntax) ===",
+        "Goal: business intent ↔ BPMN ↔ ODRL alignment; no syntax correction.",
+        "",
+    ]
+
+    reports = validation_reports or []
+    if reports:
+        lines.append("=== Per-policy verdicts (business LLM validator) ===")
+        for rep in reports:
+            uid = rep.get("policy_uid", "?")
+            verdict = rep.get("verdict", "?")
+            lines.append(f"--- {uid} → {verdict} ---")
+            if rep.get("business_intent"):
+                lines.append(f"    business_intent: {rep['business_intent']}")
+            for err in rep.get("errors") or []:
+                lines.append(f"    [ERROR] {err}")
+            for w in rep.get("warnings") or []:
+                lines.append(f"    [WARN] {w}")
+            lines.append("")
+
+    lines.append("=== Structured hints (Agent 4 repair) ===")
+    for i, h in enumerate(hints, 1):
+        lines.append(f"[{i}] policy_uid={h.policy_uid}")
+        lines.append(f"    field_path: {h.field_path or '(policy-level)'}")
+        lines.append(f"    issue: {h.issue}")
+        if h.suggested_fix:
+            lines.append(f"    suggested_fix: {h.suggested_fix}")
+        lines.append(f"    category: {h.odrl_template_key}")
+        lines.append(f"    confidence: {h.confidence}")
+        lines.append("")
+
+    if warnings:
+        lines.append("=== Global warnings ===")
+        for w in warnings:
+            lines.append(f"  - {w}")
+
+    summary = "\n".join(lines)
+    utterance = (
+        f"Business semantic validation: {len(hints)} blocking issue(s) on "
+        f"{len({h.policy_uid for h in hints})} policy uid(s). "
+        "Repair business meaning and ODRL conceptual use; resubmit for semantic audit."
+    )
+    return {
+        "semantic_correction_summary": summary,
+        "semantic_warnings": list(warnings),
+        "semantic_validation_reports": list(reports),
+        "utterance": utterance,
+    }
 
 
 class ValidationDecision(Enum):
@@ -46,9 +106,9 @@ class RejectionReason(Enum):
 
 @dataclass
 class ValidationResult:
-    """Outcome for one unsupported proposal (or structural error placeholder)."""
+    """Outcome for one unmapped proposal (or structural error placeholder)."""
 
-    proposal: Optional[UnsupportedCaseProposal]
+    proposal: Optional[UnmappedCaseProposal]
     decision: ValidationDecision
     decision_level: str
     reason: Optional[RejectionReason] = None
@@ -68,7 +128,7 @@ class ValidationReport:
     """Aggregate report for Agent 3 → Agent 4."""
 
     results: list[ValidationResult]
-    accepted_unsupported_proposals: list[UnsupportedCaseProposal] = field(default_factory=list)
+    accepted_unmapped_proposals: list[UnmappedCaseProposal] = field(default_factory=list)
     semantic_warnings: list[str] = field(default_factory=list)
     accepted: list[ValidationResult] = field(default_factory=list)
     rejected: list[ValidationResult] = field(default_factory=list)
@@ -82,15 +142,15 @@ class ValidationReport:
         self.structural_errors = [
             r for r in self.results if r.decision == ValidationDecision.STRUCTURAL_ERROR
         ]
-        self.accepted_unsupported_proposals = [
+        self.accepted_unmapped_proposals = [
             r.proposal for r in self.accepted if r.proposal is not None
         ]
 
 
 class ConstraintValidator:
     """
-    Agent 3 — B2P ambiguity resolution, unsupported proposal validation,
-    semantic validation of generated ODRL (après la première passe syntaxique A5).
+    Agent 3 — B2P ambiguity resolution, unmapped proposal validation,
+    semantic validation of generated ODRL (after the first A5 syntax pass).
     """
 
     MODEL = "gpt-4o"
@@ -121,6 +181,7 @@ class ConstraintValidator:
         self._last_enriched_graph: Optional[EnrichedGraph] = None
         self._reformulate_sent_count: dict[tuple[str, str, str], int] = {}
         self._semantic_loop_count = 0
+        self._last_semantic_validation_reports: list[dict[str, Any]] = []
         # Open Contract-Net PROPOSE envelope id (persists across REFORMULATED inform replies).
         self._last_open_propose_id: Optional[str] = None
 
@@ -153,7 +214,7 @@ class ConstraintValidator:
             self.client = OpenAI(api_key=key)
 
     def register_send_callback_exception_handling(self, fn: Callable[[AgentMessage], None]) -> None:
-        """Register the exception handling agent for ``REFORMULATE`` (unsupported path)."""
+        """Register the exception handling agent for ``REFORMULATE`` (unmapped path)."""
         self._on_send_exception_handling = fn
 
     def register_send_callback_agent4(self, fn: Callable[[AgentMessage], None]) -> None:
@@ -164,7 +225,7 @@ class ConstraintValidator:
         """Route outbound messages by ``recipient``."""
         print(f"[Agent 3] ► SEND {msg}")
         routes = {
-            UnsupportedCaseFormulator.AGENT_NAME: self._on_send_exception_handling,
+            UnmappedCaseFormulator.AGENT_NAME: self._on_send_exception_handling,
             "agent4": self._on_send_agent4,
         }
         fn = routes.get(msg.recipient)
@@ -175,7 +236,7 @@ class ConstraintValidator:
 
     def receive(self, msg: AgentMessage) -> None:
         """
-        Handle ``GRAPH_READY``, ``UNSUPPORTED_PROPOSALS``, or ``POLICIES_READY``.
+        Handle ``GRAPH_READY``, ``UNMAPPED_PROPOSALS``, or ``POLICIES_READY``.
 
         Parameters
         ----------
@@ -189,10 +250,10 @@ class ConstraintValidator:
         if msg.msg_type == MessageType.GRAPH_READY:
             self._handle_graph_ready(msg)
         elif msg.msg_type in (
-            MessageType.UNSUPPORTED_PROPOSALS,
+            MessageType.UNMAPPED_PROPOSALS,
             MessageType.REFORMULATED_PROPOSALS,
         ):
-            self._handle_unsupported_proposals(msg)
+            self._handle_unmapped_proposals(msg)
         elif msg.msg_type == MessageType.POLICIES_READY:
             self._handle_policies_ready(msg)
         else:
@@ -205,7 +266,7 @@ class ConstraintValidator:
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
-                recipient=UnsupportedCaseFormulator.AGENT_NAME,
+                recipient=UnmappedCaseFormulator.AGENT_NAME,
                 msg_type=MessageType.ACCEPT_PROPOSAL_BATCH,
                 payload={"utterance": utterance, "acl_in_reply_to": pid},
                 loop_turn=msg.loop_turn,
@@ -219,12 +280,12 @@ class ConstraintValidator:
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
-                recipient=UnsupportedCaseFormulator.AGENT_NAME,
+                recipient=UnmappedCaseFormulator.AGENT_NAME,
                 msg_type=MessageType.REJECT_PROPOSAL_BATCH,
                 payload={
                     "utterance": reason[:500],
                     "acl_in_reply_to": pid,
-                    "action": "reject-unsupported-proposals",
+                    "action": "reject-unmapped-proposals",
                     "reason": reason[:2000],
                 },
                 loop_turn=msg.loop_turn,
@@ -233,24 +294,25 @@ class ConstraintValidator:
 
     def _handle_graph_ready(self, msg: AgentMessage) -> None:
         """
-        Entry from Agent 1. Si des patterns non couverts existent, on attend les propositions
-        de l'exception handling agent (CFP émis par l'Agent 1). Sinon résolution B2P et ``VALIDATION_DONE``.
+        Entry from Agent 1. If uncovered patterns exist, wait for proposals from
+        the exception handling agent (CFP emitted by Agent 1). Otherwise B2P resolution and ``VALIDATION_DONE``.
         """
         enriched: EnrichedGraph = msg.payload["enriched_graph"]
         self._last_enriched_graph = enriched
-        unsupported = list(getattr(enriched, "unsupported_patterns", []) or [])
+        unmapped = list(getattr(enriched, "unmapped_patterns", []) or [])
 
-        if unsupported:
+        if unmapped:
             print(
-                f"[Agent 3] {len(unsupported)} unsupported pattern(s) — "
-                "attente des propositions de l'exception handling agent (CFP émis par l'Agent 1)."
+                f"[Agent 3] {len(unmapped)} unmapped pattern(s) — "
+                "waiting for proposals from the exception handling agent (CFP emitted by Agent 1). "
+                "I5 orchestrator (accept_all) will continue upon UNMAPPED_PROPOSALS."
             )
             return
 
         self._resolve_b2p_ambiguity_llm(enriched)
         report = ValidationReport(
             results=[],
-            accepted_unsupported_proposals=[],
+            accepted_unmapped_proposals=[],
             semantic_warnings=[],
         )
         self.send(
@@ -266,7 +328,7 @@ class ConstraintValidator:
             )
         )
 
-    def _handle_unsupported_proposals(self, msg: AgentMessage) -> None:
+    def _handle_unmapped_proposals(self, msg: AgentMessage) -> None:
         """
         Process proposals from the exception handling agent: B2P ambiguity (T1), validate proposals,
         then emit ``VALIDATION_DONE`` or ``REFORMULATE`` (no graph mutation).
@@ -276,24 +338,24 @@ class ConstraintValidator:
             self._last_open_propose_id = pid
 
         enriched: EnrichedGraph = msg.payload["enriched_graph"]
-        raw_props = msg.payload.get("unsupported_proposals") or []
-        proposals = [UnsupportedCaseProposal.from_dict(d) for d in raw_props]
+        raw_props = msg.payload.get("unmapped_proposals") or []
+        proposals = [UnmappedCaseProposal.from_dict(d) for d in raw_props]
         self._last_enriched_graph = enriched
 
         self._resolve_b2p_ambiguity_llm(enriched)
 
         results: list[ValidationResult] = []
         for p in proposals:
-            self._normalize_unsupported_proposal(p)
-            results.append(self._llm_judge_unsupported(p, enriched))
+            self._normalize_unmapped_proposal(p)
+            results.append(self._llm_judge_unmapped(p, enriched))
 
         report = ValidationReport(results=results)
 
-        n_acc = len(report.accepted_unsupported_proposals)
+        n_acc = len(report.accepted_unmapped_proposals)
         n_rej = len(report.rejected)
         print(
-            f"[Agent 3] Rapport propositions unsupported : {n_acc} acceptée(s), "
-            f"{n_rej} rejetée(s), {len(report.reformulate)} reformulation(s)."
+            f"[Agent 3] Unmapped proposals report: {n_acc} accepted, "
+            f"{n_rej} rejected, {len(report.reformulate)} reformulation(s)."
         )
         for r in results:
             if r.proposal:
@@ -318,14 +380,14 @@ class ConstraintValidator:
             ]
             bits = [b for b in bits if b]
             rej_reason = (
-                "Structural issue detected in unsupported proposals; "
+                "Structural issue detected in unmapped proposals; "
                 "BPMN input is not modified. "
                 + (" | ".join(bits)[:1900] if bits else "See validation report.")
             )
             self._emit_reject_proposal_batch(msg, rej_reason)
             print(
-                "[Agent 3] Erreur(s) structurelle(s) — reject-proposal vers l'exception handling agent ; "
-                "graphe d'entrée inchangé."
+                "[Agent 3] Structural error(s) — reject-proposal to exception handling agent; "
+                "input graph unchanged."
             )
             return
 
@@ -341,12 +403,12 @@ class ConstraintValidator:
                 continue
             self._reformulate_sent_count[key] = self._reformulate_sent_count.get(key, 0) + 1
             if vr.proposal and self._on_send_exception_handling:
-                rreason = vr.reformulation_hint or vr.explanation or "Reformulation requested for unsupported proposals."
+                rreason = vr.reformulation_hint or vr.explanation or "Reformulation requested for unmapped proposals."
                 self._emit_reject_proposal_batch(msg, rreason)
                 self.send(
                     AgentMessage(
                         sender=self.AGENT_NAME,
-                        recipient=UnsupportedCaseFormulator.AGENT_NAME,
+                        recipient=UnmappedCaseFormulator.AGENT_NAME,
                         msg_type=MessageType.REFORMULATE,
                         payload={
                             "hint": vr.reformulation_hint or vr.explanation,
@@ -380,14 +442,23 @@ class ConstraintValidator:
 
     def _handle_policies_ready(self, msg: AgentMessage) -> None:
         """
-        Validation sémantique (policies déjà passées par l'audit syntaxique A5).
-        On success, emit ``SEMANTIC_VALIDATED`` ; sinon ``SEMANTIC_CORRECTION`` jusqu'à ``MAX_SEMANTIC_LOOPS``.
+        Semantic validation (policies already passed A5 syntax audit).
+        On success, emit ``SEMANTIC_VALIDATED``; otherwise ``SEMANTIC_CORRECTION`` up to ``MAX_SEMANTIC_LOOPS``.
         """
         fp_results = msg.payload["fp_results"]
         enriched = msg.payload["enriched_graph"]
         self._last_enriched_graph = enriched
 
+        n_pol = sum(len(fps.all_policies()) for fps in (fp_results or {}).values())
+        print(
+            f"[Agent 3] POLICIES_READY — semantic validation of {n_pol} policy/policies "
+            f"(deterministic + business LLM on FPd/unmapped)…"
+        )
         ok, hints, warnings = self._semantic_validate_policies(fp_results, enriched)
+        print(
+            f"[Agent 3] POLICIES_READY — semantic result: "
+            f"{'OK' if ok else f'FAILURE ({len(hints)} hint(s))'}"
+        )
         if ok:
             self._semantic_loop_count = 0
             self.send(
@@ -451,6 +522,11 @@ class ConstraintValidator:
                 )
             )
 
+        extra = _build_semantic_correction_payload(
+            hints,
+            warnings,
+            validation_reports=getattr(self, "_last_semantic_validation_reports", None),
+        )
         self.send(
             AgentMessage(
                 sender=self.AGENT_NAME,
@@ -461,24 +537,27 @@ class ConstraintValidator:
                     "enriched_graph": enriched,
                     "semantic_hints": [asdict(h) for h in hints],
                     "loop_turn": msg.loop_turn + 1,
-                    "utterance": "Apply these semantic validation hints to the projected fragment policies.",
+                    "utterance": extra["utterance"],
+                    "semantic_correction_summary": extra["semantic_correction_summary"],
+                    "semantic_warnings": extra["semantic_warnings"],
+                    "semantic_validation_reports": extra.get("semantic_validation_reports") or [],
                 },
                 loop_turn=msg.loop_turn + 1,
             )
         )
 
-    def _normalize_unsupported_proposal(self, p: UnsupportedCaseProposal) -> None:
-        """Force un type de règle ODRL utilisable ; le juge LLM tranche ensuite."""
+    def _normalize_unmapped_proposal(self, p: UnmappedCaseProposal) -> None:
+        """Force a usable ODRL rule type; the LLM judge decides afterward."""
         rt = (p.odrl_rule_type or "").strip().lower()
         if rt not in ("permission", "prohibition", "obligation"):
             p.odrl_rule_type = "permission"
 
-    def _llm_judge_unsupported(
+    def _llm_judge_unmapped(
         self,
-        p: UnsupportedCaseProposal,
+        p: UnmappedCaseProposal,
         graph: EnrichedGraph,
     ) -> ValidationResult:
-        """LLM judge for semantic coherence of an unsupported proposal."""
+        """LLM judge for semantic coherence of an unmapped proposal."""
         b2p_json = json.dumps(graph.raw_b2p, ensure_ascii=False)
         user_prompt = f"""You validate an ODRL fragment-policy hint against B2P context.
 
@@ -531,7 +610,7 @@ Respond ONLY with JSON:
 
     def _resolve_b2p_ambiguity_llm(self, graph: EnrichedGraph) -> None:
         """
-        Time 1 — resolve ambiguous B2P mappings using the LLM judge (mutates ``graph.b2p_mappings``).
+        Phase 1 — resolve ambiguous B2P mappings using the LLM judge (mutates ``graph.b2p_mappings``).
         """
         ambiguous = self._collect_ambiguous_mappings(graph)
         if not ambiguous:
@@ -630,35 +709,26 @@ Respond ONLY with:
 
     def _semantic_validate_policies(self, fp_results: dict, graph: EnrichedGraph) -> tuple:
         """
-        Validation sémantique : couche déterministe (FPa↔B2P, lot, FPd) puis audit LLM.
+        Semantic validation: deterministic layer (vocabulary, FPa↔B2P, batch)
+        then business LLM judge (meaning, BPMN, intent — excluding JSON-LD syntax).
 
         Returns
         -------
         is_valid, semantic_hints, warnings
         """
         det_hints, det_warnings = run_deterministic_semantic_validation(fp_results, graph)
-        llm_hints, llm_warnings = self._semantic_validate_policies_llm(fp_results, graph)
-        merged = merge_semantic_hints(
-            det_hints,
-            [
-                {
-                    "policy_uid": h.policy_uid,
-                    "field_path": h.field_path,
-                    "issue": h.issue,
-                    "suggested_fix": h.suggested_fix,
-                    "odrl_template_key": h.odrl_template_key,
-                    "confidence": h.confidence,
-                }
-                for h in llm_hints
-            ],
+        llm_hints, llm_warnings, llm_reports = self._semantic_validate_policies_llm(
+            fp_results, graph
         )
+        self._last_semantic_validation_reports = llm_reports
+        merged = merge_semantic_hints(det_hints, llm_hints)
         warnings = list(det_warnings) + list(llm_warnings)
 
         if merged:
             uids = list({h.get("policy_uid") for h in merged if h.get("policy_uid")})
             print(
-                f"[Agent 3] Validation sémantique : {len(merged)} hint(s) "
-                f"(déterministe + LLM) sur {len(uids)} policy uid(s) — {uids[:6]}"
+                f"[Agent 3] Semantic validation: {len(merged)} hint(s) "
+                f"(deterministic + LLM) on {len(uids)} policy uid(s) — {uids[:6]}"
                 f"{' …' if len(uids) > 6 else ''}"
             )
             hints_out = [
@@ -677,82 +747,29 @@ Respond ONLY with:
 
     def _semantic_validate_policies_llm(
         self, fp_results: dict, graph: EnrichedGraph
-    ) -> tuple[list[SemanticHint], list[str]]:
-        """Audit LLM B2P ↔ ODRL pour les FPa avec _source_b2p (complément à la couche déterministe)."""
-        warnings: list[str] = []
-        all_hints: list[dict] = []
-        for _frag_id, fps in fp_results.items():
-            for pol in fps.all_policies():
-                src = pol.get("_source_b2p")
-                if not src:
-                    continue
-                b2p = next((p for p in graph.raw_b2p if p.get("uid") == src), None)
-                if not b2p:
-                    continue
-                user_prompt = f"""Validate the following generated ODRL policy against its B2P source.
+    ) -> tuple[list[dict], list[str], list[dict]]:
+        """
+        Business LLM judge for each generated policy (FPa + FPd).
 
-B2P source policy: {json.dumps(b2p, ensure_ascii=False)}
-Generated ODRL policy: {json.dumps({k: v for k, v in pol.items() if not str(k).startswith('_')}, ensure_ascii=False)}
+        Returns
+        -------
+        hint_dicts, warnings, validation_reports
+        """
+        if not self.client:
+            return [], ["Business semantic LLM validation skipped (no API client)."], []
 
-Check specifically:
-1. Is the rule type (permission/prohibition/obligation) correct?
-2. Are constraint operators correct (gt/gteq/lt/lteq/eq/neq)?
-3. Is the temporal constraint correctly expressed?
-4. Is the assigner/assignee preserved if present?
-5. Are there any hallucinated constraints not in the B2P source?
-6. STRICT ODRL vocabulary only (https://www.w3.org/TR/odrl-vocab/): reject non-ODRL actions/operands/operators.
-7. If policy uses profile extensions, mark invalid (this project forbids odrl:profile usage).
-
-For "suggested_fix": use ONLY the literal value to apply (e.g. gteq, eq, or a full http(s) IRI).
-Do not write sentences like "set uid to ..." — put the IRI alone when fixing uid or target.
-
-Respond ONLY with:
-{{
-  "is_valid": true | false,
-  "issues": [
-    {{
-      "field_path": "permission[0].constraint[0].operator",
-      "issue": "operator is gt but should be gteq",
-      "suggested_fix": "gteq",
-      "odrl_template_key": "constraint_operator",
-      "confidence": 0.0
-    }}
-  ]
-}}
-"""
-                try:
-                    raw = self._call_llm(
-                        "You are an ODRL policy auditor. You validate whether generated ODRL policies faithfully capture their source B2P rules. Respond only with valid JSON, no markdown, no preamble.",
-                        user_prompt,
-                    )
-                    data = json.loads(raw)
-                    if not data.get("is_valid", True):
-                        for issue in data.get("issues") or []:
-                            all_hints.append(
-                                {
-                                    "policy_uid": pol.get("uid"),
-                                    "field_path": issue.get("field_path", ""),
-                                    "issue": issue.get("issue", ""),
-                                    "suggested_fix": issue.get("suggested_fix", ""),
-                                    "odrl_template_key": issue.get("odrl_template_key", ""),
-                                    "confidence": float(issue.get("confidence", 0.0)),
-                                }
-                            )
-                except Exception as e:
-                    warnings.append(f"Semantic check skipped for {pol.get('uid')}: {e}")
-
-        hints_out = [
-            SemanticHint(
-                policy_uid=h["policy_uid"],
-                field_path=h["field_path"],
-                issue=h["issue"],
-                suggested_fix=h["suggested_fix"],
-                odrl_template_key=h["odrl_template_key"],
-                confidence=h["confidence"],
+        hints, warnings, reports = run_business_semantic_llm_validation(
+            fp_results,
+            graph,
+            call_llm=self._call_llm,
+        )
+        if hints:
+            uids = sorted({h.get("policy_uid") for h in hints if h.get("policy_uid")})
+            print(
+                f"[Agent 3] Business LLM semantic validation: {len(hints)} error(s) "
+                f"on {len(uids)} policy/policies — {uids[:5]}{' …' if len(uids) > 5 else ''}"
             )
-            for h in all_hints
-        ]
-        return hints_out, warnings
+        return hints, warnings, reports
 
     def _call_llm(self, system: str, user: str) -> str:
         """Invoke the configured chat model."""
@@ -779,14 +796,14 @@ Respond ONLY with:
         proposals: Optional[list] = None,
     ) -> ValidationReport:
         """
-        Standalone API: B2P ambiguity resolution plus optional unsupported proposal validation.
+        Standalone API: B2P ambiguity resolution plus optional unmapped proposal validation.
 
         Parameters
         ----------
         enriched_graph
             Output of Agent 1.
         proposals
-            ``UnsupportedCaseProposal`` instances or dicts; omit or pass ``[]`` to skip.
+            ``UnmappedCaseProposal`` instances or dicts; omit or pass ``[]`` to skip.
 
         Returns
         -------
@@ -799,10 +816,10 @@ Respond ONLY with:
         results: list[ValidationResult] = []
         for raw in raw_list:
             p = (
-                UnsupportedCaseProposal.from_dict(raw)
+                UnmappedCaseProposal.from_dict(raw)
                 if isinstance(raw, dict)
                 else raw
             )
-            self._normalize_unsupported_proposal(p)
-            results.append(self._llm_judge_unsupported(p, enriched_graph))
+            self._normalize_unmapped_proposal(p)
+            results.append(self._llm_judge_unmapped(p, enriched_graph))
         return ValidationReport(results=results)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -77,11 +78,16 @@ class AsyncBus:
         q: asyncio.Queue[ACLEnvelope],
         handler: Handler,
     ) -> None:
-        _ = receiver
         while not self._stopped.is_set():
             env = await q.get()
             try:
                 await handler(env)
+            except Exception:
+                print(
+                    f"[AsyncBus][ERROR] Handler for receiver={receiver!r} failed on "
+                    f"{env.performative.value} {env.sender}→{env.receiver}:"
+                )
+                traceback.print_exc()
             finally:
                 q.task_done()
 

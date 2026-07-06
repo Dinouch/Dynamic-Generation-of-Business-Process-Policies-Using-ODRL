@@ -1,10 +1,10 @@
 """
-Validation sémantique déterministe et au niveau du lot (Agent 3).
+Deterministic and batch-level semantic validation (Agent 3).
 
-- Alignement FPa ↔ B2P (_source_b2p) : types de règles, opérateurs, parties, cible vs activité.
-- Cohérence globale : contradictions ciblées, FPd vs graphe, références rule/policy, homonymie d'activités.
+- FPa ↔ B2P alignment (_source_b2p): rule types, operators, parties, target vs activity.
+- Global coherence: targeted contradictions, FPd vs graph, rule/policy references, activity homonymy.
 
-Sans validation syntaxique RDF/SHACL ; complète le juge LLM dans constraint_validator.
+No RDF/SHACL syntax validation; complements the LLM judge in constraint_validator.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any
 from orchestration.graph import ActivityNode
 
 from ..structural_analyzer import EnrichedGraph
+from ..Agent_4.odrl_deterministic_templates import is_deterministic_template_fpd
 
 BASE_URI = "http://example.com"
 
@@ -86,9 +87,200 @@ _ODRL_ALLOWED_LEFT_OPERANDS = {
 
 
 def _uri_asset(activity_name: str) -> str:
-    """Aligné sur policy_projection_agent.uri_asset (évite import circulaire)."""
+    """Aligned with policy_projection_agent.uri_asset (avoids circular import)."""
     slug = activity_name.replace(" ", "_").replace("-", "_")
     return f"{BASE_URI}/asset/{slug}"
+
+
+_ASSET_PREFIX = f"{BASE_URI}/asset/"
+_RULES_PREFIX = f"{BASE_URI}/rules/"
+
+
+def _normalize_iri_ref(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        raw = value.get("@id") or value.get("id")
+        return str(raw).strip() if raw is not None else ""
+    return ""
+
+
+def collect_known_asset_iris(graph: EnrichedGraph) -> set[str]:
+    """
+    Allowed IRIs ``http://example.com/asset/<slug>``: one per BPMN activity in the enriched graph.
+    Generators must not invent assets.
+    """
+    names: set[str] = set(_graph_activity_names(graph))
+    for ctx in (graph.fragment_contexts or {}).values():
+        names.update(ctx.activities or [])
+    return {_uri_asset(n) for n in names if n}
+
+
+def collect_known_b2p_rule_uids(graph: EnrichedGraph) -> set[str]:
+    """Rule UIDs already defined in B2P policies (``uid`` field of ODRL rules)."""
+    uids: set[str] = set()
+    for pol in graph.raw_b2p or []:
+        if not isinstance(pol, dict):
+            continue
+        for rt in RULE_TYPES:
+            for rule in pol.get(rt) or []:
+                if not isinstance(rule, dict):
+                    continue
+                uid = rule.get("uid")
+                if isinstance(uid, str) and uid.strip():
+                    uids.add(uid.strip())
+    return uids
+
+
+def _suggest_asset_for_policy(pol: dict, known_assets: set[str]) -> str:
+    """First plausible canonical asset for Agent 4 correction."""
+    for act in pol.get("_activities") or []:
+        if isinstance(act, str) and act.strip():
+            cand = _uri_asset(act.strip())
+            if cand in known_assets:
+                return cand
+    act = pol.get("_activity")
+    if isinstance(act, str) and act.strip():
+        cand = _uri_asset(act.strip())
+        if cand in known_assets:
+            return cand
+    return sorted(known_assets)[0] if known_assets else ""
+
+
+def _rule_has_meaningful_constraints(rule: dict) -> bool:
+    """At least one constraint (direct or refinement under action)."""
+    return len(_collect_constraint_like_entries(rule)) > 0
+
+
+def _validate_target_iri(
+    iri: str,
+    *,
+    known_assets: set[str],
+    known_b2p_rules: set[str],
+    field_path: str,
+    policy_uid: str,
+    suggested_asset: str,
+) -> list[dict]:
+    """Validate ``target``: /asset/ → existing activity; /rules/ → existing B2P uid."""
+    if not iri or not iri.startswith("http"):
+        return []
+
+    hints: list[dict] = []
+    if iri.startswith(_ASSET_PREFIX):
+        if iri not in known_assets:
+            slug = iri[len(_ASSET_PREFIX) :]
+            hints.append(
+                {
+                    "policy_uid": policy_uid,
+                    "field_path": field_path,
+                    "issue": (
+                        f"target '{iri}' references an invented asset (slug '{slug}'). "
+                        "Only enriched-graph activities are allowed under "
+                        f"{_ASSET_PREFIX}<activity> — the generator must not create assets."
+                    ),
+                    "suggested_fix": suggested_asset,
+                    "odrl_template_key": "target_asset_activity",
+                    "confidence": 0.98,
+                }
+            )
+        return hints
+
+    if iri.startswith(_RULES_PREFIX):
+        if iri not in known_b2p_rules:
+            hints.append(
+                {
+                    "policy_uid": policy_uid,
+                    "field_path": field_path,
+                    "issue": (
+                        f"target '{iri}' is not the uid of an existing B2P rule. "
+                        "References under /rules/ must reuse a uid already present "
+                        "in enriched_graph.raw_b2p (e.g. http://example.com/rules/largeAmountRule) "
+                        "— the generator must not create rules."
+                    ),
+                    "suggested_fix": sorted(known_b2p_rules)[0] if known_b2p_rules else "",
+                    "odrl_template_key": "target_b2p_rule_uid",
+                    "confidence": 0.98,
+                }
+            )
+        return hints
+
+    return hints
+
+
+def strict_target_reference_checks(
+    fp_results: dict,
+    graph: EnrichedGraph,
+) -> tuple[list[dict], list[str]]:
+    """
+    Required ``target`` references:
+    - ``.../asset/<slug>`` → existing activity in the enriched graph;
+    - ``.../rules/<...>`` → uid of an existing B2P rule.
+
+    FPd policies must have at least one constraint per rule (no empty rules).
+    """
+    hints: list[dict] = []
+    warnings: list[str] = []
+    known_assets = collect_known_asset_iris(graph)
+    known_b2p_rules = collect_known_b2p_rule_uids(graph)
+
+    if not known_assets:
+        warnings.append(
+            "No activity found in the enriched graph — /asset/ target validation impossible."
+        )
+
+    for frag_id, fps in fp_results.items():
+        for pol in fps.all_policies():
+            pol_uid = str(pol.get("uid") or "")
+            if not pol_uid:
+                continue
+            is_fpd = pol.get("_type") == "FPd"
+            is_template_fpd = is_deterministic_template_fpd(pol)
+            suggested_asset = _suggest_asset_for_policy(pol, known_assets)
+
+            for rt, idx, rule in _iter_rule_entries_with_paths(pol):
+                if not _rule_has_meaningful_constraints(rule):
+                    if is_fpd and not is_template_fpd:
+                        hints.append(
+                            {
+                                "policy_uid": pol_uid,
+                                "field_path": f"{rt}[{idx}].constraint",
+                                "issue": (
+                                    "FPd rule without constraint: a decision fragment policy "
+                                    "must express at least one condition (constraint or refinement) — "
+                                    "a bare rule is invalid."
+                                ),
+                                "suggested_fix": "",
+                                "odrl_template_key": "fpd_missing_constraint",
+                                "confidence": 0.97,
+                            }
+                        )
+
+                if is_template_fpd:
+                    continue
+
+                targets: list[tuple[str, str]] = []
+                t = _normalize_iri_ref(rule.get("target"))
+                if t:
+                    targets.append((f"{rt}[{idx}].target", t))
+                for di, duty in enumerate(rule.get("duty") or []):
+                    if isinstance(duty, dict):
+                        dt = _normalize_iri_ref(duty.get("target"))
+                        if dt:
+                            targets.append((f"{rt}[{idx}].duty[{di}].target", dt))
+
+                for field_path, iri in targets:
+                    hints.extend(
+                        _validate_target_iri(
+                            iri,
+                            known_assets=known_assets,
+                            known_b2p_rules=known_b2p_rules,
+                            field_path=field_path,
+                            policy_uid=pol_uid,
+                            suggested_asset=suggested_asset,
+                        )
+                    )
+
+    return hints, warnings
 
 
 def _norm_operator(op: Any) -> str:
@@ -147,6 +339,9 @@ def strict_odrl_vocabulary_checks(fp_results: dict) -> tuple[list[dict], list[st
         for pol in fps.all_policies():
             pol_uid = str(pol.get("uid", ""))
             if not pol_uid:
+                continue
+
+            if is_deterministic_template_fpd(pol):
                 continue
 
             if pol.get("profile"):
@@ -243,8 +438,100 @@ def strict_odrl_vocabulary_checks(fp_results: dict) -> tuple[list[dict], list[st
     return hints, warnings
 
 
+def _append_constraint_vocab_hints(
+    hints: list[dict],
+    *,
+    pol_uid: str,
+    field_path: str,
+    constraint: dict,
+) -> None:
+    op = _norm_vocab_token(constraint.get("operator"))
+    if op and op not in _ODRL_ALLOWED_OPERATORS:
+        hints.append(
+            {
+                "policy_uid": pol_uid,
+                "field_path": f"{field_path}.operator",
+                "issue": f"Operator '{op}' is outside strict ODRL vocabulary.",
+                "suggested_fix": "eq",
+                "odrl_template_key": "constraint_operator",
+                "confidence": 0.97,
+            }
+        )
+    lo = _norm_vocab_token(constraint.get("leftOperand"))
+    if lo and lo not in _ODRL_ALLOWED_LEFT_OPERANDS:
+        hints.append(
+            {
+                "policy_uid": pol_uid,
+                "field_path": f"{field_path}.leftOperand",
+                "issue": (
+                    f"leftOperand '{lo}' is outside strict ODRL vocabulary "
+                    "(likely profile-specific/custom term)."
+                ),
+                "suggested_fix": "product",
+                "odrl_template_key": "constraint_left_operand",
+                "confidence": 0.96,
+            }
+        )
+
+
+def strict_template_constraint_vocabulary_checks(
+    fp_results: dict,
+) -> tuple[list[dict], list[str]]:
+    """
+    For deterministic FPd templates: check ONLY operators and leftOperands
+    of constraints / refinements — never action, target, or structure.
+    """
+    hints: list[dict] = []
+    warnings: list[str] = []
+
+    for _frag_id, fps in fp_results.items():
+        for pol in fps.all_policies():
+            if not is_deterministic_template_fpd(pol):
+                continue
+            pol_uid = str(pol.get("uid") or "")
+            if not pol_uid:
+                continue
+
+            for rt, i, rule in _iter_rule_entries_with_paths(pol):
+                constraints = rule.get("constraint")
+                if isinstance(constraints, dict):
+                    constraints = [constraints]
+                if isinstance(constraints, list):
+                    for ci, c in enumerate(constraints):
+                        if isinstance(c, dict):
+                            _append_constraint_vocab_hints(
+                                hints,
+                                pol_uid=pol_uid,
+                                field_path=f"{rt}[{i}].constraint[{ci}]",
+                                constraint=c,
+                            )
+
+                actions = rule.get("action")
+                if actions is None:
+                    continue
+                if not isinstance(actions, list):
+                    actions = [actions]
+                for ai, a in enumerate(actions):
+                    if not isinstance(a, dict):
+                        continue
+                    refs = a.get("refinement")
+                    if isinstance(refs, dict):
+                        refs = [refs]
+                    if isinstance(refs, list):
+                        for ri, ref in enumerate(refs):
+                            if isinstance(ref, dict):
+                                _append_constraint_vocab_hints(
+                                    hints,
+                                    pol_uid=pol_uid,
+                                    field_path=f"{rt}[{i}].action[{ai}].refinement[{ri}]",
+                                    constraint=ref,
+                                )
+
+    return hints, warnings
+
+
 def _collect_constraint_like_entries(rule: dict) -> list[dict]:
-    """Contraintes directes + refinements sous action[]."""
+    """Direct constraints + refinements under action[]."""
     out: list[dict] = []
     if not isinstance(rule, dict):
         return out
@@ -274,7 +561,7 @@ def _operators_sequence(rule: dict) -> list[str]:
 
 
 def _operator_field_paths(rule_type: str, rule_idx: int, rule: dict) -> list[str]:
-    """Chemins JSON alignés sur la structure réelle de la règle (constraint vs refinement)."""
+    """JSON paths aligned with the actual rule structure (constraint vs refinement)."""
     paths: list[str] = []
     c = rule.get("constraint")
     if isinstance(c, list):
@@ -302,7 +589,7 @@ def _operator_field_paths(rule_type: str, rule_idx: int, rule: dict) -> list[str
 
 
 def _activity_names_ambiguous(graph: EnrichedGraph) -> set[str]:
-    """Noms d'activité partagés par plusieurs activity_id (homonymie)."""
+    """Activity names shared by multiple activity_id values (homonymy)."""
     by_name: dict[str, set[str]] = defaultdict(set)
     for m in graph.b2p_mappings.values():
         by_name[m.activity_name].add(m.activity_id)
@@ -355,23 +642,26 @@ def _fpd_ref_warnings(
     frag_id: str,
     policy_uids: set[str],
     rule_uids: set[str],
+    known_b2p_rules: set[str] | None = None,
 ) -> list[str]:
-    """Vérifie que les IRIs de règle/politique référencées existent dans le lot."""
+    """References /rules/ or /policy: outside batch and B2P (informational)."""
     refs: list[str] = []
     body = {k: v for k, v in fpd.items() if not str(k).startswith("_")}
     _collect_string_refs(body, refs)
     seen = set()
     w: list[str] = []
     uid_fpd = fpd.get("uid", "?")
+    b2p_rules = known_b2p_rules or set()
     for r in refs:
         if r in seen:
             continue
         seen.add(r)
-        if r in policy_uids or r in rule_uids:
+        if r in policy_uids or r in rule_uids or r in b2p_rules:
             continue
-        if "/rules/" in r or "/policy:" in r:
+        if r.startswith(_RULES_PREFIX) or "/policy:" in r:
             w.append(
-                f"[FPd {frag_id}] Politique '{uid_fpd}' référence un UID inconnu dans le lot : {r}"
+                f"[FPd {frag_id}] Policy '{uid_fpd}' references unknown UID "
+                f"(neither generated batch nor B2P): {r}"
             )
     return w
 
@@ -383,9 +673,9 @@ def deterministic_fpa_b2p_alignment(
     graph: EnrichedGraph,
 ) -> tuple[list[dict], list[str]]:
     """
-    Compare une FPa (ODRL) à sa source B2P.
+    Compare an FPa (ODRL) to its B2P source.
 
-    Retourne (hints pour Agent 4, warnings informatifs).
+    Returns (hints for Agent 4, informational warnings).
     """
     hints: list[dict] = []
     warnings: list[str] = []
@@ -399,7 +689,7 @@ def deterministic_fpa_b2p_alignment(
         o_rules = pol.get(rt) if isinstance(pol.get(rt), list) else []
         if b_rules and not o_rules:
             warnings.append(
-                f"FPa {pol_uid} : le B2P définit « {rt} » mais la politique générée ne contient pas ce type de règle."
+                f"FPa {pol_uid}: B2P defines '{rt}' but the generated policy does not contain this rule type."
             )
             continue
         if not b_rules:
@@ -416,7 +706,7 @@ def deterministic_fpa_b2p_alignment(
                     {
                         "policy_uid": pol_uid,
                         "field_path": f"{rt}[{i}].target",
-                        "issue": "target ODRL diffère du target dans la règle B2P source.",
+                        "issue": "ODRL target differs from the target in the source B2P rule.",
                         "suggested_fix": bt,
                         "odrl_template_key": "constraint_right_operand",
                         "confidence": 0.9,
@@ -435,8 +725,8 @@ def deterministic_fpa_b2p_alignment(
                         "policy_uid": pol_uid,
                         "field_path": f"{rt}[{i}].target",
                         "issue": (
-                            f"target ODRL ({ot}) ne correspond pas à l'asset canonique pour "
-                            f"l'activité « {activity} »."
+                            f"ODRL target ({ot}) does not match the canonical asset for "
+                            f"activity '{activity}'."
                         ),
                         "suggested_fix": expected_target,
                         "odrl_template_key": "constraint_right_operand",
@@ -451,7 +741,7 @@ def deterministic_fpa_b2p_alignment(
                         {
                             "policy_uid": pol_uid,
                             "field_path": f"{rt}[{i}].{field}",
-                            "issue": f"{field} ne correspond pas à la source B2P.",
+                            "issue": f"{field} does not match the B2P source.",
                             "suggested_fix": bv,
                             "odrl_template_key": "constraint_right_operand",
                             "confidence": 0.9,
@@ -469,7 +759,7 @@ def deterministic_fpa_b2p_alignment(
                             {
                                 "policy_uid": pol_uid,
                                 "field_path": fpath,
-                                "issue": f"opérateur ODRL « {oo} » ≠ B2P « {bo} ».",
+                                "issue": f"ODRL operator '{oo}' ≠ B2P '{bo}'.",
                                 "suggested_fix": bo,
                                 "odrl_template_key": "constraint_operator",
                                 "confidence": 0.95,
@@ -485,21 +775,22 @@ def batch_semantic_checks(
     graph: EnrichedGraph,
 ) -> tuple[list[dict], list[str]]:
     """
-    Cohérence du lot : contradictions sur cibles FPa, FPd vs graphe, références, XOR.
+    Batch coherence: FPa target contradictions, FPd vs graph, references, XOR.
 
-    Les hints produits sont limités aux cas avec chemin ODRL clair ; le reste part en warnings.
+    Hints are limited to cases with a clear ODRL path; the rest go to warnings.
     """
     hints: list[dict] = []
     warnings: list[str] = []
 
     policy_uids, rule_uids = _build_uid_indexes(fp_results)
+    known_b2p_rules = collect_known_b2p_rule_uids(graph)
     act_in_graph = _graph_activity_names(graph)
     amb_names = _activity_names_ambiguous(graph)
     if amb_names:
         warnings.append(
-            "Homonymie d'activités (même nom, plusieurs activity_id) : "
+            "Activity homonymy (same name, multiple activity_id): "
             f"{', '.join(sorted(amb_names)[:12])}"
-            f"{' …' if len(amb_names) > 12 else ''} — risque d'alignement FPa/FPd."
+            f"{' …' if len(amb_names) > 12 else ''} — FPa/FPd alignment risk."
         )
 
     for frag_id, fps in fp_results.items():
@@ -508,8 +799,8 @@ def batch_semantic_checks(
                 continue
             uid = pol.get("uid", "?")
             warnings.append(
-                f"[{frag_id}] FPa « {uid} » sans _source_b2p — politique minimale / par défaut, "
-                "non alignée à une entrée B2P explicite."
+                f"[{frag_id}] FPa '{uid}' without _source_b2p — minimal / default policy, "
+                "not aligned to an explicit B2P entry."
             )
 
     target_modes: dict[str, set[str]] = defaultdict(set)
@@ -525,7 +816,7 @@ def batch_semantic_checks(
     for tgt, modes in target_modes.items():
         if "permission" in modes and "prohibition" in modes:
             warnings.append(
-                f"Cohérence globale : la cible « {tgt} » a à la fois permission et prohibition dans les FPa."
+                f"Global coherence: target '{tgt}' has both permission and prohibition in FPa policies."
             )
 
     seq_pairs = {
@@ -541,7 +832,7 @@ def batch_semantic_checks(
             for act in fpd.get("_activities") or []:
                 if act not in act_in_graph:
                     warnings.append(
-                        f"[FPd {frag_id} « {uid} »] Activité « {act} » absente du graphe enrichi."
+                        f"[FPd {frag_id} '{uid}'] Activity '{act}' missing from enriched graph."
                     )
 
             if fpd.get("_flow") == "sequence":
@@ -550,18 +841,169 @@ def batch_semantic_checks(
                     pair = (acts[0], acts[1])
                     if pair not in seq_pairs:
                         warnings.append(
-                            f"[FPd {frag_id} « {uid} »] Séquence {acts[0]} → {acts[1]} "
-                            "non trouvée comme connexion sequence/message dans le graphe."
+                            f"[FPd {frag_id} '{uid}'] Sequence {acts[0]} → {acts[1]} "
+                            "not found as sequence/message connection in graph."
                         )
 
             if fpd.get("_gateway") == "XOR":
                 conds = fpd.get("_conditions") or []
                 if len(conds) >= 2 and conds[0] == conds[1]:
                     warnings.append(
-                        f"[FPd {frag_id} « {uid} »] XOR : conditions identiques ({conds[0]!r})."
+                        f"[FPd {frag_id} '{uid}'] XOR: identical conditions ({conds[0]!r})."
                     )
 
-            warnings.extend(_fpd_ref_warnings(fpd, frag_id, policy_uids, rule_uids))
+            warnings.extend(
+                _fpd_ref_warnings(
+                    fpd, frag_id, policy_uids, rule_uids, known_b2p_rules=known_b2p_rules
+                )
+            )
+
+    return hints, warnings
+
+
+_EXCLUSIVE_BRANCH_PATTERNS = frozenset({"fork_xor", "fork_event_based_exclusive"})
+
+
+def _slugify_activity(name: str) -> str:
+    return name.replace(" ", "_").replace("-", "_").lower()
+
+
+def _target_is_gateway_asset(gateway_name: str, target_iri: str) -> bool:
+    """Detect a target pointing at the gateway instead of a branch activity."""
+    if not gateway_name or not target_iri:
+        return False
+    if not target_iri.startswith(_ASSET_PREFIX):
+        return False
+    slug = target_iri[len(_ASSET_PREFIX) :].lower()
+    gw_slug = _slugify_activity(gateway_name)
+    return slug == gw_slug or gateway_name.replace("-", "_").lower() == slug
+
+
+def _target_matches_branch_activity(target_iri: str, branch_activities: set[str]) -> bool:
+    if not target_iri.startswith(_ASSET_PREFIX) or not branch_activities:
+        return True
+    slug = target_iri[len(_ASSET_PREFIX) :].lower()
+    for act in branch_activities:
+        if _slugify_activity(act) == slug:
+            return True
+    return False
+
+
+def rule_activation_compilation_checks(
+    fp_results: dict,
+    graph: EnrichedGraph,
+) -> tuple[list[dict], list[str]]:
+    """
+    Verify the compilation model: conditional activation per branch,
+    not gateway compression / single target for multiple rules.
+    """
+    hints: list[dict] = []
+    warnings: list[str] = []
+
+    branch_by_key: dict[tuple[str, str, str], set[str]] = {}
+    for up in getattr(graph, "unmapped_patterns", None) or []:
+        acts = set(up.involved_activity_names or [])
+        keys = [(up.fragment_id, up.gateway_name or "", up.pattern_type or "")]
+        for fid in up.involved_fragment_ids or []:
+            keys.append((fid, up.gateway_name or "", up.pattern_type or ""))
+        for key in keys:
+            if acts:
+                branch_by_key.setdefault(key, set()).update(acts)
+
+    for frag_id, fps in fp_results.items():
+        for pol in fps.all_policies():
+            pol_uid = str(pol.get("uid") or "")
+            if not pol_uid:
+                continue
+
+            if is_deterministic_template_fpd(pol):
+                continue
+
+            pattern = str(pol.get("_unmapped_pattern") or "").strip().lower()
+            gateway = str(pol.get("_gateway_name") or "").strip()
+            if pattern not in _EXCLUSIVE_BRANCH_PATTERNS and not gateway:
+                continue
+
+            rules = _iter_rule_entries_with_paths(pol)
+            if not rules:
+                continue
+
+            target_entries: list[tuple[str, str]] = []
+            for rt, idx, rule in rules:
+                t = _normalize_iri_ref(rule.get("target"))
+                if t:
+                    target_entries.append((f"{rt}[{idx}].target", t))
+
+            if not target_entries:
+                continue
+
+            branch_acts = branch_by_key.get((frag_id, gateway, pattern), set())
+
+            for field_path, t in target_entries:
+                if gateway and _target_is_gateway_asset(gateway, t):
+                    hints.append(
+                        {
+                            "policy_uid": pol_uid,
+                            "field_path": field_path,
+                            "issue": (
+                                "Invalid compilation: target points at BPMN gateway "
+                                f"'{gateway}' instead of a governable branch activity. "
+                                "Policies activate branch rules; they do not describe the gateway."
+                            ),
+                            "suggested_fix": "",
+                            "odrl_template_key": "business_semantic",
+                            "confidence": 0.96,
+                        }
+                    )
+                elif branch_acts and not _target_matches_branch_activity(t, branch_acts):
+                    hints.append(
+                        {
+                            "policy_uid": pol_uid,
+                            "field_path": field_path,
+                            "issue": (
+                                "Target does not match any expected branch activity for this "
+                                f"pattern '{pattern}' (gateway '{gateway}'). "
+                                f"Expected branch activities: {sorted(branch_acts)}."
+                            ),
+                            "suggested_fix": "",
+                            "odrl_template_key": "business_semantic",
+                            "confidence": 0.9,
+                        }
+                    )
+
+            target_iris = [t for _, t in target_entries]
+            unique_targets = set(target_iris)
+
+            if len(rules) > 1 and len(unique_targets) == 1:
+                hints.append(
+                    {
+                        "policy_uid": pol_uid,
+                        "field_path": "permission[0].target",
+                        "issue": (
+                            "Structural compression forbidden: multiple ODRL rules share "
+                            "the same target while the BPMN pattern has distinct branches. "
+                            "Each branch must have its own target (activity asset)."
+                        ),
+                        "suggested_fix": "",
+                        "odrl_template_key": "business_semantic",
+                        "confidence": 0.95,
+                    }
+                )
+
+            if len(rules) > 1 and len(unique_targets) < len(target_iris):
+                hints.append(
+                    {
+                        "policy_uid": pol_uid,
+                        "field_path": "",
+                        "issue": (
+                            "Undistinguished branches: rules in the same policy reuse "
+                            "identical targets without explicit BPMN convergence."
+                        ),
+                        "suggested_fix": "",
+                        "odrl_template_key": "business_semantic",
+                        "confidence": 0.88,
+                    }
+                )
 
     return hints, warnings
 
@@ -571,14 +1013,14 @@ def run_deterministic_semantic_validation(
     graph: EnrichedGraph,
 ) -> tuple[list[dict], list[str]]:
     """
-    Point d'entrée : FPa↔B2P par politique, puis contrôles de lot.
+    Entry point: FPa↔B2P per policy, then batch checks.
 
     Returns
     -------
     hints
-        Dicts compatibles avec SemanticHint / semantic_hints Agent 4.
+        Dicts compatible with SemanticHint / Agent 4 semantic_hints.
     warnings
-        Messages informatifs (homonymie, absences structurelles, etc.).
+        Informational messages (homonymy, structural absences, etc.).
     """
     all_hints: list[dict] = []
     all_warnings: list[str] = []
@@ -593,7 +1035,7 @@ def run_deterministic_semantic_validation(
             b2p = b2p_by_uid.get(src)
             if not b2p:
                 all_warnings.append(
-                    f"[{frag_id}] FPa « {pol.get('uid')} » : _source_b2p « {src} » introuvable dans raw_b2p."
+                    f"[{frag_id}] FPa '{pol.get('uid')}': _source_b2p '{src}' not found in raw_b2p."
                 )
                 continue
             h, w = deterministic_fpa_b2p_alignment(pol, frag_id, b2p, graph)
@@ -608,11 +1050,23 @@ def run_deterministic_semantic_validation(
     all_hints.extend(h3)
     all_warnings.extend(w3)
 
+    h3t, w3t = strict_template_constraint_vocabulary_checks(fp_results)
+    all_hints.extend(h3t)
+    all_warnings.extend(w3t)
+
+    h4, w4 = strict_target_reference_checks(fp_results, graph)
+    all_hints.extend(h4)
+    all_warnings.extend(w4)
+
+    h5, w5 = rule_activation_compilation_checks(fp_results, graph)
+    all_hints.extend(h5)
+    all_warnings.extend(w5)
+
     return all_hints, all_warnings
 
 
 def merge_semantic_hints(primary: list[dict], secondary: list[dict]) -> list[dict]:
-    """Dédoublonne par (policy_uid, field_path, suggested_fix)."""
+    """Deduplicate by (policy_uid, field_path, suggested_fix)."""
     seen: set[tuple[str, str, str]] = set()
     out: list[dict] = []
     for h in primary + secondary:

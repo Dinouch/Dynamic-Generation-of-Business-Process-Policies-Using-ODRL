@@ -1,12 +1,12 @@
 """
-Serveur FastAPI : lance le pipeline async + SSE pour HITL et résultat final.
+FastAPI server: runs the async pipeline + SSE for HITL and final result.
 
-Lancement (depuis la racine du projet BPFragmentODRLProject) ::
+Launch (from BPFragmentODRLProject root) ::
     uvicorn api.server:app --reload --host 127.0.0.1 --port 8765
 
-CORS (front Next.js) : par défaut ``localhost:3000`` et ``127.0.0.1:3000``.
-Autre origine (ex. IP LAN) : variable d'environnement ``CORS_ORIGINS`` (liste séparée par des virgules)
-ou ``CORS_ORIGIN_REGEX`` (ex. ``http://192\\.168\\..*``).
+CORS (Next.js frontend): defaults to ``localhost:3000`` and ``127.0.0.1:3000``.
+Other origin (e.g. LAN IP): environment variable ``CORS_ORIGINS`` (comma-separated list)
+or ``CORS_ORIGIN_REGEX`` (e.g. ``http://192\\.168\\..*``).
 """
 
 from __future__ import annotations
@@ -87,12 +87,12 @@ def _serialize_result(r: PipelineAsyncResult) -> dict[str, Any]:
 class StartRunBody(BaseModel):
     scenario_id: str = Field(
         default="scenario1",
-        description="Dossier sous src/dataset/",
+        description="Directory under src/dataset/",
     )
     human_timeout_s: float = Field(default=120.0, ge=1.0, le=3600.0)
     process_title: Optional[str] = Field(
         default=None,
-        description="Libellé métier affiché dans le HITL (ex. Credit Application BP).",
+        description="Business label shown in HITL (e.g. Credit Application BP).",
     )
 
 
@@ -106,7 +106,7 @@ class HitlBody(BaseModel):
     def _norm_decision(cls, v: str) -> str:
         d = (v or "").strip().lower()
         if d not in ("agree", "refuse"):
-            raise ValueError("decision doit être agree ou refuse")
+            raise ValueError("decision must be agree or refuse")
         return d
 
 
@@ -123,7 +123,7 @@ def _parse_and_fragment_bpmn_bytes(
     llm_temperature: float,
     llm_seed: int,
 ) -> dict[str, Any]:
-    """Parse BPMN XML depuis des octets, fragmentation LLM, écrit ``fragments`` + ``fragments_enhanced``."""
+    """Parse BPMN XML from bytes, LLM fragmentation, write ``fragments`` + ``fragments_enhanced``."""
     import tempfile
 
     suf = file_suffix if file_suffix.lower() in (".bpmn", ".xml") else ".bpmn"
@@ -136,7 +136,7 @@ def _parse_and_fragment_bpmn_bytes(
         parser = BPMNParser()
         model = parser.parse_file(tmp_path)
         if not model:
-            raise ValueError("Échec du parsing BPMN (fichier vide, XML invalide ou sans processus).")
+            raise ValueError("BPMN parsing failed (empty file, invalid XML, or no process).")
         model = parser.convert_ids_to_names(model)
 
         fragmenter = SemanticFragmenter(
@@ -194,7 +194,7 @@ def _normalize_b2p_policies(data: Any) -> list[dict[str, Any]]:
         return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict):
         return [data]
-    raise ValueError("Le fichier policies doit être un JSON objet ou tableau d'objets.")
+    raise ValueError("The policies file must be a JSON object or array of objects.")
 
 
 def _process_scenario_upload_sync(
@@ -205,11 +205,11 @@ def _process_scenario_upload_sync(
     llm_temperature: float,
     llm_seed: int,
 ) -> dict[str, Any]:
-    """Parse BPMN, fragmentation LLM, écrit ``scenarioN/`` avec bp_global.json, B2P.json, fragments.json, fragments_enhanced.json."""
+    """Parse BPMN, LLM fragmentation, write ``scenarioN/`` with bp_global.json, B2P.json, fragments.json, fragments_enhanced.json."""
     import tempfile
 
     _logger.info(
-        "Scénario (sync) : %s octets BPMN, %s octets policies — parsing…",
+        "Scenario (sync): %s BPMN bytes, %s policy bytes — parsing…",
         len(bpmn_bytes),
         len(odrl_bytes),
     )
@@ -218,10 +218,10 @@ def _process_scenario_upload_sync(
     try:
         raw_pol = json.loads(odrl_text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Policies ODRL : JSON invalide ({e})") from e
+        raise ValueError(f"ODRL policies: invalid JSON ({e})") from e
     policies = _normalize_b2p_policies(raw_pol)
     if not policies:
-        raise ValueError("Policies ODRL : aucun objet politique valide dans le JSON.")
+        raise ValueError("ODRL policies: no valid policy object in JSON.")
 
     suf = bpmn_suffix if bpmn_suffix.lower() in (".bpmn", ".xml") else ".bpmn"
     tmp_path: Optional[str] = None
@@ -233,11 +233,11 @@ def _process_scenario_upload_sync(
         parser = BPMNParser()
         model = parser.parse_file(tmp_path)
         if not model:
-            raise ValueError("Échec du parsing BPMN (fichier vide, XML invalide ou sans processus).")
+            raise ValueError("BPMN parsing failed (empty file, invalid XML, or no process).")
 
         _logger.info(
-            "BPMN parsé OK — fragmentation LLM en cours (plusieurs appels possibles, souvent 1–5 min ; "
-            "le terminal peut sembler « figé » pendant ce temps)."
+            "BPMN parsed OK — LLM fragmentation in progress (multiple calls possible, often 1–5 min; "
+            "the terminal may appear « frozen » during this time)."
         )
         fragments = build_fragments_from_bp_model(
             model,
@@ -263,7 +263,7 @@ def _process_scenario_upload_sync(
         )
 
         _logger.info(
-            "POST /scenario/process terminé — %s (%d fragments) → %s",
+            "POST /scenario/process completed — %s (%d fragments) → %s",
             scenario_id,
             len(fragments),
             scenario_dir.resolve(),
@@ -308,9 +308,9 @@ async def start_run(body: StartRunBody) -> dict[str, str]:
 
     async def _runner() -> None:
         try:
-            await bridge.emit_log(f"Chargement du scénario « {body.scenario_id} »…")
+            await bridge.emit_log(f"Loading scenario « {body.scenario_id} »…")
             bp_model, fragments, b2p_policies = load_scenario(body.scenario_id, base_dir=base_dir)
-            await bridge.emit_log("Pipeline async démarré (HITL via API).")
+            await bridge.emit_log("Async pipeline started (HITL via API).")
 
             _logged_agent5 = False
 
@@ -319,7 +319,7 @@ async def start_run(body: StartRunBody) -> dict[str, str]:
                 if env.receiver == "agent5" and not _logged_agent5:
                     _logged_agent5 = True
                     await bridge.emit_log(
-                        "Étape audit (agent 5) en cours — le LLM peut prendre du temps ; la connexion reste ouverte (keep-alive SSE)."
+                        "Audit step (agent 5) in progress — the LLM may take a while; the connection stays open (SSE keep-alive)."
                     )
                 await bridge.emit_acl(env)
 
@@ -333,6 +333,18 @@ async def start_run(body: StartRunBody) -> dict[str, str]:
                 scenario_id=body.scenario_id,
                 process_title=body.process_title,
             )
+            oep = (result.odrl_export_paths or {}) if result else {}
+            if oep:
+                await bridge.emit_log(
+                    "ODRL export written under output/"
+                    f"{body.scenario_id}/odrl_fragment_policies/ "
+                    f"({', '.join(sorted(oep.keys()))})."
+                )
+            else:
+                await bridge.emit_log(
+                    f"Warning: no ODRL export on disk for {body.scenario_id!r}. "
+                    "Check uvicorn logs (Agent 4 / 5)."
+                )
             await bridge.emit_done(_serialize_result(result))
         except Exception as e:
             await bridge.emit_error(str(e))
@@ -344,14 +356,14 @@ async def start_run(body: StartRunBody) -> dict[str, str]:
 
 
 _RUN_LOST_MSG = (
-    "Ce run_id n'existe pas en mémoire (serveur redémarré avec --reload, "
-    "ou session trop ancienne). Relancez « Lancer le pipeline » depuis l'interface."
+    "This run_id does not exist in memory (server restarted with --reload, "
+    "or session too old). Restart « Run pipeline » from the interface."
 )
 
 
 @app.get("/runs/{run_id}/ready")
 async def run_session_ready(run_id: str) -> dict[str, Any]:
-    """Vérifie que la session existe (utile au client pour distinguer 404 SSE)."""
+    """Check that the session exists (useful for the client to distinguish SSE 404)."""
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail=_RUN_LOST_MSG)
     return {"ok": True, "run_id": run_id}
@@ -364,7 +376,7 @@ async def stream_events(run_id: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail=_RUN_LOST_MSG)
 
     async def gen() -> Any:
-        # Commentaires SSE (: …) pour éviter la coupure proxy/navigateur pendant les phases longues (ex. agent 5).
+        # SSE comments (: …) to prevent proxy/browser disconnect during long phases (e.g. agent 5).
         ka_sec = float(os.environ.get("SSE_KEEPALIVE_SEC", "18"))
         while True:
             item = await bridge.pull_event_or_timeout(ka_sec)
@@ -395,10 +407,10 @@ async def submit_hitl(run_id: str, body: HitlBody) -> dict[str, Any]:
     ok = bridge.submit(body.reply_with.strip(), body.decision, body.comment)
     if not ok:
         print(
-            f"[API] POST /hitl refusé — reply_with={body.reply_with!r} "
-            f"(inconnu ou déjà répondu ; en attente : {bridge.pending_hitl_keys()!r})"
+            f"[API] POST /hitl rejected — reply_with={body.reply_with!r} "
+            f"(unknown or already answered; pending: {bridge.pending_hitl_keys()!r})"
         )
-        raise HTTPException(status_code=400, detail="reply_with inconnu ou déjà répondu")
+        raise HTTPException(status_code=400, detail="reply_with unknown or already answered")
     return {"ok": True}
 
 
@@ -423,14 +435,103 @@ def _scenario_id_ok(sid: str) -> bool:
 
 
 def _odrl_output_root(scenario_id: str) -> Path:
-    """``output/{scenarioN}/odrl_fragment_policies/`` à la racine du projet (hors ``dataset``)."""
+    """``output/{scenarioN}/odrl_fragment_policies/`` at project root (outside ``dataset``)."""
     return (_ROOT / "output" / scenario_id / "odrl_fragment_policies").resolve()
+
+
+_KNOWN_ODRL_STAGES = frozenset(
+    {"partial_template_only", "final_merged", "final_validated", "generated"}
+)
+
+
+def _jsonld_files_in_dir(directory: Path) -> list[Path]:
+    return sorted(directory.glob("*.jsonld"))
+
+
+def _collect_fragment_map(container: Path, base: Path) -> dict[str, list[dict[str, str]]]:
+    """Group ``*.jsonld`` files by fragment subfolder; ``relative`` from ``base``."""
+    frag_map: dict[str, list[dict[str, str]]] = {}
+    if not container.is_dir():
+        return frag_map
+    for child in sorted(container.iterdir()):
+        if not child.is_dir():
+            continue
+        files_meta: list[dict[str, str]] = []
+        for policy_file in _jsonld_files_in_dir(child):
+            rel = str(policy_file.relative_to(base)).replace("\\", "/")
+            files_meta.append(
+                {
+                    "relative": rel,
+                    "basename": policy_file.name,
+                    "ui_category": _ui_category_from_stem(policy_file.stem),
+                }
+            )
+        if files_meta:
+            frag_map[child.name] = files_meta
+    return frag_map
+
+
+def _fragment_dirs_at_root(base: Path) -> bool:
+    """
+    Detect flat export ``odrl_fragment_policies/f1/*.jsonld`` (without stage subfolder).
+    """
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name in _KNOWN_ODRL_STAGES:
+            return False
+        if _jsonld_files_in_dir(child):
+            return True
+    return False
+
+
+def _stage_sort_key(name: str) -> tuple[int, str]:
+    order = {
+        "final_validated": 0,
+        "final_merged": 1,
+        "partial_template_only": 2,
+        "generated": 3,
+    }
+    return (order.get(name, 99), name)
+
+
+def _list_odrl_export_stages(base: Path) -> list[dict[str, Any]]:
+    if not base.is_dir():
+        return []
+
+    stages: list[dict[str, Any]] = []
+
+    if _fragment_dirs_at_root(base):
+        frag_map = _collect_fragment_map(base, base)
+        if frag_map:
+            stages.append(
+                {
+                    "name": "generated",
+                    "path": str(base),
+                    "fragments": frag_map,
+                }
+            )
+        return stages
+
+    for stage_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        frag_map = _collect_fragment_map(stage_dir, base)
+        if frag_map:
+            stages.append(
+                {
+                    "name": stage_dir.name,
+                    "path": str(stage_dir),
+                    "fragments": frag_map,
+                }
+            )
+
+    stages.sort(key=lambda s: _stage_sort_key(str(s.get("name", ""))))
+    return stages
 
 
 def _ui_category_from_stem(stem: str) -> str:
     """
-    Catégorie affichage dérivée du préfixe du fichier exporté (voir ``PolicyProjectionAgent.export``).
-    Retourne : FPa | FPd-intra | FPd-inter | unsupported
+    Display category derived from exported file prefix (see ``PolicyProjectionAgent.export``).
+    Returns: FPa | FPd-intra | FPd-inter | unmapped
     """
     s = stem.lower()
     if s.startswith("fpa_"):
@@ -445,47 +546,20 @@ def _ui_category_from_stem(stem: str) -> str:
     ):
         return "FPd-intra"
     if s.startswith("fpd_"):
-        return "unsupported"
-    return "unsupported"
+        return "unmapped"
+    return "unmapped"
 
 
 @app.get("/scenario/{scenario_id}/odrl-index")
 async def odrl_fragment_policies_index(scenario_id: str) -> dict[str, Any]:
     """
-    Liste les exports JSON-LD par étape (``partial_template_only``, ``final_merged``),
-    par fragment, fichiers plats ; ``ui_category`` est déduit du nom de fichier.
+    List JSON-LD exports by stage (``final_validated``, ``partial_template_only``, …)
+    or flat export ``fN/*.jsonld``; ``relative`` is relative to ``odrl_fragment_policies/``.
     """
     if not _scenario_id_ok(scenario_id):
-        raise HTTPException(status_code=400, detail="Identifiant de scénario invalide.")
+        raise HTTPException(status_code=400, detail="Invalid scenario identifier.")
     base = _odrl_output_root(scenario_id)
-    if not base.is_dir():
-        return {"scenario_id": scenario_id, "stages": []}
-    stages: list[dict[str, Any]] = []
-    for stage_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-        frag_map: dict[str, Any] = {}
-        for frag in sorted(stage_dir.iterdir()):
-            if not frag.is_dir():
-                continue
-            fid = frag.name
-            files_meta: list[dict[str, str]] = []
-            for p in sorted(frag.glob("*.jsonld")):
-                rel = str(p.relative_to(stage_dir)).replace("\\", "/")
-                files_meta.append(
-                    {
-                        "relative": rel,
-                        "basename": p.name,
-                        "ui_category": _ui_category_from_stem(p.stem),
-                    }
-                )
-            if files_meta:
-                frag_map[fid] = files_meta
-        stages.append(
-            {
-                "name": stage_dir.name,
-                "path": str(stage_dir),
-                "fragments": frag_map,
-            }
-        )
+    stages = _list_odrl_export_stages(base)
     return {"scenario_id": scenario_id, "stages": stages}
 
 
@@ -494,28 +568,28 @@ async def odrl_fragment_policy_file(
     scenario_id: str,
     rel: str = Query(
         ...,
-        description="Chemin relatif depuis odrl_fragment_policies/ (ex. final_merged/f1/FPa_0_act.jsonld).",
+        description="Relative path from odrl_fragment_policies/ (e.g. final_merged/f1/FPa_0_act.jsonld).",
     ),
 ) -> dict[str, Any]:
     if not _scenario_id_ok(scenario_id):
-        raise HTTPException(status_code=400, detail="Identifiant de scénario invalide.")
+        raise HTTPException(status_code=400, detail="Invalid scenario identifier.")
     base = _odrl_output_root(scenario_id)
     if not base.is_dir():
-        raise HTTPException(status_code=404, detail="Aucun export ODRL pour ce scénario.")
+        raise HTTPException(status_code=404, detail="No ODRL export for this scenario.")
     rp = Path(rel.strip())
     if rp.is_absolute() or ".." in rp.parts:
-        raise HTTPException(status_code=400, detail="Chemin invalide.")
+        raise HTTPException(status_code=400, detail="Invalid path.")
     target = (base / rp).resolve()
     try:
         target.relative_to(base)
     except ValueError as e:
-        raise HTTPException(status_code=403, detail="Chemin hors du dossier autorisé.") from e
+        raise HTTPException(status_code=403, detail="Path outside authorized directory.") from e
     if not target.is_file():
-        raise HTTPException(status_code=404, detail="Fichier introuvable.")
+        raise HTTPException(status_code=404, detail="File not found.")
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=422, detail=f"JSON invalide : {e}") from e
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {e}") from e
     return {
         "path": str(target),
         "relative": rel.replace("\\", "/"),
@@ -531,20 +605,20 @@ async def scenario_process(
     seed: int = 42,
 ) -> dict[str, Any]:
     """
-    BPMN + policies ODRL (JSON) : parsing, fragmentation LLM, création de ``src/dataset/scenarioN/``
-    avec ``bp_global.json``, ``B2P.json``, ``fragments.json``, ``fragments_enhanced.json``.
+    BPMN + ODRL policies (JSON): parsing, LLM fragmentation, creation of ``src/dataset/scenarioN/``
+    with ``bp_global.json``, ``B2P.json``, ``fragments.json``, ``fragments_enhanced.json``.
     """
     _logger.info(
-        "POST /scenario/process — fichiers reçus : bpmn=%r odrl=%r",
+        "POST /scenario/process — files received: bpmn=%r odrl=%r",
         bpmn.filename,
         odrl.filename,
     )
     raw_b = await bpmn.read()
     raw_o = await odrl.read()
     if not raw_b:
-        raise HTTPException(status_code=400, detail="Fichier BPMN vide.")
+        raise HTTPException(status_code=400, detail="Empty BPMN file.")
     if not raw_o:
-        raise HTTPException(status_code=400, detail="Fichier policies vide.")
+        raise HTTPException(status_code=400, detail="Empty policies file.")
     bpmn_name = (bpmn.filename or "upload.bpmn").lower()
     suffix = Path(bpmn_name).suffix.lower() if Path(bpmn_name).suffix else ".bpmn"
     try:
@@ -562,7 +636,7 @@ async def scenario_process(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Traitement scénario impossible : {e!s}",
+            detail=f"Scenario processing failed: {e!s}",
         ) from e
 
 
@@ -574,15 +648,15 @@ async def fragment_uploaded_bpmn(
     threshold: Optional[float] = None,
 ) -> dict[str, Any]:
     """
-    Reçoit un BPMN (.bpmn / .xml), parse, fragmente (LLM), écrit un unique JSON
-    dans le dossier Téléchargements de l'utilisateur Windows (``Path.home() / Downloads``),
-    sauf si ``FRAGMENT_EXPORT_DIR`` est défini dans l'environnement.
+    Receives a BPMN (.bpmn / .xml), parses, fragments (LLM), writes a single JSON
+    to the user's Windows Downloads folder (``Path.home() / Downloads``),
+    unless ``FRAGMENT_EXPORT_DIR`` is set in the environment.
 
-    ``threshold`` est déprécié : si fourni il est utilisé comme température LLM pour compatibilité.
+    ``threshold`` is deprecated: if provided it is used as LLM temperature for compatibility.
     """
     raw = await file.read()
     if not raw:
-        raise HTTPException(status_code=400, detail="Fichier vide.")
+        raise HTTPException(status_code=400, detail="Empty file.")
 
     orig = (file.filename or "upload.bpmn").lower()
     suffix = Path(orig).suffix.lower() if Path(orig).suffix else ".bpmn"
@@ -602,5 +676,134 @@ async def fragment_uploaded_bpmn(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Fragmentation impossible : {e!s}",
+            detail=f"Fragmentation failed: {e!s}",
         ) from e
+
+
+class ExecutionRunBody(BaseModel):
+    scenario_id: str = Field(
+        default="scenario018",
+        description="Directory under src/dataset/ (or relative/absolute path to a scenario)",
+    )
+    policies_dir: Optional[str] = Field(
+        default=None,
+        description="Post-pipeline ODRL export; otherwise ground truth / scenario odrl_policies",
+    )
+    mode: str = Field(default="simulation", description="simulation | camunda7 | camunda8")
+    variables: dict[str, Any] = Field(default_factory=dict)
+    max_steps: int = Field(default=64, ge=1, le=256)
+    bpmn_path: Optional[str] = Field(default=None, description="Required for camunda mode")
+    process_definition_key: Optional[str] = Field(
+        default=None,
+        description="Camunda process key (process id)",
+    )
+
+
+def _resolve_scenario_path(scenario_id: str) -> Path:
+    sid = (scenario_id or "").strip()
+    p = Path(sid)
+    if p.is_dir():
+        return p.resolve()
+    under_src = _SRC / "dataset" / sid
+    if under_src.is_dir():
+        return under_src.resolve()
+    raise HTTPException(status_code=404, detail=f"Scenario not found: {scenario_id}")
+
+
+def _serialize_execution_result(result: Any) -> dict[str, Any]:
+    return {
+        "success": result.success,
+        "mode": result.mode.value if hasattr(result.mode, "value") else str(result.mode),
+        "error": result.error,
+        "summary": result.summary,
+        "camunda_process_instance_id": result.camunda_process_instance_id,
+        "steps": [
+            {
+                "index": s.step_index,
+                "activity": s.activity,
+                "fragment_id": s.fragment_id,
+                "allowed": s.decision.allowed,
+                "reason": s.decision.reason,
+                "enabled_rules": s.enabled_rules_after,
+                "variables": s.variables_snapshot,
+            }
+            for s in (result.steps or [])
+        ],
+    }
+
+
+@app.post("/execution/run")
+async def execution_run(body: ExecutionRunBody) -> dict[str, Any]:
+    """
+    Run a scenario after fragment policy generation (FPa/FPd).
+
+    ``simulation`` mode: local graph traversal + ODRL PDP.
+    ``camunda7`` mode: BPMN deployment + Camunda instances (ODRL PEP on each task).
+    """
+    from execution.engine import ExecutionEngine
+    from execution.models import RuntimeMode
+
+    scenario_path = _resolve_scenario_path(body.scenario_id)
+    mode_map = {
+        "simulation": RuntimeMode.SIMULATION,
+        "camunda7": RuntimeMode.CAMUNDA_7,
+        "camunda8": RuntimeMode.CAMUNDA_8,
+    }
+    mode_key = (body.mode or "simulation").strip().lower()
+    if mode_key not in mode_map:
+        raise HTTPException(status_code=422, detail="mode must be simulation, camunda7 or camunda8")
+
+    pol_dir = body.policies_dir
+    if pol_dir and not Path(pol_dir).is_dir():
+        pol_dir = str((_ROOT / pol_dir).resolve()) if (_ROOT / pol_dir).is_dir() else pol_dir
+
+    try:
+        engine = ExecutionEngine.from_scenario(
+            str(scenario_path),
+            policies_dir=pol_dir,
+            mode=mode_map[mode_key],
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    if mode_key == "simulation":
+        result = await asyncio.to_thread(
+            engine.run_simulation,
+            initial_variables=body.variables,
+            max_steps=body.max_steps,
+        )
+    else:
+        if not body.bpmn_path or not body.process_definition_key:
+            raise HTTPException(
+                status_code=422,
+                detail="bpmn_path and process_definition_key required for Camunda",
+            )
+        bpmn = Path(body.bpmn_path)
+        if not bpmn.is_file():
+            bpmn = _ROOT / body.bpmn_path
+        if not bpmn.is_file():
+            raise HTTPException(status_code=404, detail=f"BPMN not found: {body.bpmn_path}")
+        result = await asyncio.to_thread(
+            engine.run_camunda,
+            bpmn_path=str(bpmn.resolve()),
+            process_definition_key=body.process_definition_key,
+            initial_variables=body.variables,
+        )
+
+    out = _serialize_execution_result(result)
+    out["scenario_path"] = str(scenario_path)
+    out["policies_loaded"] = sum(
+        len(fps.all_policies()) for fps in engine.bundle.fp_results.values()
+    )
+    return out
+
+
+@app.get("/execution/health")
+async def execution_health(
+    camunda_url: Optional[str] = Query(default=None, description="Camunda 7 engine-rest URL"),
+) -> dict[str, Any]:
+    """Check Camunda availability (optional)."""
+    from execution.camunda_client import CamundaRestClient
+
+    client = CamundaRestClient(base_url=camunda_url) if camunda_url else CamundaRestClient()
+    return {"camunda_reachable": client.health(), "camunda_base_url": client.base_url}

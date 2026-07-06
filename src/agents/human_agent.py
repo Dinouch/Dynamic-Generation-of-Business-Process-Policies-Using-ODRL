@@ -20,15 +20,15 @@ class HumanDecision:
         if self.selected_option_id:
             out["selected_option_id"] = self.selected_option_id
         # FIPA REFUSE / FAILURE tuple shape (action-expression, reason-proposition) for strict ACL checks
-        out["action"] = "human_gate_review_unsupported_proposal"
+        out["action"] = "human_gate_review_unmapped_proposal"
         comment = (self.comment or "").strip()
         if comment:
             out["reason"] = comment
         else:
             out["reason"] = (
-                "operator agreed to the proposed unsupported rule"
+                "operator agreed to the proposed unmapped rule"
                 if self.decision == "agree"
-                else "operator refused the proposed unsupported rule"
+                else "operator refused the proposed unmapped rule"
             )
         return out
 
@@ -109,17 +109,25 @@ class HumanAgent:
 
     def _build_prompt(self, env: ACLEnvelope) -> str:
         c = env.content or {}
-        title = c.get("title") or "Validation humaine requise"
+        title = c.get("title") or "Human validation required"
         summary = c.get("summary") or ""
         options = c.get("options") or []
+        proposal = c.get("proposal") if isinstance(c.get("proposal"), dict) else None
+        accepted = c.get("accepted_so_far")
+        remaining = c.get("remaining_after")
         lines = [
             "",
             "═" * 70,
             f"[HITL] {title}",
             "═" * 70,
         ]
+        if accepted is not None and remaining is not None:
+            lines.append(f"Progress: {accepted} accepted, {remaining} remaining after this one.")
         if summary:
+            lines.append("")
             lines.append(summary)
+        if proposal:
+            lines.extend(self._format_unmapped_proposal(proposal))
         if options:
             lines.append("")
             lines.append("Options:")
@@ -128,11 +136,49 @@ class HumanAgent:
                 label = o.get("label", "")
                 lines.append(f"  - {oid} : {label}")
         lines.append("")
-        lines.append("Répondre par: agree | refuse")
-        lines.append("Vous pouvez coller un commentaire (ligne suivante).")
+        lines.append("Reply with: agree | refuse")
+        lines.append("Optional comment on the next line (empty Enter = none).")
         lines.append("═" * 70)
         lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_unmapped_proposal(proposal: dict[str, Any]) -> list[str]:
+        """Display the full unmapped proposal (including ODRL structure)."""
+        lines = ["", "── Unmapped proposal (detail) ──"]
+        for key in (
+            "pattern_type",
+            "fragment_id",
+            "gateway_name",
+            "odrl_rule_type",
+            "confidence",
+        ):
+            val = proposal.get(key)
+            if val is not None and val != "":
+                lines.append(f"  {key}: {val}")
+        hint = (proposal.get("hint_text") or "").strip()
+        if hint:
+            lines.append("")
+            lines.append("  hint_text:")
+            for ln in hint.splitlines():
+                lines.append(f"    {ln}")
+        just = (proposal.get("justification") or "").strip()
+        if just:
+            lines.append("")
+            lines.append("  justification:")
+            for ln in just.splitlines():
+                lines.append(f"    {ln}")
+        odrl = proposal.get("odrl_structure_hint")
+        if odrl:
+            lines.append("")
+            lines.append("  odrl_structure_hint:")
+            try:
+                blob = json.dumps(odrl, ensure_ascii=False, indent=4)
+            except TypeError:
+                blob = str(odrl)
+            for ln in blob.splitlines():
+                lines.append(f"    {ln}")
+        return lines
 
     def _ask_user(self, prompt: str) -> HumanDecision:
         print(prompt)

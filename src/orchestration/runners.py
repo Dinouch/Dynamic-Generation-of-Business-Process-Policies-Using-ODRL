@@ -12,11 +12,11 @@ def run_looped_orchestration(
     b2p_policies: List[Dict[str, Any]],
     context_mode: str = "local",
 ) -> None:
-    """Orchestration bout-en-bout : bus asyncio + enveloppes ACL (``run_pipeline_async``)."""
+    """End-to-end orchestration: asyncio bus + ACL envelopes (``run_pipeline_async``)."""
     _ = context_mode
 
     print("\n" + "═" * 70)
-    print("  PIPELINE ASYNCHRONE — run_pipeline_async()")
+    print("  ASYNC PIPELINE — run_pipeline_async()")
     print("═" * 70)
 
     import asyncio
@@ -100,16 +100,16 @@ def run_sequential_agents(
 
     rep1 = getattr(enriched_graph, "structural_llm_report", None)
     if rep1 and rep1.get("llm_used"):
-        print("\nAGENT 1 — Synthèse LLM (ambiguïtés B2P / graphe)")
+        print("\nAGENT 1 — LLM synthesis (B2P / graph ambiguities)")
         print("-" * 40)
         for n in rep1.get("notes_globales_fr") or []:
             if isinstance(n, str) and n.strip():
                 print(f"  • {n.strip()}")
         g = rep1.get("graphe") or {}
         if g.get("conseil_fr"):
-            print(f"  Conseil (graphe) : {g['conseil_fr']}")
+            print(f"  Advice (graph): {g['conseil_fr']}")
     elif rep1 and not rep1.get("llm_used"):
-        print(f"\n[Agent 1] LLM structurel : {rep1.get('reason', 'non utilisé')}")
+        print(f"\n[Agent 1] Structural LLM: {rep1.get('reason', 'not used')}")
 
     print("\nFORMAL GRAPH")
     print("-" * 40)
@@ -151,7 +151,7 @@ def run_sequential_agents(
         print("\n[INFO] No LLM key detected — skipping Agents 2 and 3.")
     else:
         print("\n" + "=" * 60)
-        print("  AGENT 2 & 3 — Unsupported formulation / validation (standalone stub)")
+        print("  AGENT 2 & 3 — Unmapped formulation / validation (standalone stub)")
         print("=" * 60)
         try:
             from agents.Agent_3.constraint_validator import ConstraintValidator
@@ -159,8 +159,8 @@ def run_sequential_agents(
             validator = ConstraintValidator(enriched_graph=enriched_graph)
             validation_report = validator.validate(enriched_graph, proposals=[])
             print(
-                f"\n  ValidationReport: accepted_unsupported="
-                f"{len(validation_report.accepted_unsupported_proposals)} "
+                f"\n  ValidationReport: accepted_unmapped="
+                f"{len(validation_report.accepted_unmapped_proposals)} "
                 f"(use full pipeline for exception handling agent LLM formulation)"
             )
         except Exception as e:
